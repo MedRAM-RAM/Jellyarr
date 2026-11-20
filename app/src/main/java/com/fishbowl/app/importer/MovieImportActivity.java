@@ -44,6 +44,7 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 import com.fishbowl.app.MediaStorageManager;
+import com.fishbowl.app.UiTheme;
 import com.termux.R;
 import com.fishbowl.app.StorageDriveHelper;
 
