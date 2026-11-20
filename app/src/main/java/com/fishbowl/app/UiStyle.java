@@ -11,13 +11,11 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.Switch;
 
-/** Vivid ON colour for switches and dirty-aware SAVE buttons. */
+/** Shared control styling for switches and dirty-aware SAVE buttons. */
 public final class UiStyle {
     private UiStyle() {}
 
     public interface StringSource { String get(); }
-
-    private static final int ON = 0xFF38BDF8;
 
     private static ColorStateList states(int checked, int unchecked) {
         return new ColorStateList(
@@ -28,8 +26,9 @@ public final class UiStyle {
     public static void styleSwitch(Context c, Switch s) {
         if (Build.VERSION.SDK_INT < 23) return;
         try {
-            s.setThumbTintList(states(0xFFFFFFFF, 0xFF9CA3AF));
-            s.setTrackTintList(states(ON, 0xFF3F3F46));
+            UiTheme.Palette palette = UiTheme.palette(c);
+            s.setThumbTintList(states(palette.onAccent, palette.textMuted));
+            s.setTrackTintList(states(palette.accent, palette.border));
         } catch (Throwable ignored) {}
     }
 

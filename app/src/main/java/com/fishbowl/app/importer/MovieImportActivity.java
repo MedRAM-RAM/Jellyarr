@@ -71,16 +71,16 @@ public final class MovieImportActivity extends AppCompatActivity {
     private static final String TAG = "MovieImportActivity";
 
     // Design Tokens (Harmonized with FishbowlActivity)
-    private static final int COLOR_BG = Color.parseColor("#000000");
-    private static final int COLOR_SURFACE = Color.parseColor("#0C0C0E");
-    private static final int COLOR_ELEVATED = Color.parseColor("#15161A");
-    private static final int COLOR_BORDER = Color.argb(20, 255, 255, 255);
-    private static final int COLOR_TEXT_PRIMARY = Color.parseColor("#F4F4F5");
-    private static final int COLOR_TEXT_MUTED = Color.parseColor("#71717A");
-    private static final int COLOR_ACCENT = Color.parseColor("#38BDF8");
-    private static final int COLOR_SUCCESS = Color.parseColor("#34D399");
-    private static final int COLOR_WARNING = Color.parseColor("#FFD51E");
-    private static final int COLOR_DANGER = Color.parseColor("#EF4444");
+    private int COLOR_BG;
+    private int COLOR_SURFACE;
+    private int COLOR_ELEVATED;
+    private int COLOR_BORDER;
+    private int COLOR_TEXT_PRIMARY;
+    private int COLOR_TEXT_MUTED;
+    private int COLOR_ACCENT;
+    private int COLOR_SUCCESS;
+    private int COLOR_WARNING;
+    private int COLOR_DANGER;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService backgroundExecutor = Executors.newCachedThreadPool();
@@ -106,6 +106,17 @@ public final class MovieImportActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        UiTheme.Palette palette = UiTheme.palette(this);
+        COLOR_BG = palette.background;
+        COLOR_SURFACE = palette.surface;
+        COLOR_ELEVATED = palette.elevated;
+        COLOR_BORDER = palette.border;
+        COLOR_TEXT_PRIMARY = palette.textPrimary;
+        COLOR_TEXT_MUTED = palette.textMuted;
+        COLOR_ACCENT = palette.accent;
+        COLOR_SUCCESS = palette.success;
+        COLOR_WARNING = palette.warning;
+        COLOR_DANGER = palette.danger;
 
         journal = MovieImportJournal.getInstance(this);
         importManager = MovieImportManager.getInstance(this);
@@ -113,7 +124,9 @@ public final class MovieImportActivity extends AppCompatActivity {
         metadataProvider = new TmdbMetadataProvider();
 
         configureSystemBars();
-        setContentView(buildRootLayout());
+        View content = buildRootLayout();
+        UiTheme.applyTextPalette(this, content);
+        setContentView(content);
 
         // Handle incoming review intent if opened from download notification
         handleIncomingIntent(getIntent());
@@ -1489,10 +1502,10 @@ public final class MovieImportActivity extends AppCompatActivity {
 
     private GradientDrawable createRoundedBackground(int bgColor, int borderColor, int radiusPx) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(bgColor);
-        gd.setCornerRadius(radiusPx);
+        gd.setColor(UiTheme.normalizeFill(this, bgColor));
+        gd.setCornerRadius(UiTheme.normalizeRadius(radiusPx, getResources().getDisplayMetrics().density));
         if (borderColor != 0) {
-            gd.setStroke(dp(1), borderColor);
+            gd.setStroke(dp(1), UiTheme.normalizeBorder(this, borderColor));
         }
         return gd;
     }
@@ -1512,7 +1525,9 @@ public final class MovieImportActivity extends AppCompatActivity {
         b.setText(text);
         b.setTextSize(11.5f);
         b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        b.setTextColor(textColor);
+        b.setTextColor(UiTheme.isAccentColor(this, bgColor)
+                ? UiTheme.palette(this).onAccent
+                : UiTheme.normalizeTextColor(this, textColor));
         b.setBackground(createRoundedBackground(bgColor, 0, dp(10)));
         return b;
     }
@@ -1522,7 +1537,7 @@ public final class MovieImportActivity extends AppCompatActivity {
         b.setText(text);
         b.setTextSize(11f);
         b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        b.setTextColor(strokeColor);
+        b.setTextColor(UiTheme.normalizeAccentColor(this, strokeColor));
         b.setBackground(createRoundedBackground(Color.TRANSPARENT, strokeColor, dp(10)));
         return b;
     }

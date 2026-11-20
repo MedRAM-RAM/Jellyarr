@@ -482,7 +482,9 @@ public final class FishbowlActivity extends AppCompatActivity
         passwordResetListener = info -> runOnUiThread(() -> updatePasswordResetBanner(info));
         PasswordResetManager.registerListener(passwordResetListener);
 
-        setContentView(buildMainPixelShell());
+        View mainShell = buildMainPixelShell();
+        UiTheme.applyTextPalette(this, mainShell);
+        setContentView(mainShell);
         // Initialize native Chromium in-app Cloudflare solver (headless WebView on port 8191)
         com.fishbowl.app.services.NativeFlareSolver.getInstance().init(this);
         setupSystemBarsAndInsets();
@@ -493,6 +495,8 @@ public final class FishbowlActivity extends AppCompatActivity
             activeTab = savedInstanceState.getInt("activeTab", 0);
             updateBottomNavSelection();
             renderActiveTab();
+            String section = savedInstanceState.getString("settingsSection");
+            if (section != null) openSettingsSectionByName(section);
         }
 
         // Auto-start server on app launch ONLY if explicitly enabled in preferences or uninitialized
@@ -685,6 +689,9 @@ public final class FishbowlActivity extends AppCompatActivity
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         outState.putInt("activeTab", activeTab);
+        if (settingsSectionOpen && settingsDetailTitle != null) {
+            outState.putString("settingsSection", settingsDetailTitle.getText().toString());
+        }
     }
 
     @Override
@@ -786,18 +793,18 @@ public final class FishbowlActivity extends AppCompatActivity
         return true;
     }
 
-    // -- Colors & Design Tokens (Google Stitch Minimalist) --------------------
+    // -- Shared Material-style design tokens ----------------------------------
 
-    private int getBgColor() { return Color.parseColor("#000000"); }
-    private int getSurfaceColor() { return Color.parseColor("#000000"); }
-    private int getSurfaceElevatedColor() { return Color.parseColor("#0C0C0E"); }
-    private int getBorderColor() { return Color.argb(20, 255, 255, 255); }
-    private int getPrimaryTextColor() { return Color.parseColor("#F4F4F5"); }
-    private int getSecondaryTextColor() { return Color.parseColor("#A1A1AA"); }
-    private int getAccentColor() { return Color.parseColor("#38BDF8"); }
-    private int getSuccessColor() { return Color.parseColor("#34D399"); }
-    private int getWarningColor() { return Color.parseColor("#FFD51E"); }
-    private int getDangerColor() { return Color.parseColor("#FF1744"); }
+    private int getBgColor() { return UiTheme.palette(this).background; }
+    private int getSurfaceColor() { return UiTheme.palette(this).surface; }
+    private int getSurfaceElevatedColor() { return UiTheme.palette(this).elevated; }
+    private int getBorderColor() { return UiTheme.palette(this).border; }
+    private int getPrimaryTextColor() { return UiTheme.palette(this).textPrimary; }
+    private int getSecondaryTextColor() { return UiTheme.palette(this).textSecondary; }
+    private int getAccentColor() { return UiTheme.palette(this).accent; }
+    private int getSuccessColor() { return UiTheme.palette(this).success; }
+    private int getWarningColor() { return UiTheme.palette(this).warning; }
+    private int getDangerColor() { return UiTheme.palette(this).danger; }
 
     private GradientDrawable createCardDrawable(int bgColor, int radiusDp) {
         int r = radiusDp > 0 ? radiusDp : dp(14);
@@ -8601,6 +8608,7 @@ public final class FishbowlActivity extends AppCompatActivity
         sub.setPadding(0, dp(2), 0, dp(14));
         settingsMenu.addView(sub);
 
+        addSettingsMenuRow("Appearance", "Choose a dynamic color theme", buildAppearanceSection());
         addSettingsMenuRow("General & Startup", "Auto-start, keep screen on, media stack", buildGeneralSection());
         addSettingsMenuRow("Automation", "Transmission cleanup, auto-recheck, Wi-Fi only", buildAutomationSection());
         addSettingsMenuRow("Storage", "Jellyarr footprint and disk usage", buildStorageSection());
@@ -8675,6 +8683,77 @@ public final class FishbowlActivity extends AppCompatActivity
 
         refreshStorageBar();
         return settingsRoot;
+    }
+
+    private View buildAppearanceSection() {
+        LinearLayout section = createSettingsSectionCard();
+        TextView intro = new TextView(this);
+        intro.setText("Choose a color palette for Jellyarr. Your choice is saved on this device.");
+        intro.setTextSize(12f);
+        intro.setTextColor(getSecondaryTextColor());
+        intro.setPadding(dp(4), dp(2), dp(4), dp(12));
+        section.addView(intro);
+
+        String selectedTheme = UiTheme.selectedTheme(this);
+        for (String theme : UiTheme.themeKeys()) {
+            final String themeKey = theme;
+            UiTheme.Palette optionPalette = UiTheme.paletteFor(this, theme);
+            boolean selected = theme.equals(selectedTheme);
+
+            LinearLayout option = new LinearLayout(this);
+            option.setOrientation(LinearLayout.HORIZONTAL);
+            option.setGravity(Gravity.CENTER_VERTICAL);
+            option.setPadding(dp(14), dp(12), dp(14), dp(12));
+            option.setBackground(createBorderedRoundedDrawable(
+                    selected ? optionPalette.elevated : optionPalette.card,
+                    selected ? optionPalette.accent : optionPalette.border,
+                    dp(1), dp(14)));
+            option.setClickable(true);
+            option.setFocusable(true);
+            option.setContentDescription(UiTheme.themeName(theme) + (selected ? ", selected" : ""));
+
+            View swatch = new View(this);
+            GradientDrawable swatchShape = new GradientDrawable();
+            swatchShape.setShape(GradientDrawable.OVAL);
+            swatchShape.setColor(optionPalette.accent);
+            swatchShape.setStroke(dp(1), optionPalette.border);
+            swatch.setBackground(swatchShape);
+            LinearLayout.LayoutParams swatchParams = new LinearLayout.LayoutParams(dp(22), dp(22));
+            swatchParams.rightMargin = dp(12);
+            option.addView(swatch, swatchParams);
+
+            LinearLayout labels = new LinearLayout(this);
+            labels.setOrientation(LinearLayout.VERTICAL);
+            TextView name = new TextView(this);
+            name.setText(UiTheme.themeName(theme));
+            name.setTextSize(14f);
+            name.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+            name.setTextColor(getPrimaryTextColor());
+            labels.addView(name);
+            TextView description = new TextView(this);
+            description.setText(UiTheme.themeDescription(theme));
+            description.setTextSize(11f);
+            description.setTextColor(getSecondaryTextColor());
+            description.setPadding(0, dp(2), 0, 0);
+            labels.addView(description);
+            option.addView(labels, new LinearLayout.LayoutParams(0, -2, 1f));
+
+            TextView state = new TextView(this);
+            state.setText(selected ? "✓" : "›");
+            state.setTextSize(selected ? 18f : 22f);
+            state.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+            state.setTextColor(selected ? optionPalette.accent : optionPalette.textMuted);
+            option.addView(state);
+
+            LinearLayout.LayoutParams optionParams = new LinearLayout.LayoutParams(-1, -2);
+            optionParams.bottomMargin = dp(8);
+            section.addView(option, optionParams);
+            option.setOnClickListener(v -> {
+                UiTheme.saveTheme(this, themeKey);
+                recreate();
+            });
+        }
+        return section;
     }
 
     private final java.util.HashMap<String, View> settingsSectionViews = new java.util.HashMap<>();
@@ -13188,7 +13267,10 @@ public final class FishbowlActivity extends AppCompatActivity
         b.setTextSize(11f);
         b.setLetterSpacing(0.03f);
         b.setAllCaps(false);
-        b.setTextColor(textColor);
+        int buttonTextColor = UiTheme.isAccentColor(this, bgColor)
+                ? UiTheme.palette(this).onAccent
+                : UiTheme.normalizeTextColor(this, textColor);
+        b.setTextColor(buttonTextColor);
         b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         b.setMinHeight(0);
         b.setMinimumHeight(0);
@@ -13204,13 +13286,11 @@ public final class FishbowlActivity extends AppCompatActivity
         } else if (bgColor == Color.WHITE) {
             strokeColor = Color.argb(40, 255, 255, 255);
         } else {
-            strokeColor = colorWithAlpha(textColor, 45);
+            strokeColor = colorWithAlpha(buttonTextColor, 45);
         }
         GradientDrawable defaultShape = createBorderedRoundedDrawable(bgColor, strokeColor, dp(1), dp(10));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = (textColor == Color.WHITE || textColor == Color.parseColor("#090D12"))
-                    ? Color.argb(80, 255, 255, 255)
-                    : colorWithAlpha(getAccentColor(), 80);
+            int rippleColor = colorWithAlpha(buttonTextColor, 70);
             android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
                     android.content.res.ColorStateList.valueOf(rippleColor),
                     defaultShape,
@@ -13244,7 +13324,10 @@ public final class FishbowlActivity extends AppCompatActivity
         b.setTextSize(10.5f);
         b.setLetterSpacing(0.04f);
         b.setAllCaps(false);
-        b.setTextColor(textColor);
+        int buttonTextColor = UiTheme.isAccentColor(this, outlineColor)
+                ? UiTheme.palette(this).accent
+                : UiTheme.normalizeTextColor(this, textColor);
+        b.setTextColor(buttonTextColor);
         b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         b.setMinHeight(0);
         b.setMinimumHeight(0);
@@ -13254,9 +13337,10 @@ public final class FishbowlActivity extends AppCompatActivity
             b.setStateListAnimator(null);
         }
 
-        GradientDrawable defaultShape = createBorderedRoundedDrawable(Color.BLACK, outlineColor, dp(1), dp(8));
+        int themedOutlineColor = UiTheme.normalizeAccentColor(this, outlineColor);
+        GradientDrawable defaultShape = createBorderedRoundedDrawable(Color.BLACK, themedOutlineColor, dp(1), dp(8));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = colorWithAlpha(outlineColor, 60);
+            int rippleColor = colorWithAlpha(themedOutlineColor, 60);
             android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
                     android.content.res.ColorStateList.valueOf(rippleColor),
                     defaultShape,
@@ -13284,10 +13368,13 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void applyOutlineButtonStyle(Button b, int outlineColor, int textColor) {
         if (b == null) return;
-        b.setTextColor(textColor);
-        GradientDrawable defaultShape = createBorderedRoundedDrawable(Color.BLACK, outlineColor, dp(1), dp(8));
+        b.setTextColor(UiTheme.isAccentColor(this, outlineColor)
+                ? UiTheme.palette(this).accent
+                : UiTheme.normalizeTextColor(this, textColor));
+        int themedOutlineColor = UiTheme.normalizeAccentColor(this, outlineColor);
+        GradientDrawable defaultShape = createBorderedRoundedDrawable(Color.BLACK, themedOutlineColor, dp(1), dp(8));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = colorWithAlpha(outlineColor, 60);
+            int rippleColor = colorWithAlpha(themedOutlineColor, 60);
             android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
                     android.content.res.ColorStateList.valueOf(rippleColor),
                     defaultShape,
@@ -13301,7 +13388,9 @@ public final class FishbowlActivity extends AppCompatActivity
     private void applyButtonStyle(Button btn, String text, int bgColor, int textColor, boolean enabled) {
         if (btn == null) return;
         btn.setText(text);
-        btn.setTextColor(textColor);
+        btn.setTextColor(UiTheme.isAccentColor(this, bgColor)
+                ? UiTheme.palette(this).onAccent
+                : UiTheme.normalizeTextColor(this, textColor));
         btn.setEnabled(enabled);
         btn.setAlpha(1.0f);
         btn.setTextSize(12);
@@ -13337,7 +13426,9 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void applyDockButtonStyle(Button btn, String text, int bgColor, int textColor, int iconRes, boolean enabled) {
         if (btn == null) return;
-        btn.setTextColor(textColor);
+        btn.setTextColor(UiTheme.isAccentColor(this, bgColor)
+                ? UiTheme.palette(this).onAccent
+                : UiTheme.normalizeTextColor(this, textColor));
         btn.setEnabled(enabled);
         btn.setAlpha(enabled ? 1.0f : 0.65f);
         btn.setTextSize(12);
@@ -13400,15 +13491,15 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private GradientDrawable createRoundedDrawable(int color, int radiusDp) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(UiTheme.normalizeFill(color));
+        gd.setColor(UiTheme.normalizeFill(this, color));
         gd.setCornerRadius(UiTheme.normalizeRadius(radiusDp, getResources().getDisplayMetrics().density));
         return gd;
     }
 
     private GradientDrawable createBorderedRoundedDrawable(int bgColor, int borderColor, int strokeWidthPx, int radiusDp) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(UiTheme.normalizeFill(bgColor));
-        gd.setStroke(strokeWidthPx, UiTheme.normalizeBorder(borderColor));
+        gd.setColor(UiTheme.normalizeFill(this, bgColor));
+        gd.setStroke(strokeWidthPx, UiTheme.normalizeBorder(this, borderColor));
         gd.setCornerRadius(UiTheme.normalizeRadius(radiusDp, getResources().getDisplayMetrics().density));
         return gd;
     }
@@ -13418,7 +13509,7 @@ public final class FishbowlActivity extends AppCompatActivity
         tv.setTextSize(11f);
         tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         tv.setLetterSpacing(0.08f);
-        tv.setTextColor(Color.parseColor("#71717A"));
+        tv.setTextColor(UiTheme.palette(this).textMuted);
     }
 
     private int colorWithAlpha(int color, int alpha) {

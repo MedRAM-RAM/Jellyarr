@@ -2,7 +2,7 @@ name: Build APK (Jellyarr)
 
 on:
   push:
-    branches: [ 'feature/**' ]
+    branches: [ 'feature/**', 'redesign/**' ]
   workflow_dispatch:
     inputs:
       channel:
@@ -70,6 +70,12 @@ jobs:
           chmod +x gradlew
           ./gradlew downloadBootstraps
 
+      - name: Run unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Run Android Lint
+        run: ./gradlew --no-daemon :app:lintDebug
+
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
 
@@ -99,6 +105,7 @@ jobs:
           retention-days: 14
 
       - name: Publish APK as a GitHub pre-release
+        if: startsWith(github.ref, 'refs/heads/feature/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

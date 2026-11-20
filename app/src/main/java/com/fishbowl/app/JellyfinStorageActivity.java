@@ -52,16 +52,16 @@ import java.util.Set;
 public final class JellyfinStorageActivity extends AppCompatActivity {
 
     // Color tokens synchronized with FishbowlActivity design tokens
-    private static final int COLOR_BG = Color.parseColor("#000000");
-    private static final int COLOR_SURFACE = Color.parseColor("#0C0C0E");
-    private static final int COLOR_ELEVATED = Color.parseColor("#16171B");
-    private static final int COLOR_BORDER = Color.argb(20, 255, 255, 255);
-    private static final int COLOR_ACCENT = Color.parseColor("#38BDF8");
-    private static final int COLOR_TEXT_PRIMARY = Color.parseColor("#F4F4F5");
-    private static final int COLOR_TEXT_MUTED = Color.parseColor("#A1A1AA");
-    private static final int COLOR_SUCCESS = Color.parseColor("#34D399");
-    private static final int COLOR_WARNING = Color.parseColor("#FFD51E");
-    private static final int COLOR_DANGER = Color.parseColor("#FF1744");
+    private int COLOR_BG;
+    private int COLOR_SURFACE;
+    private int COLOR_ELEVATED;
+    private int COLOR_BORDER;
+    private int COLOR_ACCENT;
+    private int COLOR_TEXT_PRIMARY;
+    private int COLOR_TEXT_MUTED;
+    private int COLOR_SUCCESS;
+    private int COLOR_WARNING;
+    private int COLOR_DANGER;
 
     private SharedPreferences prefs;
     private String activeSelectedPath = "/storage/emulated/0/FishbowlMedia/Movies";
@@ -121,6 +121,17 @@ public final class JellyfinStorageActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
         super.onCreate(savedInstanceState);
+        UiTheme.Palette palette = UiTheme.palette(this);
+        COLOR_BG = palette.background;
+        COLOR_SURFACE = palette.surface;
+        COLOR_ELEVATED = palette.elevated;
+        COLOR_BORDER = palette.border;
+        COLOR_ACCENT = palette.accent;
+        COLOR_TEXT_PRIMARY = palette.textPrimary;
+        COLOR_TEXT_MUTED = palette.textMuted;
+        COLOR_SUCCESS = palette.success;
+        COLOR_WARNING = palette.warning;
+        COLOR_DANGER = palette.danger;
         setupSystemBars();
 
         prefs = getSharedPreferences("fishbowl_storage", MODE_PRIVATE);
@@ -134,7 +145,9 @@ public final class JellyfinStorageActivity extends AppCompatActivity {
             activeSelectedPath = "/storage/emulated/0/FishbowlMedia/Movies";
         }
 
-        setContentView(buildView());
+        View content = buildView();
+        UiTheme.applyTextPalette(this, content);
+        setContentView(content);
     }
 
     @Override
@@ -979,16 +992,16 @@ public final class JellyfinStorageActivity extends AppCompatActivity {
     // UI Component Helpers synchronized with Fishbowl design language
     private GradientDrawable createCardDrawable(int bgColor, int radiusPx) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(bgColor);
-        gd.setCornerRadius(radiusPx > 0 ? radiusPx : dp(8));
-        gd.setStroke(dp(1), COLOR_BORDER);
+        gd.setColor(UiTheme.normalizeFill(this, bgColor));
+        gd.setCornerRadius(UiTheme.normalizeRadius(radiusPx > 0 ? radiusPx : dp(8), getResources().getDisplayMetrics().density));
+        gd.setStroke(dp(1), UiTheme.normalizeBorder(this, COLOR_BORDER));
         return gd;
     }
 
     private GradientDrawable createRoundedFillDrawable(int bgColor, int radiusPx) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(bgColor);
-        gd.setCornerRadius(radiusPx > 0 ? radiusPx : dp(8));
+        gd.setColor(UiTheme.normalizeFill(this, bgColor));
+        gd.setCornerRadius(UiTheme.normalizeRadius(radiusPx > 0 ? radiusPx : dp(8), getResources().getDisplayMetrics().density));
         return gd;
     }
 

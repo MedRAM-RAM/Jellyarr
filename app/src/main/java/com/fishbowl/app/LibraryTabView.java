@@ -55,7 +55,7 @@ public final class LibraryTabView {
 
         root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.BLACK);
+        root.setBackgroundColor(UiTheme.palette(act).background);
 
         LinearLayout header = new LinearLayout(act);
         header.setOrientation(LinearLayout.VERTICAL);
@@ -467,8 +467,9 @@ public final class LibraryTabView {
         TextView t = text(label, 9.5f, selected ? "#000000" : "#A1A1AA", true);
         t.setGravity(Gravity.CENTER);
         t.setSingleLine(true);
-        t.setBackground(rounded(selected ? Color.parseColor("#38BDF8") : Color.parseColor("#0C0C0E"),
+        t.setBackground(rounded(selected ? UiTheme.palette(act).accent : Color.parseColor("#0C0C0E"),
                 Color.argb(30, 255, 255, 255), 8));
+        if (selected) t.setTextColor(UiTheme.palette(act).onAccent);
         t.setClickable(true);
         t.setOnClickListener(l);
         return t;
@@ -480,8 +481,8 @@ public final class LibraryTabView {
         b.setAllCaps(false);
         b.setTextSize(10.5f);
         b.setTypeface(Typeface.DEFAULT_BOLD);
-        int c = Color.parseColor(colorHex);
-        b.setTextColor(c);
+        int c = UiTheme.normalizeAccentColor(act, Color.parseColor(colorHex));
+        b.setTextColor(UiTheme.normalizeTextColor(act, c));
         b.setBackground(rounded(Color.argb(25, Color.red(c), Color.green(c), Color.blue(c)), Color.argb(80, Color.red(c), Color.green(c), Color.blue(c)), 6));
         b.setOnClickListener(l);
         return b;
@@ -491,16 +492,16 @@ public final class LibraryTabView {
         TextView t = new TextView(act);
         t.setText(s);
         t.setTextSize(size);
-        t.setTextColor(Color.parseColor(colorHex));
+        t.setTextColor(UiTheme.normalizeTextColor(act, Color.parseColor(colorHex)));
         if (bold) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         return t;
     }
 
     private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
         GradientDrawable g = new GradientDrawable();
-        g.setColor(fill);
-        g.setStroke(dp(1), stroke);
-        g.setCornerRadius(dp(radiusDp));
+        g.setColor(UiTheme.normalizeFill(act, fill));
+        g.setStroke(dp(1), UiTheme.normalizeBorder(act, stroke));
+        g.setCornerRadius(UiTheme.normalizeRadius(dp(radiusDp), act.getResources().getDisplayMetrics().density));
         return g;
     }
 
