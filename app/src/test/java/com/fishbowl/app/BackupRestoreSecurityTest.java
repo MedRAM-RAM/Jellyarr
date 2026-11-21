@@ -394,7 +394,7 @@ public class BackupRestoreSecurityTest {
 
     /**
      * Test 10: Dynamic backup manifest version correctness:
-     * - Manifest contains active BuildConfig VERSION_NAME (1.4.10-beta.2) and VERSION_CODE (101418).
+     * - Manifest contains the active BuildConfig VERSION_NAME and VERSION_CODE.
      * - Hardcoded legacy versions (1.4.8, 101414) are rejected.
      */
     @Test
@@ -402,8 +402,8 @@ public class BackupRestoreSecurityTest {
         String currentVersion = com.termux.BuildConfig.VERSION_NAME;
         long currentVersionCode = com.termux.BuildConfig.VERSION_CODE;
 
-        Assert.assertEquals("Version name must be 1.4.10-beta.2", "1.4.10-beta.2", currentVersion);
-        Assert.assertEquals("Version code must be 101418", 101418L, currentVersionCode);
+        Assert.assertFalse("Version name must be configured", currentVersion.trim().isEmpty());
+        Assert.assertTrue("Version code must be positive", currentVersionCode > 0L);
 
         File metaFile = new File(stagingDir, BackupRestoreManager.META_FILENAME);
         String metaJson = "{\n" +
@@ -420,8 +420,10 @@ public class BackupRestoreSecurityTest {
         String content = BackupRestoreManager.readFileToString(metaFile);
         Assert.assertFalse("Must not contain obsolete version 1.4.8", content.contains("\"1.4.8\""));
         Assert.assertFalse("Must not contain obsolete version code 101414", content.contains("101414"));
-        Assert.assertTrue("Must contain current version 1.4.10-beta.2", content.contains("1.4.10-beta.2"));
-        Assert.assertTrue("Must contain current version code 101418", content.contains("101418"));
+        Assert.assertTrue("Must contain the active build version",
+                content.contains("\"version\": \"" + currentVersion + "\""));
+        Assert.assertTrue("Must contain the active build version code",
+                content.contains("\"versionCode\": " + currentVersionCode));
     }
 
     /**

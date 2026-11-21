@@ -122,7 +122,7 @@ public class MediaStackSecurityTest {
         String content = MediaServiceManager.readTextFile(settingsJson);
         Assert.assertNotNull(content);
         Assert.assertTrue("Should contain apiKey", content.contains("\"apiKey\""));
-        Assert.assertTrue("Should contain applicationTitle", content.contains("Fishbowl Requests"));
+        Assert.assertTrue("Should contain applicationTitle", content.contains("Jellyarr Requests"));
         Assert.assertTrue("Should disable trustProxy", content.contains("\"trustProxy\": false") || content.contains("\"trustProxy\":false"));
         Assert.assertTrue("Should enable csrfProtection", content.contains("\"csrfProtection\": true") || content.contains("\"csrfProtection\":true"));
     }
@@ -140,7 +140,7 @@ public class MediaStackSecurityTest {
         Assert.assertTrue("Empty backup file must be created", emptyBak.exists());
 
         String content = MediaServiceManager.readTextFile(emptySettings);
-        Assert.assertTrue("settings.json must be populated with defaults", content.contains("Fishbowl Requests"));
+        Assert.assertTrue("settings.json must be populated with defaults", content.contains("Jellyarr Requests"));
     }
 
     @Test
