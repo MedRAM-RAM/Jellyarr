@@ -11,16 +11,18 @@ import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.SequenceInputStream;
+import java.util.Enumeration;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.zip.GZIPInputStream;
 
 import android.os.PowerManager;
 import android.os.StatFs;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
 
 public class JellyfinBootstrapper {
 
@@ -28,14 +30,27 @@ public class JellyfinBootstrapper {
     private static final String INITIALIZED_MARKER_FILE = ".jellyfin_initialized_v12.4.0";
     private static final String LEGACY_V123_MARKER_FILE = ".jellyfin_initialized_v12.3.0";
     private static final String[] ASSET_PARTS = {
-            "jellyfin-bootstrap.tar.gz.part_aa",
-            "jellyfin-bootstrap.tar.gz.part_ab",
-            "jellyfin-bootstrap.tar.gz.part_ac",
-            "jellyfin-bootstrap.tar.gz.part_ad",
-            "jellyfin-bootstrap.tar.gz.part_ae"
+            "jellyfin-bootstrap.tar.xz.part_aa",
+            "jellyfin-bootstrap.tar.xz.part_ab",
+            "jellyfin-bootstrap.tar.xz.part_ac"
     };
     private static final long MIN_REQUIRED_BYTES = 1000L * 1024L * 1024L; // ~1.0 GB minimum required free space
     private static volatile String lastError = null;
+
+    /** Concatenates the split asset parts lazily so the archive is never copied to disk. */
+    private static InputStream openPartsStream(final Context context, final List<String> parts) {
+        final java.util.Iterator<String> it = parts.iterator();
+        return new SequenceInputStream(new Enumeration<InputStream>() {
+            @Override public boolean hasMoreElements() { return it.hasNext(); }
+            @Override public InputStream nextElement() {
+                try {
+                    return context.getAssets().open(it.next());
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        });
+    }
 
     public interface ProgressCallback {
         void onProgress(String statusMessage, int percent);
@@ -103,10 +118,6 @@ public class JellyfinBootstrapper {
             File prefixDir = TermuxConstants.TERMUX_PREFIX_DIR;
             if (prefixDir.exists()) {
                 deleteRecursively(prefixDir);
-            }
-            File cacheTarGz = new File(context.getCacheDir(), "jellyfin-bootstrap.tar.gz");
-            if (cacheTarGz.exists()) {
-                cacheTarGz.delete();
             }
             return initializeInternal(context, callback);
         }
@@ -359,7 +370,6 @@ public class JellyfinBootstrapper {
             }
         }
 
-        File cacheTarGz = new File(context.getCacheDir(), "jellyfin-bootstrap.tar.gz");
         try {
             File filesDir = TermuxConstants.TERMUX_FILES_DIR;
             try {
@@ -384,7 +394,7 @@ public class JellyfinBootstrapper {
             }
 
             if (callback != null) {
-                callback.onProgress("Recombining runtime packages...", 10);
+                callback.onProgress("Preparing runtime packages...", 10);
             }
             Log.i(TAG, "Initializing Jellyfin self-contained environment...");
             File marker = new File(TermuxConstants.TERMUX_FILES_DIR, INITIALIZED_MARKER_FILE);
@@ -418,13 +428,13 @@ public class JellyfinBootstrapper {
                 prefixDir.setExecutable(true, false);
             } catch (Exception ignored) {}
 
-            Log.i(TAG, "Recombining split bootstrap assets into cache...");
+            Log.i(TAG, "Locating split bootstrap asset parts...");
             List<String> partFiles = new ArrayList<>();
             try {
                 String[] allAssets = context.getAssets().list("");
                 if (allAssets != null) {
                     for (String asset : allAssets) {
-                        if (asset.startsWith("jellyfin-bootstrap.tar.gz.part_")) {
+                        if (asset.startsWith("jellyfin-bootstrap.tar.xz.part_")) {
                             partFiles.add(asset);
                         }
                     }
@@ -436,32 +446,13 @@ public class JellyfinBootstrapper {
             }
             Log.i(TAG, "Found bootstrap asset parts: " + partFiles);
 
-            int totalParts = partFiles.size();
-            int partIndex = 0;
-            try (OutputStream out = new BufferedOutputStream(new FileOutputStream(cacheTarGz))) {
-                byte[] buffer = new byte[65536];
-                for (String part : partFiles) {
-                    partIndex++;
-                    if (callback != null) {
-                        int pct = 10 + (int) ((partIndex / (float) totalParts) * 25);
-                        callback.onProgress("Recombining part " + partIndex + " of " + totalParts + "...", pct);
-                    }
-                    try (InputStream in = context.getAssets().open(part)) {
-                        int read;
-                        while ((read = in.read(buffer)) != -1) {
-                            out.write(buffer, 0, read);
-                        }
-                    }
-                }
-            }
-
             if (callback != null) {
                 callback.onProgress("Extracting Jellyfin runtime & FFmpeg...", 40);
             }
-            Log.i(TAG, "Unpacking combined bootstrap archive via Java TarArchiveInputStream...");
-            try (InputStream fileIn = new BufferedInputStream(new java.io.FileInputStream(cacheTarGz));
-                 GZIPInputStream gzIn = new GZIPInputStream(fileIn);
-                 TarArchiveInputStream tarIn = new TarArchiveInputStream(gzIn)) {
+            Log.i(TAG, "Streaming bootstrap archive parts through XZ + tar (no intermediate cache copy)...");
+            try (InputStream fileIn = new BufferedInputStream(openPartsStream(context, partFiles), 1 << 16);
+                 XZCompressorInputStream xzIn = new XZCompressorInputStream(fileIn);
+                 TarArchiveInputStream tarIn = new TarArchiveInputStream(xzIn)) {
 
                 TarArchiveEntry entry;
                 byte[] buffer = new byte[65536];
@@ -527,10 +518,9 @@ public class JellyfinBootstrapper {
                         callback.onProgress("Extracting runtime files (" + extractedCount + ")...", pct);
                     }
                 }
-                Log.i(TAG, "Extracted " + extractedCount + " entries from tar.gz!");
+                Log.i(TAG, "Extracted " + extractedCount + " entries from tar.xz!");
             }
 
-            cacheTarGz.delete();
 
             if (callback != null) {
                 callback.onProgress("Configuring permissions & binaries...", 90);
@@ -602,9 +592,6 @@ public class JellyfinBootstrapper {
             setLastError(fullErr);
             if (callback != null) {
                 callback.onProgress(fullErr, 0);
-            }
-            if (cacheTarGz.exists()) {
-                cacheTarGz.delete();
             }
             return false;
         } finally {
