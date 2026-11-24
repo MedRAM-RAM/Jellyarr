@@ -23,8 +23,6 @@ android {
     ndkVersion = System.getenv("JITPACK_NDK_VERSION") ?: project.properties.ndkVersion
     def appVersionName = System.getenv("TERMUX_APP_VERSION_NAME") ?: ""
     def apkVersionTag = System.getenv("TERMUX_APK_VERSION_TAG") ?: ""
-    def splitAPKsForDebugBuilds = System.getenv("TERMUX_SPLIT_APKS_FOR_DEBUG_BUILDS") ?: "1"
-    def splitAPKsForReleaseBuilds = System.getenv("TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS") ?: "0" // F-Droid does not support split APKs #1904
 
     dependencies {
         implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
@@ -72,14 +70,9 @@ android {
         manifestPlaceholders.TERMUX_APP_NAME = "Fishbowl"
 
 
-        splits {
-            abi {
-                enable ((gradle.startParameter.taskNames.any { it.contains("Debug") } && splitAPKsForDebugBuilds == "1") ||
-                    (gradle.startParameter.taskNames.any { it.contains("Release") } && splitAPKsForReleaseBuilds == "1"))
-                reset ()
-                include 'arm64-v8a'
-                universalApk false
-            }
+        // The runtime bootstrap is ARM64-only, so ship only arm64-v8a native code.
+        ndk {
+            abiFilters 'arm64-v8a'
         }
     }
 
@@ -124,7 +117,7 @@ android {
         release {
             signingConfig signingConfigs.release
             minifyEnabled true
-            shrinkResources false // Reproducible builds
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
 
@@ -164,16 +157,25 @@ android {
         jniLibs {
             useLegacyPackaging true
         }
+        resources {
+            excludes += ['META-INF/*.version', 'META-INF/DEPENDENCIES', 'META-INF/INDEX.LIST']
+        }
+    }
+
+    // The bootstrap archive is already xz-compressed; storing it raw avoids a pointless second pass
+    // at build time and keeps APK extraction a straight copy.
+    androidResources {
+        noCompress += ['xz', 'part_aa', 'part_ab', 'part_ac']
     }
 
     applicationVariants.all { variant ->
         variant.outputs.all { output ->
             if (variant.buildType.name == "debug") {
                 def abi = output.getFilter(com.android.build.OutputFile.ABI)
-                outputFileName = new File("Fishbowl-v" + versionName + "-debug" + (abi ? "-" + abi : "-universal") + ".apk")
+                outputFileName = new File("Jellyarr-v" + versionName + "-debug" + (abi ? "-" + abi : "-universal") + ".apk")
             } else if (variant.buildType.name == "release") {
                 def abi = output.getFilter(com.android.build.OutputFile.ABI)
-                outputFileName = new File("Fishbowl-v" + versionName + "-release" + (abi ? "-" + abi : "-universal") + ".apk")
+                outputFileName = new File("Jellyarr-v" + versionName + "-release" + (abi ? "-" + abi : "-universal") + ".apk")
             }
         }
     }
