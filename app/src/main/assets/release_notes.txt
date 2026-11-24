@@ -1,0 +1,118 @@
+What's new in 2.0.4-beta.20 (beta)
+- Full redesign with one shared design system: consistent headers, cards, buttons, chips, lists and loading / empty / error states on every screen.
+- Sonarr, Radarr, Prowlarr and Transmission tabs reviewed against the official APIs and fixed (safer actions, live lists that keep their scroll position, clear 'not running' and login errors, faster cached posters).
+- Jellyfin Library signs in automatically with the unified account and recovers from expired logins without risking an account lockout.
+- Stability: heavy work moved off the main thread, leaks and duplicate refreshes removed, Arabic/RTL fixes, and the side-drawer swipe no longer fights horizontal lists.
+
+From 2.0.4-beta.19:
+- Fixed the unified account failing with HTTP 400 in Sonarr, Radarr and Prowlarr: existing logins are now updated and the new password is verified by a real login on every service.
+- Jellyfin password changes for an existing user now go through the Jellyfin API and are verified; errors now show the real reason instead of a URL.
+- The Transmission web page inside the app signs in automatically with the unified account.
+
+From 2.0.4-beta.18:
+- One account for every service: the same username and password now work for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission. Manage it in Settings > Security & Identity (per-service status, change, apply now, forget).
+- First launch now shows two windows: restore a backup if one is found, then sign in or create the account for all services (you can skip both).
+
+From 2.0.4-beta.17:
+- Tapping a service logo on Home now opens its details window (links, API key, status, Web UI / Stop / Logs / Uninstall) instead of switching it on or off. The window was moved from the Media page.
+- Movie Importer and Media Storage moved from Home to the Media tab as richer cards: live folder usage and free space, staging retention policy, importer statistics, download-detection switches and quick actions.
+- Removed the STOP ALL button from the Media stack (START ALL shows only while nothing is running).
+
+From 2.0.4-beta.16:
+- Bazarr and Jackett were removed from the app completely (services, drawer, widget, storage, settings, licences).
+- The side drawer now opens above the bottom navigation bar instead of covering it.
+- The Download Center moved from the Media page into the Transmission tab (new DOWNLOADS section with history, refresh and clear).
+
+From 2.0.4-beta.15:
+- New Prowlarr tab (side drawer): indexers (add / edit / test / enable), search and grab, applications sync, stats, history and system.
+- New Jackett tab (side drawer): indexers (add / edit / test / delete) with Torznab URLs, search with copy / send to Transmission, and server settings.
+
+From 2.0.4-beta.14:
+- New Radarr tab (side drawer): movies list and detail, add movie, interactive search, calendar, queue, history, wanted (missing / cutoff unmet) and system settings.
+- New Transmission tab (side drawer): live torrent list with filters, details (files, peers, trackers), add torrent, speed limits and alt-speed, session settings and global pause/resume.
+
+From 2.0.4-beta.13:
+- Jellyfin now uses its original gradient logo everywhere (Home, side drawer, service card).
+- Side drawer swipe now works from anywhere on the screen (swipe right in English, left in Arabic to open; the other way to close).
+
+From 2.0.4-beta.12:
+- Service logos are now the original full-colour logos (Sonarr, Radarr, Prowlarr, Jackett, Transmission, Bazarr) on Home, the side drawer and service cards. Logos are grey and faded when the service is off.
+
+From 2.0.4-beta.11:
+- Swipe from the screen edge (left edge in English, right edge in Arabic) to open the side drawer; swipe back to close it.
+- Seerr and Lidarr were removed from the app completely (services, widget, storage, settings, licences). The drawer now lists Radarr, Prowlarr, Transmission, Jackett and Bazarr.
+- Home service logos now show their state: faded grey when off, brand-coloured logo with a yellow ring while starting, green ring when running, red ring when failed.
+
+From 2.0.4-beta.10:
+- The side drawer now lists every service icon (Radarr, Prowlarr, Transmission, Lidarr, Jackett, Bazarr, Seerr; Lidarr and Seerr were removed in beta.11) under Jellyfin and Sonarr. Their pages are empty placeholders for now ("Coming soon") and will be filled in later updates.
+
+From 2.0.4-beta.9:
+- Side drawer now works properly in Arabic (RTL): it slides in from the right next to the Menu button, closes by swiping toward the edge, and has rounded corners on the side facing the content.
+
+From 2.0.4-beta.8:
+- New icon-only side drawer: the Jellyfin Library and Sonarr tabs moved out of the bottom bar. Tap the new Menu icon in the bottom bar to slide the drawer in (tap outside, swipe left or press Back to close it).
+- Update bar fix: the download / install bar at the top is no longer hidden under the phone's status bar.
+
+From 2.0.4-beta.7:
+- Sonarr tab is now a full Sonarr client (inspired by nzb360):
+  - SERIES: browse your library with posters, filter, open any series (seasons and episodes), monitor / unmonitor series, seasons and episodes, SEARCH / REFRESH / RESCAN, delete downloaded episode files, delete a series (optionally with files).
+  - ADD: search TheTVDB and add a series (root folder, quality profile, monitor mode, series type, season folders, search for missing).
+  - INTERACTIVE SEARCH: pick and grab a specific release for an episode or a whole season.
+  - CALENDAR, QUEUE (live progress, remove / blocklist), HISTORY, WANTED (search one or all missing).
+  - SYSTEM: version, health warnings, disk space, root folders (add / remove), quality profiles, indexers, download clients, RSS sync / refresh / rescan / backup.
+  - AUTO: the automatic missing-episode search is still there.
+
+From 2.0.4-beta.6:
+- Update bar at the top of the app: while an update downloads it shows the live percentage; when ready it shows an INSTALL button. It stays on screen until you close it with the X.
+
+From 2.0.4-beta.5:
+- Faster, smoother UI: log reading and colouring moved off the main thread (the Activity tab no longer freezes).
+- Hidden tabs no longer refresh in the background; service cards are rebuilt only when something actually changed.
+- Settings no longer rescans storage every time it is opened (at most every 30 s).
+- Light performance timing added to help find remaining slow spots.
+
+From 2.0.4-beta.4:
+- New Sonarr tab: lists monitored missing episodes (with a SEARCH button for each) and an AUTO-SEARCH option that asks Sonarr to search all missing episodes every N minutes, with PREVIEW and SEARCH NOW (replaces the old Termux missing-fix.sh job).
+
+From 2.0.4-beta.3:
+- Arabic language support: the whole app can now be used in Arabic or English (Settings > Appearance > Language), with full right-to-left layout. "System" follows your phone's language.
+- Texts without an Arabic translation yet stay in English.
+
+From 2.0.4-beta.2:
+- Material 3 redesign: new colour system, pill-shaped buttons (filled / tonal / outlined) with press animation, and a new bottom navigation bar with labels and an active indicator.
+- Settings > Appearance: choose System, Light, Dark or AMOLED black, pick an accent colour (8 presets), or use Dynamic colours from your wallpaper (Material You, Android 12+). Includes a live preview and "Reset to default".
+- Settings are now grouped by task: Personalize, Server, Device & Security, Maintenance.
+- Navigation is ordered by what you do: Home, Library, Media, Activity, Settings.
+- Home: startup progress and error cards now appear right under the server status.
+- Dialogs, switches, chips and all screens follow the selected theme (default stays AMOLED black with the blue accent).
+
+From 2.0.4-beta.1:
+- Consistent design across ALL tabs: one card style (colour, border, corner radius) for Home, Library, Downloads, Services and Settings.
+- Unified section titles (same font, size, colour and spacing everywhere).
+- Settings cards and rows now match the rest of the app.
+
+From 2.0.3:
+- START SERVER / Restart / Stop on Home now control the WHOLE server: Jellyfin + all installed companion services (Transmission, Prowlarr, Radarr, Sonarr...).
+- "Start on app launch" now starts the full server too.
+- SYNC STACK now opens a live dialog: what is synchronized, which services are running/skipped, and each step as it happens.
+
+From 2.0.2:
+- Updates: the button now says "تنزيل التحديث" (download only); installing is a separate "تثبيت التحديث" button.
+- The downloaded file is kept on the device and downloads resume automatically (also after closing the app or losing the connection), so nothing is downloaded twice.
+- New setting: download updates automatically in the background (optionally Wi-Fi only), with a notification when ready.
+- Installed update files are deleted automatically after the update is installed.
+
+From 2.0.1:
+- The app is now named Jellyarr (display name, notifications and screens). Same signing key and package, so it installs over the previous version and keeps all data.
+
+From 2.0.0 (first stable release):
+- Update notifications: Fishbowl now checks for new versions in the background and notifies you outside the app (system notification) and inside the app (pop-up).
+- Separate Stable and Beta update settings: choose for each channel whether to get a system notification and/or an in-app notice, and set the check interval.
+- In-app download, verification and installation of updates, straight from the notice or from Settings > Software Updates.
+- Updates now come from the Jellyarr releases (same signing key, installs over the current version).
+- "What's new" summary shown after every update and in Settings > Software Updates.
+- Settings are split into separate pages, one per section, with all options visible directly (no folded lists inside).
+- Switches are brightly coloured when ON; SAVE buttons stay dimmed until a value changes.
+- Backup & Restore: export no longer aborts when a database is busy or one file is unreadable; it also saves Transmission torrents/resume data, shows a detailed error window if it fails, and uses a safer file move.
+- First stable release: includes everything from the 2.x beta builds.
+- Library tab, Transmission controls/history and automation features from earlier builds.

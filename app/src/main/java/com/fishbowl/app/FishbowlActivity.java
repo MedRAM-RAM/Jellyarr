@@ -140,12 +140,30 @@ import org.json.JSONArray;
 public final class FishbowlActivity extends AppCompatActivity
         implements JellyfinController.Listener, JellyfinController.LogListener {
 
+    @Override
+    protected void attachBaseContext(android.content.Context newBase) {
+        super.attachBaseContext(I18n.wrap(newBase));
+    }
+
     private static final String TAG = "FishbowlActivity";
     private JellyfinController controller;
     private SharedPreferences settingsPrefs;
 
     // Active tab state (0: Home, 1: Logs, 2: Settings)
     private int activeTab = 0;
+    private View cachedLibraryView;
+    private LibraryTabView libraryTabView;
+    private View cachedSonarrView;
+    private SonarrTabView sonarrTabView;
+    private View cachedRadarrView;
+    private RadarrTabView radarrTabView;
+    private View cachedTransmissionView;
+    private TransmissionTabView transmissionTabView;
+    private static final int TAB_RADARR = 10;
+    private static final int TAB_TRANSMISSION = 12;
+    private View cachedProwlarrView;
+    private ProwlarrTabView prowlarrTabView;
+    private static final int TAB_PROWLARR = 11;
 
     // Containers
     private LinearLayout rootLayout;
@@ -333,15 +351,45 @@ public final class FishbowlActivity extends AppCompatActivity
         }
     });
 
+    /** Runs {@code r} on the background pool; ignored once the pool is shut down in onDestroy. */
+    private void runBg(Runnable r) {
+        try {
+            bgExecutor.execute(r);
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            // activity is being destroyed
+        }
+    }
+
+    /** True while it is safe to show dialogs and touch the view tree. */
+    private boolean isUiAlive() {
+        return !isFinishing() && !isDestroyed();
+    }
+
+    /** Shows a dialog unless the activity is finishing (avoids WindowManager$BadTokenException). */
+    private boolean safeShow(Dialog d) {
+        if (d == null || !isUiAlive()) return false;
+        try {
+            d.show();
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "dialog show failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** True between onStart and onStop (pollers only run while the activity is visible). */
+    private boolean uiStarted = false;
+
     // Download Center Auto-Refresh Poller (Dynamic throttle: 1.5s active, 3.5s idle)
     private final Handler downloadAutoRefreshHandler = new Handler(Looper.getMainLooper());
     private volatile boolean hasActiveDownloads = false;
     private final Runnable downloadRefreshRunnable = new Runnable() {
         @Override
         public void run() {
-            if (activeTab == 1 && !isFinishing() && (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1 || !isDestroyed())) {
-                refreshDownloadCenter();
-                long delay = hasActiveDownloads ? 1500L : 3500L;
+            if (activeTab == TAB_TRANSMISSION && uiStarted && isUiAlive()) {
+                boolean visible = downloadItemsContainer != null && downloadItemsContainer.isShown();
+                if (visible) refreshDownloadCenter();
+                long delay = (visible && hasActiveDownloads) ? 1500L : 3500L;
                 downloadAutoRefreshHandler.postDelayed(this, delay);
             }
         }
@@ -351,6 +399,8 @@ public final class FishbowlActivity extends AppCompatActivity
     private LinearLayout servicesCardsContainer;
     private TextView servicesSummaryBadge;
     private Button masterStackToggleBtn;
+    private View masterStackGap;
+    private MediaToolsView mediaToolsView;
     private TextView homeServicesCountBadge;
     private LinearLayout homeServicesRow;
     private boolean isAvailableServicesDrawerOpen = false;
@@ -381,10 +431,20 @@ public final class FishbowlActivity extends AppCompatActivity
     private final Runnable healthPollRunnable = new Runnable() {
         @Override
         public void run() {
+            // Only polls while Home is the visible tab; renderActiveTab() restarts it when Home is shown again.
+            if (activeTab != 0 || !uiStarted) return;
             refreshServerHealthUI();
             healthHandler.postDelayed(this, 4000);
         }
     };
+
+    /** Restarts the Home health poller (no-op unless Home is visible and the activity is started). */
+    private void restartHealthPolling() {
+        healthHandler.removeCallbacks(healthPollRunnable);
+        if (activeTab == 0 && uiStarted) healthHandler.post(healthPollRunnable);
+    }
+
+    private final Runnable firstRunFlowRunnable = this::maybeRunFirstRunFlow;
 
     // Network Callback & Receiver
     private ConnectivityManager.NetworkCallback networkCallback;
@@ -477,10 +537,17 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Start watching for Jellyfin password reset token files and notify user
         PasswordResetManager.getInstance(getApplicationContext()).startMonitoring();
-        passwordResetListener = info -> runOnUiThread(() -> updatePasswordResetBanner(info));
+        passwordResetListener = new PasswordResetManager.ResetStateListener() {
+            @Override
+            public void onResetStateChanged(PasswordResetManager.ActiveResetInfo info) {
+                runOnUiThread(() -> {
+                    if (isUiAlive()) updatePasswordResetBanner(info);
+                });
+            }
+        };
         PasswordResetManager.registerListener(passwordResetListener);
 
-        setContentView(buildMainPixelShell());
+        setContentView(I18n.attach(buildMainPixelShell()));
         // Initialize native Chromium in-app Cloudflare solver (headless WebView on port 8191)
         com.fishbowl.app.services.NativeFlareSolver.getInstance().init(this);
         setupSystemBarsAndInsets();
@@ -491,17 +558,39 @@ public final class FishbowlActivity extends AppCompatActivity
             activeTab = savedInstanceState.getInt("activeTab", 0);
             updateBottomNavSelection();
             renderActiveTab();
+            String reopen = savedInstanceState.getString("settingsSection");
+            if (reopen != null) openSettingsSectionByName(reopen);
         }
 
         // Auto-start server on app launch ONLY if explicitly enabled in preferences or uninitialized
         if (!JellyfinBootstrapper.isInitialized(this)) {
-            Log.i(TAG, "Fishbowl runtime uninitialized on app launch. Automatically initiating initial setup & extraction.");
+            Log.i(TAG, "Jellyarr runtime uninitialized on app launch. Automatically initiating initial setup & extraction.");
             showSetupOverlay(false);
             ensureBootstrapStartedIfNeeded();
         } else {
             triggerAutoStartOnAppLaunchIfEnabled();
         }
         handleControlIntent(getIntent());
+    }
+
+    /** Starts the whole server: Jellyfin plus every installed companion service (then auto-wires them). */
+    private void startFullServer() {
+        if (controller != null) controller.start(getApplicationContext());
+        triggerServerAction(JellyfinServerService.ACTION_START_JELLYFIN);
+        try {
+            MediaServiceManager mgr = MediaServiceManager.getInstance(this);
+            if (isMediaStackEnabled()) mgr.startCompanionServices();
+        } catch (Throwable t) { Log.w(TAG, "startFullServer companions: " + t.getMessage()); }
+        refreshHomeServicesBadge();
+    }
+
+    /** Stops the whole server: companion services first, then Jellyfin. */
+    private void stopFullServer() {
+        try { MediaServiceManager.getInstance(this).stopCompanionServices(); }
+        catch (Throwable t) { Log.w(TAG, "stopFullServer companions: " + t.getMessage()); }
+        if (controller != null) controller.stop();
+        triggerServerAction(JellyfinServerService.ACTION_STOP_JELLYFIN);
+        refreshHomeServicesBadge();
     }
 
     private void triggerAutoStartOnAppLaunchIfEnabled() {
@@ -511,11 +600,8 @@ public final class FishbowlActivity extends AppCompatActivity
         if (startOnAppLaunch) {
             JellyfinController.State state = controller != null ? controller.getState() : JellyfinController.State.UNINITIALIZED;
             if (state != JellyfinController.State.RUNNING && state != JellyfinController.State.STARTING && state != JellyfinController.State.INITIALIZING) {
-                Log.i(TAG, "Auto-start on app launch triggered: launching Jellyfin server only (current state=" + state + ")");
-                if (controller != null) {
-                    controller.start(getApplicationContext());
-                }
-                triggerServerAction(JellyfinServerService.ACTION_START_JELLYFIN);
+                Log.i(TAG, "Auto-start on app launch triggered: launching full server (current state=" + state + ")");
+                startFullServer();
                 renderCurrentState();
             }
         }
@@ -530,6 +616,7 @@ public final class FishbowlActivity extends AppCompatActivity
         super.onNewIntent(intent);
         setIntent(intent);
         handleControlIntent(intent);
+        handleUpdateIntent(intent);
         if (intent != null && Intent.ACTION_MAIN.equals(intent.getAction()) && intent.hasCategory(Intent.CATEGORY_LAUNCHER)) {
             triggerAutoStartOnAppLaunchIfEnabled();
         }
@@ -582,38 +669,43 @@ public final class FishbowlActivity extends AppCompatActivity
     @Override
     protected void onStart() {
         super.onStart();
+        uiStarted = true;
         controller.addListener(this);
-        controller.reconcileStateAsync();
         controller.addLogListener(this);
         MediaServiceManager.getInstance(this).addListener(serviceListener);
-        MediaServiceManager.getInstance(this).reconcileRunningServices();
         UpdateManager.getInstance(this).addListener(updateListener);
+        refreshUpdateBanner();
         UpdateManager.getInstance(this).checkForUpdates(this, false);
         refreshLanAddress();
-        refreshHomeServicesBadge();
         renderCurrentState();
-        refreshUpdateUI();
+        // reconcile*, refreshHomeServicesBadge() and refreshUpdateUI() run in onResume(), which always follows.
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         PasswordResetManager.getInstance(getApplicationContext()).checkOnce();
+        mainHandler.removeCallbacks(firstRunFlowRunnable);
+        mainHandler.postDelayed(firstRunFlowRunnable, 1500);
         if (controller != null) {
             controller.reconcileStateAsync();
         }
         MediaServiceManager.getInstance(this).reconcileRunningServices();
         MediaServiceManager.getInstance(this).scheduleAutoWireDebounced(4000);
         refreshUpdateUI();
+        UpdateNotifier.schedule(this);
+        UpdateManager.getInstance(this).restoreSavedState(this);
+        maybeShowWhatsNewAfterUpdate();
+        runStartupUpdateCheck();
+        handleUpdateIntent(getIntent());
         refreshHomeServicesBadge();
-        healthHandler.removeCallbacks(healthPollRunnable);
-        healthHandler.post(healthPollRunnable);
+        restartHealthPolling();
         refreshPermissionsUI();
         updatePasswordResetBanner(PasswordResetManager.getActiveResetInfo());
         refreshHomeAccountsUI();
 
         // Background automatic cleanup for orphan media folders (e.g. movies deleted in Jellyfin leaving only .nfo or empty folders)
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             try {
                 MediaStorageManager.getInstance(FishbowlActivity.this).cleanupOrphanMediaFolders();
             } catch (Throwable ignored) {}
@@ -624,7 +716,7 @@ public final class FishbowlActivity extends AppCompatActivity
         } else {
             triggerAutoStartOnAppLaunchIfEnabled();
         }
-        if (activeTab == 1) {
+        if (activeTab == TAB_TRANSMISSION) {
             downloadAutoRefreshHandler.removeCallbacks(downloadRefreshRunnable);
             downloadAutoRefreshHandler.post(downloadRefreshRunnable);
         }
@@ -632,6 +724,8 @@ public final class FishbowlActivity extends AppCompatActivity
 
     @Override
     protected void onStop() {
+        uiStarted = false;
+        mainHandler.removeCallbacks(firstRunFlowRunnable);
         controller.removeListener(this);
         controller.removeLogListener(this);
         MediaServiceManager.getInstance(this).removeListener(serviceListener);
@@ -641,6 +735,8 @@ public final class FishbowlActivity extends AppCompatActivity
         healthHandler.removeCallbacks(healthPollRunnable);
         downloadAutoRefreshHandler.removeCallbacksAndMessages(null);
         mainHandler.removeCallbacks(startupProgressPoller);
+        // the reset-PIN countdown is restarted by updatePasswordResetBanner() in onResume()
+        resetBannerCountdownHandler.removeCallbacksAndMessages(null);
         super.onStop();
     }
 
@@ -649,8 +745,19 @@ public final class FishbowlActivity extends AppCompatActivity
         unregisterUsbReceiver();
         teardownNetworkMonitor();
         controller.removeLogListener(this);
+        controller.removeListener(this);
         logUpdateHandler.removeCallbacksAndMessages(null);
         downloadAutoRefreshHandler.removeCallbacksAndMessages(null);
+        // Nothing scheduled on the UI handlers may run against a destroyed activity.
+        mainHandler.removeCallbacksAndMessages(null);
+        healthHandler.removeCallbacksAndMessages(null);
+        resetBannerCountdownHandler.removeCallbacksAndMessages(null);
+        serviceUiThrottleHandler.removeCallbacksAndMessages(null);
+        updateUiHandler.removeCallbacksAndMessages(null);
+        if (passwordResetListener != null) {
+            PasswordResetManager.unregisterListener(passwordResetListener);
+            passwordResetListener = null;
+        }
         com.fishbowl.app.services.NativeFlareSolver.getInstance().stop();
         bgExecutor.shutdown();
         super.onDestroy();
@@ -660,26 +767,52 @@ public final class FishbowlActivity extends AppCompatActivity
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         outState.putInt("activeTab", activeTab);
+        if (settingsOpenName != null) outState.putString("settingsSection", settingsOpenName);
     }
 
     @Override
     protected void onRestoreInstanceState(Bundle savedInstanceState) {
         super.onRestoreInstanceState(savedInstanceState);
-        if (savedInstanceState != null) {
-            activeTab = savedInstanceState.getInt("activeTab", 0);
-            updateBottomNavSelection();
-            renderActiveTab();
-        }
+        // onCreate() already restored the tab and the open Settings section; rendering again here
+        // only duplicated every refresh.
     }
 
     @Override
     public void onConfigurationChanged(android.content.res.Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
-        // Configuration changes handled without destroying or restarting activity
+        // Configuration changes are handled without restarting, except when the app follows the
+        // system light/dark setting and that setting just flipped: colours are baked into views.
+        if (AppTheme.getMode(this) == AppTheme.MODE_SYSTEM) {
+            boolean nightNow = (newConfig.uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+                    == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+            if (nightNow != AppTheme.isDark()) recreate();
+        }
     }
 
     @Override
     public void onBackPressed() {
+        if (sideDrawerOpen) {
+            closeSideDrawer();
+            return;
+        }
+        if (activeTab == 5 && libraryTabView != null && libraryTabView.onBack()) {
+            return;
+        }
+        if (activeTab == 6 && sonarrTabView != null && sonarrTabView.onBack()) {
+            return;
+        }
+        if (activeTab == TAB_RADARR && radarrTabView != null && radarrTabView.onBack()) {
+            return;
+        }
+        if (activeTab == TAB_TRANSMISSION && transmissionTabView != null && transmissionTabView.onBack()) {
+            return;
+        }
+        if (activeTab == TAB_PROWLARR && prowlarrTabView != null && prowlarrTabView.onBack()) {
+            return;
+        }
+        if (activeTab == 3 && closeSettingsSection()) {
+            return;
+        }
         if (activeTab != 0) {
             activeTab = 0;
             updateBottomNavSelection();
@@ -695,7 +828,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 renderActiveTab();
                 return;
             }
-            Toast.makeText(this, "Setup in progress. Please keep Fishbowl open.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Setup in progress. Please keep Jellyarr open."), Toast.LENGTH_SHORT).show();
             moveTaskToBack(true);
             return;
         }
@@ -709,12 +842,11 @@ public final class FishbowlActivity extends AppCompatActivity
         WindowCompat.setDecorFitsSystemWindows(window, false);
 
         WindowInsetsControllerCompat controllerCompat = new WindowInsetsControllerCompat(window, window.getDecorView());
-        controllerCompat.setAppearanceLightStatusBars(false);
-        controllerCompat.setAppearanceLightNavigationBars(false);
+        controllerCompat.setAppearanceLightStatusBars(!AppTheme.isDark());
+        controllerCompat.setAppearanceLightNavigationBars(!AppTheme.isDark());
 
-        int color = getSurfaceColor();
-        window.setStatusBarColor(color);
-        window.setNavigationBarColor(color);
+        window.setStatusBarColor(getSurfaceColor());
+        window.setNavigationBarColor(AppTheme.card());
 
         ViewCompat.setOnApplyWindowInsetsListener(rootLayout, (v, insets) -> {
             androidx.core.graphics.Insets statusBarInset = insets.getInsets(WindowInsetsCompat.Type.statusBars());
@@ -722,11 +854,10 @@ public final class FishbowlActivity extends AppCompatActivity
 
             statusBarInsetTop = statusBarInset.top;
             statusBarInsetBottom = navBarInset.bottom;
-            if (headerBar != null) {
-                headerBar.setPadding(dp(20), statusBarInset.top + dp(10), dp(20), dp(10));
-            }
+            applyTopInsets();
+            applyDrawerInsets(statusBarInset.top, navBarInset.bottom);
             if (bottomNavLayout != null) {
-                bottomNavLayout.setPadding(0, dp(6), 0, navBarInset.bottom + dp(6));
+                bottomNavLayout.setPadding(dp(8), dp(8), dp(8), navBarInset.bottom + dp(8));
             }
             if (setupOverlayContainer != null) {
                 setupOverlayContainer.setPadding(dp(24), statusBarInset.top + dp(28), dp(24), navBarInset.bottom + dp(24));
@@ -736,37 +867,52 @@ public final class FishbowlActivity extends AppCompatActivity
         });
     }
 
+    private boolean isUpdateBannerShown() {
+        return updateBannerBar != null && updateBannerBar.getVisibility() == View.VISIBLE;
+    }
+
+    /** The update bar sits at the very top, so while it is visible IT owns the status-bar inset. */
+    private void applyTopInsets() {
+        boolean banner = isUpdateBannerShown();
+        if (updateBannerBar != null) updateBannerBar.setPadding(0, banner ? statusBarInsetTop : 0, 0, 0);
+        if (headerBar != null) {
+            headerBar.setPadding(dp(20), (banner ? 0 : statusBarInsetTop) + dp(10), dp(20), dp(10));
+        }
+        updateContentInsetsForTab();
+    }
+
     private void updateContentInsetsForTab() {
         if (contentContainer == null) return;
-        if (activeTab == 0) {
+        if (activeTab == 0 || isUpdateBannerShown()) {
             contentContainer.setPadding(0, 0, 0, 0);
         } else {
             contentContainer.setPadding(0, statusBarInsetTop > 0 ? statusBarInsetTop : dp(24), 0, 0);
         }
     }
 
-    // -- Theme Engine (Pure Dark Mode Only) -----------------------------------
+    // -- Theme Engine (System / Light / Dark / AMOLED + accent, see AppTheme) -------
 
     private void applySavedThemeMode() {
-        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
+        AppTheme.init(this);
+        AppTheme.applyNightMode();
     }
 
     private boolean isDarkTheme() {
-        return true;
+        return AppTheme.isDark();
     }
 
-    // -- Colors & Design Tokens (Google Stitch Minimalist) --------------------
+    // -- Colors & Design Tokens (Material 3 colour roles via AppTheme) ---------
 
-    private int getBgColor() { return Color.parseColor("#000000"); }
-    private int getSurfaceColor() { return Color.parseColor("#000000"); }
-    private int getSurfaceElevatedColor() { return Color.parseColor("#0C0C0E"); }
-    private int getBorderColor() { return Color.argb(20, 255, 255, 255); }
-    private int getPrimaryTextColor() { return Color.parseColor("#F4F4F5"); }
-    private int getSecondaryTextColor() { return Color.parseColor("#A1A1AA"); }
-    private int getAccentColor() { return Color.parseColor("#38BDF8"); }
-    private int getSuccessColor() { return Color.parseColor("#34D399"); }
-    private int getWarningColor() { return Color.parseColor("#FFD51E"); }
-    private int getDangerColor() { return Color.parseColor("#FF1744"); }
+    private int getBgColor() { return AppTheme.bg(); }
+    private int getSurfaceColor() { return AppTheme.bg(); }
+    private int getSurfaceElevatedColor() { return AppTheme.card(); }
+    private int getBorderColor() { return AppTheme.outline(); }
+    private int getPrimaryTextColor() { return AppTheme.text(); }
+    private int getSecondaryTextColor() { return AppTheme.textSecondary(); }
+    private int getAccentColor() { return AppTheme.accent(); }
+    private int getSuccessColor() { return AppTheme.success(); }
+    private int getWarningColor() { return AppTheme.warning(); }
+    private int getDangerColor() { return AppTheme.danger(); }
 
     private GradientDrawable createCardDrawable(int bgColor, int radiusDp) {
         int r = radiusDp > 0 ? radiusDp : dp(14);
@@ -780,6 +926,9 @@ public final class FishbowlActivity extends AppCompatActivity
         rootLayout = new LinearLayout(this);
         rootLayout.setOrientation(LinearLayout.VERTICAL);
         rootLayout.setBackgroundColor(getBgColor());
+
+        // Persistent update bar (download progress / install) - stays until the user closes it
+        rootLayout.addView(buildUpdateBanner());
 
         // Header Bar
         headerBar = buildHeaderBar();
@@ -836,6 +985,42 @@ public final class FishbowlActivity extends AppCompatActivity
         contentContainer.addView(cachedLogsView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        libraryTabView = new LibraryTabView(this);
+        cachedLibraryView = libraryTabView.getView();
+        cachedLibraryView.setVisibility(View.GONE);
+        contentContainer.addView(cachedLibraryView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        sonarrTabView = new SonarrTabView(this);
+        cachedSonarrView = sonarrTabView.getView();
+        cachedSonarrView.setVisibility(View.GONE);
+        contentContainer.addView(cachedSonarrView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        radarrTabView = new RadarrTabView(this);
+        cachedRadarrView = radarrTabView.getView();
+        cachedRadarrView.setVisibility(View.GONE);
+        contentContainer.addView(cachedRadarrView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        transmissionTabView = new TransmissionTabView(this);
+        transmissionTabView.setCenterView(buildDownloadCenterCard(), this::refreshDownloadCenter);
+        cachedTransmissionView = transmissionTabView.getView();
+        cachedTransmissionView.setVisibility(View.GONE);
+        contentContainer.addView(cachedTransmissionView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        prowlarrTabView = new ProwlarrTabView(this);
+        cachedProwlarrView = prowlarrTabView.getView();
+        cachedProwlarrView.setVisibility(View.GONE);
+        contentContainer.addView(cachedProwlarrView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        cachedPlaceholderView = buildPlaceholderView();
+        cachedPlaceholderView.setVisibility(View.GONE);
+        contentContainer.addView(cachedPlaceholderView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         // Dedicated Full-Screen Setup / Loading Overlay (placed on top of tabs)
         setupOverlayView = buildSetupOverlay();
         contentContainer.addView(setupOverlayView, new FrameLayout.LayoutParams(
@@ -843,16 +1028,22 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Bottom Navigation Bar (4 Destinations: Home, Services, Activity, Settings)
         navDivider = new View(this);
-        navDivider.setBackgroundColor(Color.argb(10, 255, 255, 255));
+        navDivider.setBackgroundColor(AppTheme.outline());
         rootLayout.addView(navDivider, new LinearLayout.LayoutParams(-1, dp(1)));
 
         bottomNavLayout = buildBottomNavBar();
+        bottomNavLayout.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob) -> {
+            if (b - t != ob - ot) syncDrawerBottomMargin();
+        });
         rootLayout.addView(bottomNavLayout);
 
         // Initial tab render
         renderActiveTab();
 
-        return rootLayout;
+        FrameLayout shell = new FrameLayout(this);
+        shell.addView(rootLayout, new FrameLayout.LayoutParams(-1, -1));
+        buildSideDrawer(shell);
+        return shell;
     }
 
     private View buildHeaderBar() {
@@ -869,33 +1060,33 @@ public final class FishbowlActivity extends AppCompatActivity
         // Logo Mark (Fishbowl Logo, White)
         ImageView logo = new ImageView(this);
         logo.setImageResource(R.drawable.ic_fishbowl_logo);
-        logo.setColorFilter(Color.WHITE);
+        logo.setColorFilter(AppTheme.text());
         logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
         LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(dp(28), dp(28));
-        logoParams.rightMargin = dp(10);
+        logoParams.setMarginEnd(dp(10));
         header.addView(logo, logoParams);
 
-        // App Branding Name: FISHBOWL (Uppercase, tracking-widest)
+        // App Branding Name: JELLYARR (Uppercase, tracking-widest)
         TextView title = new TextView(this);
-        title.setText("FISHBOWL");
+        title.setText("JELLYARR");
         title.setTextSize(14f);
         title.setLetterSpacing(0.14f);
         title.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        title.setTextColor(Color.WHITE);
+        title.setTextColor(AppTheme.text());
         header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         TextView verBadge = new TextView(this);
-        verBadge.setText("v" + com.termux.BuildConfig.VERSION_NAME + " • JF v12.4.0");
+        verBadge.setText("v" + com.termux.BuildConfig.VERSION_NAME);
         verBadge.setTextSize(10);
         verBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        verBadge.setTextColor(Color.parseColor("#71717A"));
+        verBadge.setTextColor(AppTheme.textMuted());
         header.addView(verBadge);
 
         rootHeader.addView(header);
 
         // Hairline divider
         View border = new View(this);
-        border.setBackgroundColor(Color.argb(12, 255, 255, 255));
+        border.setBackgroundColor(AppTheme.outline());
         rootHeader.addView(border, new LinearLayout.LayoutParams(-1, dp(1)));
 
         return rootHeader;
@@ -904,69 +1095,99 @@ public final class FishbowlActivity extends AppCompatActivity
     private LinearLayout buildBottomNavBar() {
         LinearLayout nav = new LinearLayout(this);
         nav.setOrientation(LinearLayout.HORIZONTAL);
-        nav.setBackgroundColor(getBgColor());
-        nav.setPadding(dp(16), dp(4), dp(16), dp(4));
+        nav.setBackgroundColor(AppTheme.card());
+        nav.setPadding(dp(8), dp(8), dp(8), dp(8));
 
-        // Icon-Only 4-Tab Bottom Navigation: Home (0), Media Stack & Downloads (1), Activity (2), Settings (3)
-        addNavTab(nav, 0, R.drawable.ic_home);
-        if (isMediaStackEnabled()) {
-            addNavTab(nav, 1, R.drawable.ic_services);
-        }
-        addNavTab(nav, 2, R.drawable.ic_activity);
-        addNavTab(nav, 3, R.drawable.ic_settings);
-
+        populateNavTabs(nav);
         return nav;
     }
 
-    private void addNavTab(LinearLayout parent, int tabIndex, int iconRes) {
-        FrameLayout tab = new FrameLayout(this);
+    /** Material 3 navigation bar, ordered by what you do: control the server (Home), watch
+     *  (Library), search missing episodes (Sonarr), acquire (Media: services + downloads), inspect (Activity), configure (Settings). */
+    private void populateNavTabs(LinearLayout nav) {
+        addNavTab(nav, -1, R.drawable.ic_menu, "Menu");
+        addNavTab(nav, 0, R.drawable.ic_home, "Home");
+        if (isMediaStackEnabled()) {
+            addNavTab(nav, 1, R.drawable.ic_services, "Media");
+        }
+        addNavTab(nav, 2, R.drawable.ic_activity, "Activity");
+        addNavTab(nav, 3, R.drawable.ic_settings, "Settings");
+    }
+
+    private void addNavTab(LinearLayout parent, int tabIndex, int iconRes, String label) {
+        LinearLayout tab = new LinearLayout(this);
+        tab.setOrientation(LinearLayout.VERTICAL);
+        tab.setGravity(Gravity.CENTER_HORIZONTAL);
         tab.setTag(tabIndex);
-        tab.setPadding(0, dp(4), 0, dp(4));
+        tab.setClickable(true);
+        tab.setFocusable(true);
+        tab.setContentDescription(label);
+        tab.setBackground(UiKit.rowRipple(this));
         tab.setOnClickListener(v -> {
+            if (tabIndex == -1) {
+                toggleSideDrawer();
+                return;
+            }
             if (activeTab != tabIndex) {
+                final long t0 = SystemClock.elapsedRealtime();
                 activeTab = tabIndex;
                 updateBottomNavSelection();
                 renderActiveTab();
+                final int shown = tabIndex;
+                v.post(() -> Log.i("JellyarrPerf", "tab " + shown + " switch+layout ms=" + (SystemClock.elapsedRealtime() - t0)));
             }
         });
 
-        View pill = new View(this);
+        // Active indicator ("pill") that holds the icon.
+        FrameLayout pill = new FrameLayout(this);
         pill.setTag("pill");
-        pill.setVisibility(View.GONE);
-        tab.addView(pill, new FrameLayout.LayoutParams(0, 0));
-
         ImageView icon = new ImageView(this);
         icon.setTag("icon");
         icon.setImageResource(iconRes);
         FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(dp(22), dp(22));
         iconParams.gravity = Gravity.CENTER;
-        tab.addView(icon, iconParams);
+        pill.addView(icon, iconParams);
+        tab.addView(pill, new LinearLayout.LayoutParams(dp(60), dp(32)));
 
-        LinearLayout.LayoutParams tabParams = new LinearLayout.LayoutParams(0, dp(48), 1.0f);
-        parent.addView(tab, tabParams);
+        TextView labelView = new TextView(this);
+        labelView.setTag("label");
+        labelView.setText(label);
+        labelView.setTextSize(11f);
+        labelView.setGravity(Gravity.CENTER);
+        labelView.setSingleLine(true);
+        labelView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+        lp.topMargin = dp(4);
+        tab.addView(labelView, lp);
+
+        parent.addView(tab, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
     }
 
     private void updateBottomNavSelection() {
+        updateDrawerSelection();
         if (bottomNavLayout == null) return;
         for (int i = 0; i < bottomNavLayout.getChildCount(); i++) {
             View child = bottomNavLayout.getChildAt(i);
-            if (!(child instanceof FrameLayout)) continue;
-            FrameLayout tab = (FrameLayout) child;
+            if (!(child instanceof LinearLayout)) continue;
+            LinearLayout tab = (LinearLayout) child;
+            View pill = tab.findViewWithTag("pill");
             ImageView icon = tab.findViewWithTag("icon");
+            TextView label = tab.findViewWithTag("label");
             Object tagVal = tab.getTag();
             int tabIndex = (tagVal instanceof Integer) ? (Integer) tagVal : i;
 
-            boolean selected = (tabIndex == activeTab);
-            int color = selected ? Color.WHITE : Color.parseColor("#71717A");
+            boolean selected = (tabIndex == activeTab) || (tabIndex == -1 && isDrawerTab(activeTab));
+            if (pill != null) {
+                pill.setBackground(createRoundedDrawable(selected ? AppTheme.accentContainer() : Color.TRANSPARENT, dp(16)));
+                pill.setScaleX(selected ? 1f : 0.85f);
+                pill.animate().scaleX(1f).setDuration(160).start();
+            }
             if (icon != null) {
-                icon.setColorFilter(color);
-                if (selected) {
-                    icon.setScaleX(1.05f);
-                    icon.setScaleY(1.05f);
-                } else {
-                    icon.setScaleX(1.0f);
-                    icon.setScaleY(1.0f);
-                }
+                icon.setColorFilter(selected ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
+            }
+            if (label != null) {
+                label.setTextColor(selected ? AppTheme.text() : AppTheme.textSecondary());
+                label.setTypeface(Typeface.create("sans-serif-medium", selected ? Typeface.BOLD : Typeface.NORMAL));
             }
         }
     }
@@ -996,14 +1217,26 @@ public final class FishbowlActivity extends AppCompatActivity
         if (cachedActivityView != null) cachedActivityView.setVisibility(activeTab == 2 ? View.VISIBLE : View.GONE);
         if (cachedSettingsView != null) cachedSettingsView.setVisibility(activeTab == 3 ? View.VISIBLE : View.GONE);
         if (cachedLogsView != null) cachedLogsView.setVisibility(activeTab == 4 ? View.VISIBLE : View.GONE);
+        if (cachedLibraryView != null) cachedLibraryView.setVisibility(activeTab == 5 ? View.VISIBLE : View.GONE);
+        if (cachedSonarrView != null) cachedSonarrView.setVisibility(activeTab == 6 ? View.VISIBLE : View.GONE);
+        if (cachedRadarrView != null) cachedRadarrView.setVisibility(activeTab == TAB_RADARR ? View.VISIBLE : View.GONE);
+        if (cachedTransmissionView != null) cachedTransmissionView.setVisibility(activeTab == TAB_TRANSMISSION ? View.VISIBLE : View.GONE);
+        if (cachedProwlarrView != null) cachedProwlarrView.setVisibility(activeTab == TAB_PROWLARR ? View.VISIBLE : View.GONE);
+        if (cachedPlaceholderView != null) {
+            boolean ph = activeTab >= PLACEHOLDER_TAB_BASE && activeTab != TAB_RADARR && activeTab != TAB_TRANSMISSION
+                    && activeTab != TAB_PROWLARR;
+            cachedPlaceholderView.setVisibility(ph ? View.VISIBLE : View.GONE);
+            if (ph) showPlaceholderFor(activeTab);
+        }
 
         if (activeTab == 0) {
             refreshLanAddress();
             refreshHomeServicesBadge();
             refreshHomeAccountsUI();
+            restartHealthPolling();
         } else if (activeTab == 1) {
             refreshServicesTabUI();
-            refreshDownloadCenter();
+            if (mediaToolsView != null) mediaToolsView.refresh(false);
         } else if (activeTab == 2) {
             refreshLogServiceChips();
             updateLogLevelChips();
@@ -1021,6 +1254,17 @@ public final class FishbowlActivity extends AppCompatActivity
             }
             refreshUpdateUI();
             refreshKillTrackerUI();
+        } else if (activeTab == 5) {
+            if (libraryTabView != null) libraryTabView.refresh();
+        } else if (activeTab == 6) {
+            if (sonarrTabView != null) sonarrTabView.refresh();
+        } else if (activeTab == TAB_RADARR) {
+            if (radarrTabView != null) radarrTabView.refresh();
+        } else if (activeTab == TAB_TRANSMISSION) {
+            if (transmissionTabView != null) transmissionTabView.refresh();
+            // the download-center poller is (re)scheduled once, below
+        } else if (activeTab == TAB_PROWLARR) {
+            if (prowlarrTabView != null) prowlarrTabView.refresh();
         } else if (activeTab == 4) {
             refreshUnifiedLogsDisplay();
             if (autoScrollEnabled && logsScrollView != null) {
@@ -1036,7 +1280,7 @@ public final class FishbowlActivity extends AppCompatActivity
             logUpdatePending = false;
         }
 
-        if (activeTab == 1) {
+        if (activeTab == TAB_TRANSMISSION) {
             downloadAutoRefreshHandler.removeCallbacks(downloadRefreshRunnable);
             downloadAutoRefreshHandler.postDelayed(downloadRefreshRunnable, 1000);
         } else {
@@ -1084,14 +1328,14 @@ public final class FishbowlActivity extends AppCompatActivity
         // Setup Brand Logo with subtle glow / accent tint
         ImageView logo = new ImageView(this);
         logo.setImageResource(R.drawable.ic_fishbowl_logo);
-        logo.setColorFilter(Color.WHITE);
+        logo.setColorFilter(AppTheme.text());
         LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(dp(58), dp(58));
         logoParams.bottomMargin = dp(14);
         container.addView(logo, logoParams);
 
         // Setup Title
         TextView title = new TextView(this);
-        title.setText("FishBowl System Setup");
+        title.setText("Jellyarr System Setup");
         title.setTextSize(20);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         title.setTextColor(getPrimaryTextColor());
@@ -1152,7 +1396,7 @@ public final class FishbowlActivity extends AppCompatActivity
         row1.setTag("setup_step_1");
         progressCard.addView(row1);
 
-        TextView row2 = createSetupCheckItem("2. Extracting FishBowl & Jellyfin Core 12.4.0 ARM64 runtime");
+        TextView row2 = createSetupCheckItem("2. Extracting Jellyarr & Jellyfin Core 12.4.0 ARM64 runtime");
         row2.setTag("setup_step_2");
         progressCard.addView(row2);
 
@@ -1174,7 +1418,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout setupDiagCard = new LinearLayout(this);
         setupDiagCard.setOrientation(LinearLayout.VERTICAL);
         setupDiagCard.setPadding(dp(16), dp(12), dp(16), dp(12));
-        setupDiagCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#0B0D12"), Color.parseColor("#1B222C"), dp(1), dp(12)));
+        setupDiagCard.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(12)));
         LinearLayout.LayoutParams sdcParams = new LinearLayout.LayoutParams(-1, -2);
         sdcParams.bottomMargin = dp(12);
         setupDiagCard.setLayoutParams(sdcParams);
@@ -1183,7 +1427,7 @@ public final class FishbowlActivity extends AppCompatActivity
         sdcTitle.setText("SYSTEM & PORT PRE-FLIGHT CHECK");
         sdcTitle.setTextSize(11);
         sdcTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        sdcTitle.setTextColor(Color.parseColor("#38BDF8"));
+        sdcTitle.setTextColor(AppTheme.accent());
         setupDiagCard.addView(sdcTitle);
 
         TextView sdcDetails = new TextView(this);
@@ -1191,7 +1435,7 @@ public final class FishbowlActivity extends AppCompatActivity
         sdcDetails.setText("• Architecture: " + abiStr + " (64-bit)\n• Core Port 8096: Probing...\n• Companion Ports: Probing...");
         sdcDetails.setTextSize(11);
         sdcDetails.setTypeface(Typeface.MONOSPACE);
-        sdcDetails.setTextColor(Color.parseColor("#D4D4D8"));
+        sdcDetails.setTextColor(AppTheme.text());
         sdcDetails.setPadding(0, dp(4), 0, 0);
         setupDiagCard.addView(sdcDetails);
 
@@ -1232,7 +1476,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout logCard = new LinearLayout(this);
         logCard.setOrientation(LinearLayout.VERTICAL);
         logCard.setPadding(dp(16), dp(12), dp(16), dp(12));
-        logCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#08090C"), getBorderColor(), dp(1), dp(10)));
+        logCard.setBackground(createBorderedRoundedDrawable(AppTheme.card(), getBorderColor(), dp(1), dp(10)));
         LinearLayout.LayoutParams logCardParams = new LinearLayout.LayoutParams(-1, -2);
         logCardParams.bottomMargin = dp(12);
         logCard.setLayoutParams(logCardParams);
@@ -1249,7 +1493,7 @@ public final class FishbowlActivity extends AppCompatActivity
         setupLogSummaryText.setText("Initializing unpacker engine...");
         setupLogSummaryText.setTextSize(11);
         setupLogSummaryText.setTypeface(Typeface.MONOSPACE);
-        setupLogSummaryText.setTextColor(Color.parseColor("#10B981"));
+        setupLogSummaryText.setTextColor(AppTheme.success());
         setupLogSummaryText.setMaxLines(4);
         setupLogSummaryText.setEllipsize(android.text.TextUtils.TruncateAt.END);
         logCard.addView(setupLogSummaryText);
@@ -1258,7 +1502,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Advisory Note
         TextView note = new TextView(this);
-        note.setText("Please keep FishBowl open while runtime extraction completes.\nThis setup process only runs once.");
+        note.setText("Please keep Jellyarr open while runtime extraction completes.\nThis setup process only runs once.");
         note.setTextSize(11.5f);
         note.setTextColor(getSecondaryTextColor());
         note.setGravity(Gravity.CENTER);
@@ -1266,7 +1510,7 @@ public final class FishbowlActivity extends AppCompatActivity
         container.addView(note);
 
         // Continue to FishBowl button (Shown when setup is completed or previewed)
-        setupDismissBtn = createPixelButton("CONTINUE TO FISHBOWL", getAccentColor(), Color.WHITE);
+        setupDismissBtn = createPixelButton("CONTINUE TO FISHBOWL", getAccentColor(), AppTheme.onAccent());
         setupDismissBtn.setFocusable(true);
         setupDismissBtn.setFocusableInTouchMode(true);
         setupDismissBtn.setOnClickListener(v -> {
@@ -1284,7 +1528,7 @@ public final class FishbowlActivity extends AppCompatActivity
         container.addView(setupDismissBtn, pDismiss);
 
         // Retry & Reinstall Buttons (Shown only if failure occurs)
-        setupRetryBtn = createPixelButton("RETRY SETUP", getAccentColor(), Color.WHITE);
+        setupRetryBtn = createPixelButton("RETRY SETUP", getAccentColor(), AppTheme.onAccent());
         setupRetryBtn.setOnClickListener(v -> {
             setupRetryBtn.setVisibility(View.GONE);
             triggerServerAction(JellyfinServerService.ACTION_START);
@@ -1295,7 +1539,7 @@ public final class FishbowlActivity extends AppCompatActivity
         pRetry.bottomMargin = dp(8);
         container.addView(setupRetryBtn, pRetry);
 
-        Button setupReinstallBtn = createPixelButton("CLEAN REINSTALL", Color.parseColor("#455A64"), Color.WHITE);
+        Button setupReinstallBtn = createPixelButton("CLEAN REINSTALL", AppTheme.inner(), Color.WHITE);
         setupReinstallBtn.setOnClickListener(v -> showReinstallConfirmation());
         setupReinstallBtn.setTag("setup_reinstall_btn");
         setupReinstallBtn.setVisibility(View.GONE);
@@ -1312,7 +1556,7 @@ public final class FishbowlActivity extends AppCompatActivity
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(16), dp(12), dp(16), dp(12));
         card.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#0B0D12"), Color.parseColor("#1B222C"), dp(1), dp(12)));
+                AppTheme.card(), AppTheme.outline(), dp(1), dp(12)));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.bottomMargin = dp(12);
         card.setLayoutParams(lp);
@@ -1321,13 +1565,13 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("REQUIRED PERMISSIONS ONBOARDING");
         title.setTextSize(11);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#38BDF8"));
+        title.setTextColor(AppTheme.accent());
         card.addView(title);
 
         TextView sub = new TextView(this);
         sub.setText("Grant permissions now to enable 24/7 background streaming and external drive access.");
         sub.setTextSize(10.5f);
-        sub.setTextColor(Color.parseColor("#71717A"));
+        sub.setTextColor(AppTheme.textMuted());
         sub.setPadding(0, dp(2), 0, dp(8));
         card.addView(sub);
 
@@ -1364,8 +1608,8 @@ public final class FishbowlActivity extends AppCompatActivity
         // Row 4: OEM Autostart
         setupPermOemBadge = new TextView(this);
         setupPermOemBadge.setText("CONFIGURE");
-        setupPermOemBadge.setTextColor(Color.parseColor("#F59E0B"));
-        setupPermOemBadge.setBackground(createRoundedDrawable(Color.parseColor("#3A2E1A"), dp(6)));
+        setupPermOemBadge.setTextColor(AppTheme.warning());
+        setupPermOemBadge.setBackground(createRoundedDrawable(AppTheme.warningContainer(), dp(6)));
         setupPermOemBadge.setPadding(dp(6), dp(2), dp(6), dp(2));
         setupPermOemBadge.setTextSize(9f);
         setupPermOemBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
@@ -1377,7 +1621,7 @@ public final class FishbowlActivity extends AppCompatActivity
         ));
 
         // Grant All Button
-        setupBtnGrantAll = createPixelButton("GRANT ALL PERMISSIONS", getAccentColor(), Color.WHITE);
+        setupBtnGrantAll = createPixelButton("GRANT ALL PERMISSIONS", getAccentColor(), AppTheme.onAccent());
         setupBtnGrantAll.setTextSize(10.5f);
         setupBtnGrantAll.setOnClickListener(v -> com.fishbowl.app.permissions.AppPermissionManager.grantNextUngrantedPermission(this));
         LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(-1, dp(36));
@@ -1404,13 +1648,13 @@ public final class FishbowlActivity extends AppCompatActivity
         t.setText(title);
         t.setTextSize(12f);
         t.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        t.setTextColor(Color.WHITE);
+        t.setTextColor(AppTheme.text());
         textCol.addView(t);
 
         TextView d = new TextView(this);
         d.setText(desc);
         d.setTextSize(10f);
-        d.setTextColor(Color.parseColor("#71717A"));
+        d.setTextColor(AppTheme.textMuted());
         textCol.addView(d);
 
         row.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -1514,11 +1758,11 @@ public final class FishbowlActivity extends AppCompatActivity
             if (setupDetailText != null) {
                 String errSummary = (lastErr != null && !lastErr.isEmpty()) ? lastErr : "Installation failed or incomplete.";
                 setupDetailText.setText(errSummary + "\nTap RETRY SETUP or CLEAN REINSTALL to unpack fresh binaries.");
-                setupDetailText.setTextColor(Color.parseColor("#E57373"));
+                setupDetailText.setTextColor(AppTheme.danger());
             }
             if (setupProgressText != null) {
                 setupProgressText.setText("FAILED");
-                setupProgressText.setTextColor(Color.parseColor("#E57373"));
+                setupProgressText.setTextColor(AppTheme.danger());
             }
             if (setupRetryBtn != null) {
                 setupRetryBtn.setVisibility(View.VISIBLE);
@@ -1549,7 +1793,7 @@ public final class FishbowlActivity extends AppCompatActivity
             if (setupDetailText != null) {
                 String detail = (msg != null && !msg.isEmpty()) ? msg : (initialized ? "Runtime components fully verified & ready." : "Configuring runtime files...");
                 setupDetailText.setText(detail);
-                setupDetailText.setTextColor(initialized ? Color.parseColor("#10B981") : getSecondaryTextColor());
+                setupDetailText.setTextColor(initialized ? AppTheme.success() : getSecondaryTextColor());
             }
             if (setupRetryBtn != null) {
                 setupRetryBtn.setVisibility(View.GONE);
@@ -1568,7 +1812,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
             // Update stage rows
             updateSetupStageItem("setup_step_1", "1. Recombining split package archives (asset chunks)", pct >= 35 || initialized, pct > 0 && pct < 35);
-            updateSetupStageItem("setup_step_2", "2. Extracting FishBowl & Jellyfin Core 12.4.0 ARM64 runtime", pct >= 65 || initialized, pct >= 35 && pct < 65);
+            updateSetupStageItem("setup_step_2", "2. Extracting Jellyarr & Jellyfin Core 12.4.0 ARM64 runtime", pct >= 65 || initialized, pct >= 35 && pct < 65);
             updateSetupStageItem("setup_step_3", "3. Unpacking Microsoft .NET 10 & FFmpeg 7.1.4 transcoder", pct >= 88 || initialized, pct >= 65 && pct < 88);
             updateSetupStageItem("setup_step_4", "4. Configuring POSIX permissions & system libraries", pct >= 95 || initialized, pct >= 88 && pct < 95);
             updateSetupStageItem("setup_step_5", "5. Verifying server binaries & service readiness", initialized || pct == 100, pct >= 95 && !initialized);
@@ -1596,7 +1840,7 @@ public final class FishbowlActivity extends AppCompatActivity
         if (tv == null) return;
         if (completed) {
             tv.setText("✓  " + label);
-            tv.setTextColor(Color.parseColor("#10B981"));
+            tv.setTextColor(AppTheme.success());
         } else if (active) {
             tv.setText("●  " + label);
             tv.setTextColor(getWarningColor());
@@ -1620,7 +1864,7 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(getBgColor());
         // Bottom padding ensures content scrolls completely clear of the docked action bar
-        scroll.setPadding(dp(20), dp(16), dp(20), dp(130));
+        scroll.setPadding(dp(16), dp(12), dp(16), dp(130));
         scroll.setClipToPadding(false);
 
         LinearLayout layout = new LinearLayout(this);
@@ -1633,27 +1877,29 @@ public final class FishbowlActivity extends AppCompatActivity
         // 1. Hero Status Section (Clean, Unboxed)
         layout.addView(buildServerHeroSection());
 
-        // Gap dp(14) - tightened to eliminate dead void space
-        layout.addView(createSectionSpacer(dp(14)));
-
-        // 2. Client Streaming IPs & Linked Account (Seamless Borderless Rows)
-        layout.addView(buildClientStreamingIpsSection());
-
-        // Gap dp(32)
-        layout.addView(createSectionSpacer());
-
-        // 3. Services Control Plane (Horizontal Icon Row)
-        layout.addView(buildServicesControlPlaneSection());
-
-        // Tools Action Row (Movie Importer & Media Storage)
-        layout.addView(buildHomeToolsSection());
-
-        // 4. Dynamic Alerts (Startup Progress Card & Error Diagnostic Card)
+        // 2. Alerts first: startup progress and error diagnostics are what you need to see
+        //    right under the server status, not below the tools (cards hide themselves when idle).
         startupProgressCard = buildRealStartupProgressCard();
         layout.addView(startupProgressCard);
 
         errorDiagnosticCard = buildErrorDiagnosticCard();
         layout.addView(errorDiagnosticCard);
+
+        layout.addView(createSectionSpacer(dp(12)));
+
+        // 3. Client Streaming IPs & Linked Account (rows inside one card)
+        LinearLayout connectCard = UiKit.card(this);
+        connectCard.setPadding(dp(8), dp(12), dp(8), dp(6));
+        TextView connectTitle = UiKit.overline(this, "Connect");
+        connectTitle.setPadding(dp(8), 0, dp(8), dp(2));
+        connectCard.addView(connectTitle);
+        connectCard.addView(buildClientStreamingIpsSection());
+        layout.addView(connectCard);
+
+        // 4. Services Control Plane (Horizontal Icon Row)
+        LinearLayout servicesCard = UiKit.card(this);
+        servicesCard.addView(buildServicesControlPlaneSection());
+        layout.addView(servicesCard);
 
         scroll.addView(layout);
         root.addView(scroll, new FrameLayout.LayoutParams(
@@ -1674,8 +1920,8 @@ public final class FishbowlActivity extends AppCompatActivity
         banner.setOrientation(LinearLayout.VERTICAL);
         banner.setPadding(dp(16), dp(14), dp(16), dp(14));
         banner.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#1C1917"),
-                Color.parseColor("#EF4444"),
+                AppTheme.inner(),
+                AppTheme.danger(),
                 dp(1),
                 dp(12)
         ));
@@ -1693,17 +1939,17 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("EMERGENCY PASSWORD RESET ACTIVE");
         title.setTextSize(11f);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#F87171"));
+        title.setTextColor(AppTheme.danger());
         top.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         resetBannerTimerText = new TextView(this);
         resetBannerTimerText.setText("Expires in 05:00");
         resetBannerTimerText.setTextSize(10f);
         resetBannerTimerText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        resetBannerTimerText.setTextColor(Color.parseColor("#EF4444"));
+        resetBannerTimerText.setTextColor(AppTheme.danger());
         resetBannerTimerText.setPadding(dp(6), dp(2), dp(6), dp(2));
         resetBannerTimerText.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#450A0A"), Color.parseColor("#DC2626"), dp(1), dp(4)));
+                AppTheme.dangerContainer(), AppTheme.danger(), dp(1), dp(4)));
         top.addView(resetBannerTimerText);
 
         banner.addView(top);
@@ -1712,7 +1958,7 @@ public final class FishbowlActivity extends AppCompatActivity
         resetBannerUserText = new TextView(this);
         resetBannerUserText.setText("Password reset requested on Jellyfin Web client.");
         resetBannerUserText.setTextSize(11.5f);
-        resetBannerUserText.setTextColor(Color.parseColor("#D4D4D8"));
+        resetBannerUserText.setTextColor(AppTheme.text());
         resetBannerUserText.setPadding(0, dp(6), 0, dp(6));
         banner.addView(resetBannerUserText);
 
@@ -1722,7 +1968,7 @@ public final class FishbowlActivity extends AppCompatActivity
         pinBox.setGravity(Gravity.CENTER);
         pinBox.setPadding(dp(12), dp(8), dp(12), dp(8));
         pinBox.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#09090B"), Color.parseColor("#7F1D1D"), dp(1), dp(8)));
+                AppTheme.card(), AppTheme.danger(), dp(1), dp(8)));
         LinearLayout.LayoutParams pinBoxLp = new LinearLayout.LayoutParams(-1, -2);
         pinBoxLp.topMargin = dp(4);
         pinBoxLp.bottomMargin = dp(10);
@@ -1732,7 +1978,7 @@ public final class FishbowlActivity extends AppCompatActivity
         lblPin.setText("ONE-TIME RESET PIN CODE");
         lblPin.setTextSize(9f);
         lblPin.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblPin.setTextColor(Color.parseColor("#A1A1AA"));
+        lblPin.setTextColor(AppTheme.textSecondary());
         lblPin.setLetterSpacing(0.08f);
         pinBox.addView(lblPin);
 
@@ -1740,7 +1986,7 @@ public final class FishbowlActivity extends AppCompatActivity
         resetBannerPinText.setText("----");
         resetBannerPinText.setTextSize(24f);
         resetBannerPinText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        resetBannerPinText.setTextColor(Color.parseColor("#FCA5A5"));
+        resetBannerPinText.setTextColor(AppTheme.danger());
         resetBannerPinText.setLetterSpacing(0.2f);
         resetBannerPinText.setPadding(0, dp(4), 0, dp(2));
         pinBox.addView(resetBannerPinText);
@@ -1752,7 +1998,7 @@ public final class FishbowlActivity extends AppCompatActivity
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
         btnRow.setGravity(Gravity.CENTER_VERTICAL);
 
-        Button btnCopyPin = createPixelButton("COPY PIN", Color.parseColor("#DC2626"), Color.WHITE);
+        Button btnCopyPin = createPixelButton("COPY PIN", AppTheme.danger(), Color.WHITE);
         btnCopyPin.setTextSize(10f);
         btnCopyPin.setOnClickListener(v -> {
             CharSequence pin = resetBannerPinText.getText();
@@ -1765,7 +2011,7 @@ public final class FishbowlActivity extends AppCompatActivity
         View gap = new View(this);
         btnRow.addView(gap, new LinearLayout.LayoutParams(dp(8), 1));
 
-        Button btnOpenReset = createPixelButton("OPEN RESET PAGE", Color.parseColor("#27272A"), Color.WHITE);
+        Button btnOpenReset = createPixelButton("OPEN RESET PAGE", AppTheme.outline(), Color.WHITE);
         btnOpenReset.setTextSize(10f);
         btnOpenReset.setOnClickListener(v -> {
             String resetUrl = "http://127.0.0.1:8096/web/index.html#!/forgotpasswordpin.html";
@@ -1781,7 +2027,7 @@ public final class FishbowlActivity extends AppCompatActivity
         View gap2 = new View(this);
         btnRow.addView(gap2, new LinearLayout.LayoutParams(dp(8), 1));
 
-        Button btnDismiss = createPixelButton("DISMISS", Color.parseColor("#18181B"), Color.parseColor("#A1A1AA"));
+        Button btnDismiss = createPixelButton("DISMISS", AppTheme.inner(), AppTheme.textSecondary());
         btnDismiss.setTextSize(10f);
         btnDismiss.setOnClickListener(v -> {
             PasswordResetManager.clearActiveResetInfo();
@@ -1844,7 +2090,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void updateHomeLinkedAccountStatus() {
         if (homeLinkedAccountValueText == null) return;
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> users =
                     com.fishbowl.app.security.FishbowlSecurityManager.getRegisteredUsers(this);
             runOnUiThread(() -> {
@@ -1853,7 +2099,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 if (users == null || users.isEmpty()) {
                     cachedCleanAccountUsername = null;
                     homeLinkedAccountValueText.setText("No account configured");
-                    homeLinkedAccountValueText.setTextColor(Color.parseColor("#71717A"));
+                    homeLinkedAccountValueText.setTextColor(AppTheme.textMuted());
                     setEndpointCopyState(btnCopyLinkedAccount, rowAccountView, dotAccount, false);
                 } else {
                     StringBuilder sb = new StringBuilder();
@@ -1869,7 +2115,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     }
                     cachedCleanAccountUsername = cleanSb.toString();
                     homeLinkedAccountValueText.setText(sb.toString());
-                    homeLinkedAccountValueText.setTextColor(Color.parseColor("#E4E4E7"));
+                    homeLinkedAccountValueText.setTextColor(AppTheme.text());
                     setEndpointCopyState(btnCopyLinkedAccount, rowAccountView, dotAccount, true);
                 }
             });
@@ -1883,22 +2129,22 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Hairline top border
         View topBorder = new View(this);
-        topBorder.setBackgroundColor(Color.argb(10, 255, 255, 255));
+        topBorder.setBackgroundColor(AppTheme.outline());
         dock.addView(topBorder, new LinearLayout.LayoutParams(-1, dp(1)));
 
         LinearLayout inner = new LinearLayout(this);
         inner.setOrientation(LinearLayout.VERTICAL);
-        inner.setPadding(dp(20), dp(10), dp(20), dp(12));
+        inner.setPadding(dp(16), dp(10), dp(16), dp(12));
 
         // Primary Action: OPEN JELLYFIN (White button, black text) or START SERVER
-        btnOpenJellyfin = createPixelButton("OPEN JELLYFIN", Color.WHITE, Color.BLACK);
+        btnOpenJellyfin = createPixelButton("OPEN JELLYFIN", AppTheme.accent(), AppTheme.onAccent());
         LinearLayout.LayoutParams pOpen = new LinearLayout.LayoutParams(-1, dp(44));
         btnOpenJellyfin.setLayoutParams(pOpen);
         btnOpenJellyfin.setOnClickListener(v -> startActivity(new Intent(this, JellyfinWebActivity.class)));
         applyButtonStyle(btnOpenJellyfin, "OPEN JELLYFIN", Color.WHITE, Color.BLACK, true);
         inner.addView(btnOpenJellyfin);
 
-        btnStartServer = createPixelButton("START SERVER", Color.WHITE, Color.BLACK);
+        btnStartServer = createPixelButton("START SERVER", AppTheme.accent(), AppTheme.onAccent());
         LinearLayout.LayoutParams pStart = new LinearLayout.LayoutParams(-1, dp(44));
         btnStartServer.setLayoutParams(pStart);
         btnStartServer.setOnClickListener(v -> {
@@ -1907,11 +2153,10 @@ public final class FishbowlActivity extends AppCompatActivity
             lastButtonActionTimestamp = now;
             errorCardDismissed = false;
 
-            applyButtonStyle(btnStartServer, "STARTING SERVER...", Color.parseColor("#27272A"), Color.parseColor("#F59E0B"), false);
+            applyButtonStyle(btnStartServer, "STARTING SERVER...", AppTheme.outline(), AppTheme.warning(), false);
             if (btnStopServer != null) btnStopServer.setEnabled(false);
             if (btnRestartServer != null) btnRestartServer.setEnabled(false);
-            controller.start(getApplicationContext());
-            triggerServerAction(JellyfinServerService.ACTION_START_JELLYFIN);
+            startFullServer();
         });
         applyButtonStyle(btnStartServer, "START SERVER", Color.WHITE, Color.BLACK, true);
         inner.addView(btnStartServer);
@@ -1931,19 +2176,15 @@ public final class FishbowlActivity extends AppCompatActivity
             lastButtonActionTimestamp = now;
             errorCardDismissed = false;
 
-            applyDockButtonStyle(btnRestartServer, "Restarting...", Color.parseColor("#27272A"), Color.parseColor("#A1A1AA"), R.drawable.ic_restart, false);
+            applyDockButtonStyle(btnRestartServer, "Restarting...", AppTheme.outline(), AppTheme.textSecondary(), R.drawable.ic_restart, false);
             if (btnStartServer != null) btnStartServer.setEnabled(false);
             if (btnStopServer != null) btnStopServer.setEnabled(false);
-            controller.stop();
-            triggerServerAction(JellyfinServerService.ACTION_STOP_JELLYFIN);
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                controller.start(getApplicationContext());
-                triggerServerAction(JellyfinServerService.ACTION_START_JELLYFIN);
-            }, 1600);
+            stopFullServer();
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> startFullServer(), 3500);
         });
-        applyDockButtonStyle(btnRestartServer, "Restart", Color.parseColor("#27272A"), Color.WHITE, R.drawable.ic_restart, true);
+        applyDockButtonStyle(btnRestartServer, "Restart", AppTheme.outline(), Color.WHITE, R.drawable.ic_restart, true);
         LinearLayout.LayoutParams lpRestart = new LinearLayout.LayoutParams(0, dp(44), 1.0f);
-        lpRestart.rightMargin = dp(4);
+        lpRestart.setMarginEnd(dp(6));
         subControls.addView(btnRestartServer, lpRestart);
 
         btnStopServer = createPixelButton("Stop", Color.TRANSPARENT, Color.WHITE);
@@ -1952,15 +2193,14 @@ public final class FishbowlActivity extends AppCompatActivity
             if (now - lastButtonActionTimestamp < BUTTON_DEBOUNCE_MS) return;
             lastButtonActionTimestamp = now;
 
-            applyDockButtonStyle(btnStopServer, "Stopping...", Color.parseColor("#3F1D24"), Color.parseColor("#F43F5E"), R.drawable.ic_stop, false);
+            applyDockButtonStyle(btnStopServer, "Stopping...", AppTheme.dangerContainer(), AppTheme.danger(), R.drawable.ic_stop, false);
             if (btnStartServer != null) btnStartServer.setEnabled(false);
             if (btnRestartServer != null) btnRestartServer.setEnabled(false);
-            controller.stop();
-            triggerServerAction(JellyfinServerService.ACTION_STOP_JELLYFIN);
+            stopFullServer();
         });
-        applyDockButtonStyle(btnStopServer, "Stop", Color.parseColor("#E11D48"), Color.WHITE, R.drawable.ic_stop, true);
+        applyDockButtonStyle(btnStopServer, "Stop", AppTheme.danger(), Color.WHITE, R.drawable.ic_stop, true);
         LinearLayout.LayoutParams lpStop = new LinearLayout.LayoutParams(0, dp(44), 1.0f);
-        lpStop.leftMargin = dp(4);
+        lpStop.setMarginStart(dp(6));
         subControls.addView(btnStopServer, lpStop);
 
         inner.addView(subControls);
@@ -1974,14 +2214,14 @@ public final class FishbowlActivity extends AppCompatActivity
             controller.resetCrashLoop(this);
         });
         btnResetCrash.setVisibility(View.GONE);
-        LinearLayout.LayoutParams pCrash = new LinearLayout.LayoutParams(-1, dp(38));
+        LinearLayout.LayoutParams pCrash = new LinearLayout.LayoutParams(-1, dp(42));
         pCrash.topMargin = dp(6);
         inner.addView(btnResetCrash, pCrash);
 
-        btnReinstallRuntime = createPixelButton("REINSTALL RUNTIME", Color.parseColor("#455A64"), Color.WHITE);
+        btnReinstallRuntime = createPixelButton("REINSTALL RUNTIME", AppTheme.inner(), Color.WHITE);
         btnReinstallRuntime.setOnClickListener(v -> showReinstallConfirmation());
         btnReinstallRuntime.setVisibility(View.GONE);
-        LinearLayout.LayoutParams pReinstall = new LinearLayout.LayoutParams(-1, dp(38));
+        LinearLayout.LayoutParams pReinstall = new LinearLayout.LayoutParams(-1, dp(42));
         pReinstall.topMargin = dp(6);
         inner.addView(btnReinstallRuntime, pReinstall);
 
@@ -2006,6 +2246,7 @@ public final class FishbowlActivity extends AppCompatActivity
         header.setTextColor(getSecondaryTextColor());
         header.setPadding(0, 0, 0, dp(10));
         card.addView(header);
+        styleSectionLabel(header);
 
         // Row 1: Client Playback & Direct Stream Status
         LinearLayout rowStatus = new LinearLayout(this);
@@ -2105,35 +2346,52 @@ public final class FishbowlActivity extends AppCompatActivity
         JellyfinEncodingConfig.EncodingOptions opts = JellyfinEncodingConfig.loadEncodingConfig(this);
         boolean isHw = JellyfinEncodingConfig.HW_ACCEL_MEDIACODEC.equalsIgnoreCase(opts.hardwareAccelerationType);
         transcodeEngineBadge.setText(isHw ? "Android MediaCodec (Hardware SoC)" : "ARM NEON SIMD (Multi-threaded Software)");
-        transcodeEngineBadge.setTextColor(isHw ? Color.parseColor("#FFB74D") : getAccentColor());
+        transcodeEngineBadge.setTextColor(isHw ? AppTheme.warning() : getAccentColor());
     }
+
+    /** One health probe at a time: renderCurrentState() runs every 500 ms while the server starts. */
+    private volatile boolean healthRefreshInFlight = false;
 
     private void refreshServerHealthUI() {
         if (healthStatusBadge == null && healthUptimeText == null && healthStorageText == null) return;
-        bgExecutor.execute(() -> {
-            JellyfinController.ServerHealth health = controller.getServerHealth();
-            StorageDriveHelper.DriveInfo extDrive = StorageDriveHelper.getPrimaryExternalDrive(this);
-            JellyfinEncodingConfig.EncodingOptions encOpts = JellyfinEncodingConfig.loadEncodingConfig(this);
-            long freeMb = controller != null ? controller.getAvailableInternalStorageMb() : 500;
+        if (healthRefreshInFlight || controller == null) return;
+        healthRefreshInFlight = true;
+        runBg(() -> {
+            final JellyfinController.ServerHealth health;
+            final StorageDriveHelper.DriveInfo extDrive;
+            final JellyfinEncodingConfig.EncodingOptions encOpts;
+            final long freeMb;
+            try {
+                health = controller.getServerHealth();
+                extDrive = StorageDriveHelper.getPrimaryExternalDrive(this);
+                encOpts = JellyfinEncodingConfig.loadEncodingConfig(this);
+                freeMb = controller.getAvailableInternalStorageMb();
+            } catch (Throwable t) {
+                healthRefreshInFlight = false;
+                return;
+            }
+            healthRefreshInFlight = false;
+            if (health == null) return;
 
             runOnUiThread(() -> {
+                if (!isUiAlive()) return;
                 if (healthStatusBadge != null) {
                     if (freeMb < 50) {
                         healthStatusBadge.setText("● STORAGE FULL");
                         healthStatusBadge.setTextColor(getDangerColor());
-                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(Color.argb(25, 244, 63, 94), Color.argb(60, 244, 63, 94), dp(1), dp(6)));
+                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.danger(), 25), AppTheme.withAlpha(AppTheme.danger(), 60), dp(1), dp(6)));
                     } else if (health.isHealthy) {
                         healthStatusBadge.setText("● HTTP 200");
                         healthStatusBadge.setTextColor(getSuccessColor());
-                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(Color.argb(25, 16, 185, 129), Color.argb(60, 16, 185, 129), dp(1), dp(6)));
+                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.success(), 25), AppTheme.withAlpha(AppTheme.success(), 60), dp(1), dp(6)));
                     } else if (controller.getState() == JellyfinController.State.RUNNING) {
                         healthStatusBadge.setText("● Responding");
                         healthStatusBadge.setTextColor(getWarningColor());
-                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(Color.argb(25, 245, 158, 11), Color.argb(60, 245, 158, 11), dp(1), dp(6)));
+                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.warning(), 25), AppTheme.withAlpha(AppTheme.warning(), 60), dp(1), dp(6)));
                     } else {
                         healthStatusBadge.setText("● Offline");
                         healthStatusBadge.setTextColor(getDangerColor());
-                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(Color.argb(25, 244, 63, 94), Color.argb(60, 244, 63, 94), dp(1), dp(6)));
+                        healthStatusBadge.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.danger(), 25), AppTheme.withAlpha(AppTheme.danger(), 60), dp(1), dp(6)));
                     }
                 }
                 if (healthDetailText != null) {
@@ -2196,10 +2454,10 @@ public final class FishbowlActivity extends AppCompatActivity
                         transcodeActiveBadge.setTextColor(getSuccessColor());
                     }
                 }
-                if (transcodeEngineBadge != null) {
+                if (transcodeEngineBadge != null && encOpts != null) {
                     boolean isHw = JellyfinEncodingConfig.HW_ACCEL_MEDIACODEC.equalsIgnoreCase(encOpts.hardwareAccelerationType);
                     transcodeEngineBadge.setText(isHw ? "Android MediaCodec (Hardware SoC)" : "ARM NEON SIMD (Software)");
-                    transcodeEngineBadge.setTextColor(isHw ? Color.parseColor("#FFB74D") : getAccentColor());
+                    transcodeEngineBadge.setTextColor(isHw ? AppTheme.warning() : getAccentColor());
                 }
             });
         });
@@ -2214,32 +2472,33 @@ public final class FishbowlActivity extends AppCompatActivity
         // Left Column: Status Badge
         statusBadge = new TextView(this);
         statusBadge.setText("● SERVER STOPPED");
-        statusBadge.setTextSize(11.5f);
-        statusBadge.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        statusBadge.setLetterSpacing(0.06f);
-        statusBadge.setTextColor(Color.parseColor("#A1A1AA"));
-        statusBadge.setPadding(0, 0, 0, 0);
-        statusBadge.setBackground(null);
-        row.addView(statusBadge, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+        statusBadge.setTextSize(12f);
+        statusBadge.setTypeface(UiKit.BOLD);
+        statusBadge.setLetterSpacing(0.05f);
+        statusBadge.setSingleLine(true);
+        statusBadge.setTextColor(AppTheme.textSecondary());
+        statusBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
+        statusBadge.setBackground(UiKit.shape(this, AppTheme.withAlpha(AppTheme.textSecondary(), 0x22), 0, UiKit.R_PILL));
+        // pill hugs its text; the remaining width goes to a flexible gap before the uptime
+        row.addView(statusBadge, new LinearLayout.LayoutParams(-2, ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1.0f));
 
         // Right Column: Inline Uptime
         LinearLayout uptimeRow = new LinearLayout(this);
         uptimeRow.setOrientation(LinearLayout.HORIZONTAL);
         uptimeRow.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
 
-        TextView lblUptime = new TextView(this);
-        lblUptime.setText("UPTIME  ");
-        lblUptime.setTextSize(10f);
-        lblUptime.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        TextView lblUptime = UiKit.text(this, "UPTIME", 11f, AppTheme.textMuted(), UiKit.BOLD);
         lblUptime.setLetterSpacing(0.08f);
-        lblUptime.setTextColor(Color.parseColor("#71717A"));
-        uptimeRow.addView(lblUptime);
+        LinearLayout.LayoutParams upLp = new LinearLayout.LayoutParams(-2, -2);
+        upLp.setMarginEnd(dp(6));
+        uptimeRow.addView(lblUptime, upLp);
 
         healthUptimeText = new TextView(this);
         healthUptimeText.setText("0s");
-        healthUptimeText.setTextSize(11.5f);
-        healthUptimeText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        healthUptimeText.setTextColor(Color.WHITE);
+        healthUptimeText.setTextSize(12.5f);
+        healthUptimeText.setTypeface(UiKit.MEDIUM);
+        healthUptimeText.setTextColor(AppTheme.text());
         uptimeRow.addView(healthUptimeText);
 
         row.addView(uptimeRow);
@@ -2262,8 +2521,11 @@ public final class FishbowlActivity extends AppCompatActivity
         if (clientEndpointsContainer == null) return;
         clientEndpointsContainer.removeAllViews();
 
+        // Interface enumeration happens off the UI thread in refreshLanAddress(); use its cached results.
+        final String defaultIp = cachedDefaultIp != null ? cachedDefaultIp : "192.0.0.2";
+        lastRenderedNetworkSignature = networkSignature(rawLan, rawTailscale);
+
         // 1. DEFAULT Endpoint (192.0.0.2:8096) - Fixed / Carrier Default
-        final String defaultIp = NetworkUtils.getDefaultIp();
         defaultIpValueText = new TextView(this);
         defaultIpValueText.setText(defaultIp + ":8096");
         ImageView copyDefault = new ImageView(this);
@@ -2277,7 +2539,7 @@ public final class FishbowlActivity extends AppCompatActivity
         clientEndpointsContainer.addView(createHairlineDivider());
 
         // 2. Active Mobile / Wi-Fi / LAN Endpoint (Current dynamic connection)
-        NetworkUtils.LanEndpoint activeLan = NetworkUtils.getActiveLanEndpoint();
+        NetworkUtils.LanEndpoint activeLan = cachedActiveLan;
         lanIpValueText = new TextView(this);
         ImageView copyLan = new ImageView(this);
         btnCopyLanIp = copyLan;
@@ -2299,10 +2561,8 @@ public final class FishbowlActivity extends AppCompatActivity
         }
         lanIpValueText.setText(lanVal);
         rowLanView = buildEndpointRow("lan", lanLabel, lanIpValueText, copyLan, () -> {
-            String val = lanIpValueText.getText().toString();
-            if (val != null && !val.contains("not connected")) {
-                copyUrlToClipboard(lanLabel + " Endpoint", val.startsWith("http") ? val : "http://" + val);
-            }
+            // Decide from state, not from the displayed (possibly translated) text.
+            if (lanOperable) copyUrlToClipboard(lanLabel + " Endpoint", "http://" + lanVal);
         });
         View dotLan = rowLanView.findViewWithTag("dot_lan");
         setEndpointCopyState(copyLan, rowLanView, dotLan, lanOperable);
@@ -2330,18 +2590,12 @@ public final class FishbowlActivity extends AppCompatActivity
         ImageView copyAccount = new ImageView(this);
         btnCopyLinkedAccount = copyAccount;
         rowAccountView = buildEndpointRow("account", "ACCOUNT", homeLinkedAccountValueText, copyAccount, () -> {
-            if (cachedCleanAccountUsername != null && !cachedCleanAccountUsername.isEmpty()) {
-                copyUrlToClipboard("Linked Account", cachedCleanAccountUsername);
-            } else {
-                String val = homeLinkedAccountValueText.getText().toString();
-                if (val != null && !val.contains("No account") && !val.contains("Checking")) {
-                    String clean = val.replace(" (Admin)", "").trim();
-                    copyUrlToClipboard("Linked Account", clean);
-                }
-            }
+            // Only the loaded user list is copied; the label may be "Checking..." or translated.
+            String names = cachedCleanAccountUsername;
+            if (names != null && !names.isEmpty()) copyUrlToClipboard("Linked Account", names);
         });
         View dotAccount = rowAccountView.findViewWithTag("dot_account");
-        setEndpointCopyState(copyAccount, rowAccountView, dotAccount, true);
+        setEndpointCopyState(copyAccount, rowAccountView, dotAccount, false);
         clientEndpointsContainer.addView(rowAccountView);
 
         updateHomeLinkedAccountStatus();
@@ -2351,44 +2605,48 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(6), dp(10), dp(6), dp(10));
+        row.setPadding(dp(8), dp(12), dp(8), dp(12));
         row.setClickable(true);
         row.setFocusable(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            row.setBackground(createRowRippleDrawable());
-        }
+        row.setBackground(UiKit.rowRipple(this));
 
         View dot = new View(this);
         dot.setTag("dot_" + tag);
-        dot.setBackground(createCircleDrawable(Color.parseColor("#52525B")));
+        dot.setBackground(createCircleDrawable(AppTheme.textMuted()));
         LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(dp(6), dp(6));
-        dotParams.rightMargin = dp(12);
+        dotParams.setMarginEnd(dp(12));
         row.addView(dot, dotParams);
 
         TextView lbl = new TextView(this);
         lbl.setText(typeLabel);
-        lbl.setTextSize(11);
-        lbl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        lbl.setTextSize(11.5f);
+        lbl.setTypeface(UiKit.BOLD);
         lbl.setLetterSpacing(0.06f);
-        lbl.setTextColor(Color.parseColor("#A1A1AA"));
+        lbl.setAllCaps(true);
+        lbl.setSingleLine(true);
+        lbl.setTextColor(AppTheme.textSecondary());
         LinearLayout.LayoutParams lblParams = new LinearLayout.LayoutParams(dp(84), ViewGroup.LayoutParams.WRAP_CONTENT);
         row.addView(lbl, lblParams);
 
-        valueView.setTextSize(12.5f);
-        valueView.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        valueView.setTextColor(Color.parseColor("#E4E4E7"));
+        valueView.setTextSize(13f);
+        // addresses are monospace; the account row shows names, so it uses the UI font
+        valueView.setTypeface("account".equals(tag) ? UiKit.MEDIUM : Typeface.MONOSPACE);
+        valueView.setTextColor(AppTheme.text());
         valueView.setSingleLine(true);
         valueView.setEllipsize(TextUtils.TruncateAt.END);
+        valueView.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
         LinearLayout.LayoutParams valParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        valParams.rightMargin = dp(8);
+        valParams.setMarginEnd(dp(8));
         row.addView(valueView, valParams);
 
         copyBtn.setImageResource(R.drawable.ic_copy);
-        copyBtn.setColorFilter(Color.parseColor("#52525B"));
+        copyBtn.setColorFilter(AppTheme.textMuted());
         copyBtn.setEnabled(false);
         copyBtn.setAlpha(0.45f);
-        LinearLayout.LayoutParams cpParams = new LinearLayout.LayoutParams(dp(24), dp(24));
-        copyBtn.setPadding(dp(4), dp(4), dp(4), dp(4));
+        LinearLayout.LayoutParams cpParams = new LinearLayout.LayoutParams(dp(32), dp(32));
+        copyBtn.setPadding(dp(7), dp(7), dp(7), dp(7));
+        copyBtn.setBackground(UiKit.rowRipple(this));
+        copyBtn.setContentDescription("Copy");
         row.addView(copyBtn, cpParams);
 
         row.setOnClickListener(v -> {
@@ -2404,20 +2662,20 @@ public final class FishbowlActivity extends AppCompatActivity
     private void setEndpointCopyState(ImageView icon, View row, View dot, boolean operable) {
         if (icon != null) {
             icon.setEnabled(operable);
-            icon.setColorFilter(operable ? Color.WHITE : Color.parseColor("#52525B"));
+            icon.setColorFilter(operable ? AppTheme.text() : AppTheme.textMuted());
             icon.setAlpha(operable ? 1.0f : 0.45f);
         }
         if (row != null) {
             row.setEnabled(operable);
         }
         if (dot != null) {
-            dot.setBackground(createCircleDrawable(operable ? getSuccessColor() : Color.parseColor("#52525B")));
+            dot.setBackground(createCircleDrawable(operable ? getSuccessColor() : AppTheme.textMuted()));
         }
     }
 
     private View createHairlineDivider() {
         View v = new View(this);
-        v.setBackgroundColor(Color.argb(10, 255, 255, 255));
+        v.setBackgroundColor(AppTheme.outline());
         v.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)));
         return v;
     }
@@ -2442,7 +2700,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private Drawable createRowRippleDrawable() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             return new android.graphics.drawable.RippleDrawable(
-                    ColorStateList.valueOf(Color.argb(20, 255, 255, 255)),
+                    ColorStateList.valueOf(AppTheme.outline()),
                     null,
                     createBorderedRoundedDrawable(Color.TRANSPARENT, Color.TRANSPARENT, 0, dp(6)));
         }
@@ -2455,7 +2713,7 @@ public final class FishbowlActivity extends AppCompatActivity
         ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (cm != null) {
             cm.setPrimaryClip(ClipData.newPlainText(label, url));
-            Toast.makeText(this, "Copied " + label + " to clipboard", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Copied " + label + " to clipboard"), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -2469,7 +2727,7 @@ public final class FishbowlActivity extends AppCompatActivity
         card.setLayoutParams(params);
 
         startupProgressHeader = new TextView(this);
-        startupProgressHeader.setText("Starting FishBowl Server");
+        startupProgressHeader.setText("Starting Jellyarr Server");
         startupProgressHeader.setTextSize(13);
         startupProgressHeader.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         startupProgressHeader.setTextColor(getPrimaryTextColor());
@@ -2483,7 +2741,7 @@ public final class FishbowlActivity extends AppCompatActivity
         card.addView(startupProgressBar, progressParams);
 
         txtStage1 = createStageText("1. Starting runtime environment");
-        txtStage2 = createStageText("2. Launching FishBowl core server process");
+        txtStage2 = createStageText("2. Launching Jellyarr core server process");
         txtStage3 = createStageText("3. Waiting for server (binding port 8096)");
         txtStage4 = createStageText("4. Checking readiness & migrating database");
         txtStage5 = createStageText("5. Ready");
@@ -2539,21 +2797,15 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout headerRow = new LinearLayout(this);
         headerRow.setOrientation(LinearLayout.HORIZONTAL);
         headerRow.setGravity(Gravity.CENTER_VERTICAL);
-        headerRow.setPadding(dp(4), 0, dp(4), dp(10));
+        headerRow.setPadding(0, 0, 0, dp(12));
 
         TextView title = new TextView(this);
         title.setText("SERVICES");
-        title.setTextSize(11);
-        title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        title.setLetterSpacing(0.08f);
-        title.setTextColor(Color.parseColor("#71717A"));
+        styleSectionLabel(title);
         headerRow.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        homeServicesCountBadge = new TextView(this);
-        homeServicesCountBadge.setText("7 / 7 Active");
-        homeServicesCountBadge.setTextSize(10);
-        homeServicesCountBadge.setTypeface(Typeface.MONOSPACE);
-        homeServicesCountBadge.setTextColor(Color.parseColor("#52525B"));
+        homeServicesCountBadge = UiKit.caption(this, "7 / 7 Active");
+        homeServicesCountBadge.setTypeface(UiKit.MEDIUM);
         headerRow.addView(homeServicesCountBadge);
 
         section.addView(headerRow);
@@ -2595,20 +2847,15 @@ public final class FishbowlActivity extends AppCompatActivity
         serviceTileMap.clear();
 
         List<HomeServiceTileSpec> tiles = new ArrayList<>();
-        // 1. Core Jellyfin Service Tile (always present)
-        tiles.add(new HomeServiceTileSpec("jellyfin", "Jellyfin", R.drawable.ic_service_jellyfin, Color.WHITE));
-
-        // 2. Installed Companion Service Tiles (ordered consistently)
-        if (!isMovieStreamerModeEnabled() && isMediaStackEnabled()) {
-            MediaServiceManager mgr = MediaServiceManager.getInstance(this);
-            String[] preferredOrder = new String[] {
-                    "radarr", "sonarr", "prowlarr", "jackett", "transmission", "seerr", "bazarr", "lidarr"
-            };
-            for (String sid : preferredOrder) {
+        // 1. Core Jellyfin tile (always present), then 2. installed companions in a fixed order
+        MediaServiceManager mgr = MediaServiceManager.getInstance(this);
+        for (String sid : homeTileIds()) {
+            if ("jellyfin".equals(sid)) {
+                tiles.add(new HomeServiceTileSpec("jellyfin", "Jellyfin", R.drawable.logo_jellyfin, AppTheme.text()));
+            } else {
                 ManagedService s = mgr.getService(sid);
-                if (s != null && s.isInstalled()) {
-                    tiles.add(new HomeServiceTileSpec(s.getId(), s.getDisplayName(), getServiceIconRes(s.getId()), Color.WHITE));
-                }
+                String nm = s != null ? s.getDisplayName() : sid;
+                tiles.add(new HomeServiceTileSpec(sid, nm, getServiceIconRes(sid), AppTheme.text()));
             }
         }
 
@@ -2650,17 +2897,23 @@ public final class FishbowlActivity extends AppCompatActivity
         slot.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         FrameLayout tile = new FrameLayout(this);
-        FrameLayout.LayoutParams tileParams = new FrameLayout.LayoutParams(dp(40), dp(40));
+        FrameLayout.LayoutParams tileParams = new FrameLayout.LayoutParams(dp(44), dp(44));
         tileParams.gravity = Gravity.CENTER;
         tile.setLayoutParams(tileParams);
-        // Clean unboxed presentation: no background container box on service logos
+        // Clean unboxed presentation: no background container box on service logos (state ring is the background)
         tile.setClickable(true);
         tile.setFocusable(true);
+        tile.setContentDescription(name);
+        if (Build.VERSION.SDK_INT >= 23) tile.setForeground(UiKit.rowRipple(this));
 
         ImageView icon = new ImageView(this);
         icon.setImageResource(iconRes);
-        icon.setColorFilter(brandColor);
-        int iconSize = dp(24);
+        if (isColorLogoRes(iconRes)) {
+            icon.setTag("logo");
+        } else {
+            icon.setColorFilter(brandColor);
+        }
+        int iconSize = dp(26);
         FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(iconSize, iconSize);
         iconParams.gravity = Gravity.CENTER;
         tile.addView(icon, iconParams);
@@ -2668,99 +2921,84 @@ public final class FishbowlActivity extends AppCompatActivity
         serviceTileMap.put(id, icon);
 
         tile.setOnClickListener(v -> {
-            if ("jellyfin".equalsIgnoreCase(id)) {
-                if (controller != null && controller.getState() == JellyfinController.State.RUNNING) {
-                    Toast.makeText(this, "Stopping FishBowl Server...", Toast.LENGTH_SHORT).show();
-                    controller.stop();
-                    triggerServerAction(JellyfinServerService.ACTION_STOP);
-                } else {
-                    Toast.makeText(this, "Starting FishBowl Server...", Toast.LENGTH_SHORT).show();
-                    triggerServerAction(JellyfinServerService.ACTION_START);
-                }
-            } else {
-                MediaServiceManager mgr = MediaServiceManager.getInstance(this);
-                ManagedService svc = mgr.getService(id);
-                if (svc != null) {
-                    if (svc.isBlocked()) {
-                        Toast.makeText(this, name + " is blocked: " + (svc.getBlockedReason() != null ? svc.getBlockedReason() : "Incompatible"), Toast.LENGTH_LONG).show();
-                        return;
-                    }
-                    if (svc.isRunning()) {
-                        Toast.makeText(this, "Stopping " + name + "...", Toast.LENGTH_SHORT).show();
-                        mgr.stopService(id);
-                    } else {
-                        Toast.makeText(this, "Starting " + name + "...", Toast.LENGTH_SHORT).show();
-                        mgr.startService(id);
-                    }
-                }
+            ManagedService svc = MediaServiceManager.getInstance(this).getService(id);
+            if (svc != null) {
+                showServiceDetailsModal(svc);
             }
-            mainHandler.postDelayed(() -> {
-                refreshHomeServicesBadge();
-                refreshServicesTabUI();
-            }, 600);
         });
 
         slot.addView(tile);
         parent.addView(slot);
     }
 
+    /** Ids of the Home tiles, in display order: always Jellyfin, then the installed core companions. */
+    private List<String> homeTileIds() {
+        List<String> ids = new ArrayList<>();
+        ids.add("jellyfin");
+        if (!isMovieStreamerModeEnabled() && isMediaStackEnabled()) {
+            MediaServiceManager mgr = MediaServiceManager.getInstance(this);
+            for (String sid : new String[]{"radarr", "sonarr", "prowlarr", "transmission"}) {
+                ManagedService s = mgr.getService(sid);
+                if (s != null && s.isInstalled()) ids.add(s.getId());
+            }
+        }
+        return ids;
+    }
+
     private void refreshHomeServicesBadge() {
         MediaServiceManager mgr = MediaServiceManager.getInstance(this);
         List<ManagedService> services = mgr.getAllServices();
+        // Count exactly what the Home row shows (other installed services have no tile).
+        final List<String> tileIds = homeTileIds();
         int running = 0;
-        int installed = 1; // Jellyfin core is always counted as installed
-        for (ManagedService s : services) {
-            if ("jellyfin".equalsIgnoreCase(s.getId())) {
-                if (controller != null && controller.getState() == JellyfinController.State.RUNNING) {
-                    running++;
-                }
+        for (String id : tileIds) {
+            if ("jellyfin".equals(id)) {
+                if (controller != null && controller.getState() == JellyfinController.State.RUNNING) running++;
             } else {
-                if (s.isInstalled()) {
-                    installed++;
-                }
-                if (s.isRunning()) {
-                    running++;
-                }
+                ManagedService s = mgr.getService(id);
+                if (s != null && s.isRunning()) running++;
             }
         }
 
         final int fRunning = running;
-        final int fInstalled = installed;
+        final int fInstalled = tileIds.size();
         final List<ManagedService> fServices = services;
 
         runOnUiThread(() -> {
-            if (homeServicesRow != null && serviceTileMap.size() != fInstalled) {
+            // Rebuild only when the set of tiles changed (the old size check never matched with extra services
+            // installed or in streamer mode, so the row was rebuilt on every state change).
+            if (homeServicesRow != null && !new HashSet<>(tileIds).equals(serviceTileMap.keySet())) {
                 rebuildHomeServiceTiles();
             }
 
             if (homeServicesCountBadge != null) {
                 homeServicesCountBadge.setText(fRunning + " / " + fInstalled + " Active");
-                homeServicesCountBadge.setTextColor(fRunning > 0 ? Color.parseColor("#34D399") : Color.parseColor("#52525B"));
+                homeServicesCountBadge.setTextColor(fRunning > 0 ? AppTheme.success() : AppTheme.textMuted());
             }
 
             // Jellyfin Service Tile (Jfn glyph)
             ImageView jIcon = serviceTileMap.get("jellyfin");
             if (jIcon != null) {
                 JellyfinController.State js = controller != null ? controller.getState() : JellyfinController.State.STOPPED;
-                int jColor;
+                int jCat;
                 switch (js) {
                     case RUNNING:
-                        jColor = getServiceBrandColor("jellyfin");
+                        jCat = 2;
                         break;
                     case STARTING:
                     case INITIALIZING:
-                        jColor = getWarningColor();
+                        jCat = 1;
                         break;
                     case CRASHED:
                     case FAILED:
                     case CRASH_LOOP:
-                        jColor = getDangerColor();
+                        jCat = 3;
                         break;
                     default:
-                        jColor = Color.WHITE;
+                        jCat = 0;
                         break;
                 }
-                jIcon.setColorFilter(jColor);
+                applyTileState(jIcon, jCat, getServiceBrandColor("jellyfin"));
             }
 
             // Other Services Tiles (Brand-colored typography glyphs)
@@ -2768,18 +3006,74 @@ public final class FishbowlActivity extends AppCompatActivity
                 if ("jellyfin".equalsIgnoreCase(s.getId())) continue;
                 ImageView icon = serviceTileMap.get(s.getId());
                 if (icon != null) {
-                    icon.setColorFilter(getServiceBrandTintColor(s.getId(), s.getState()));
+                    applyTileState(icon, tileCategory(s.getState()), getServiceBrandColor(s.getId()));
                 }
             }
         });
     }
 
-    private int getServiceStateTintColor(com.fishbowl.app.model.ServiceState state) {
-        if (state == null) return Color.WHITE;
+    /** 0 = off, 1 = starting, 2 = running OK, 3 = failed. */
+    private int tileCategory(com.fishbowl.app.model.ServiceState state) {
+        if (state == null) return 0;
         switch (state) {
             case RUNNING:
             case API_READY:
-                return Color.parseColor("#34D399");
+                return 2;
+            case STARTING:
+            case PROCESS_READY:
+            case SOCKET_READY:
+            case RECOVERING:
+            case INSTALLING:
+            case UPDATING:
+                return 1;
+            case FAILED:
+            case ERROR:
+            case CRASH_LOOP_PROTECTION:
+            case UNHEALTHY:
+                return 3;
+            default:
+                return 0;
+        }
+    }
+
+    /** Home logo state: faded grey when off; brand-coloured logo inside a yellow / green / red ring otherwise. */
+    private void applyTileState(ImageView icon, int category, int brand) {
+        int ring;
+        switch (category) {
+            case 1: ring = getWarningColor(); break;
+            case 2: ring = AppTheme.success(); break;
+            case 3: ring = getDangerColor(); break;
+            default: ring = 0; break;
+        }
+        if ("logo".equals(icon.getTag())) {
+            applyColorLogoState(icon, category != 0);
+        } else if (category == 0) {
+            icon.setColorFilter(AppTheme.textMuted());
+            icon.setAlpha(0.45f);
+        } else {
+            icon.setColorFilter(brand);
+            icon.setAlpha(1f);
+        }
+        View tile = icon.getParent() instanceof View ? (View) icon.getParent() : null;
+        if (tile == null) return;
+        if (category == 0) {
+            tile.setBackground(null);
+        } else {
+            GradientDrawable g = new GradientDrawable();
+            g.setShape(GradientDrawable.OVAL);
+            g.setColor((ring & 0x00FFFFFF) | 0x26000000);
+            g.setStroke(dp(2), ring);
+            tile.setBackground(g);
+            tile.setElevation(category == 1 ? dp(2) : dp(3));
+        }
+    }
+
+    private int getServiceStateTintColor(com.fishbowl.app.model.ServiceState state) {
+        if (state == null) return AppTheme.text();
+        switch (state) {
+            case RUNNING:
+            case API_READY:
+                return AppTheme.success();
             case STARTING:
             case PROCESS_READY:
             case SOCKET_READY:
@@ -2799,7 +3093,7 @@ public final class FishbowlActivity extends AppCompatActivity
             case DISABLED:
             case BLOCKED:
             default:
-                return Color.WHITE;
+                return AppTheme.text();
         }
     }
 
@@ -2809,25 +3103,19 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private int getServiceIconRes(String serviceId) {
-        if (serviceId == null) return R.drawable.ic_service_jellyfin;
+        if (serviceId == null) return R.drawable.logo_jellyfin;
         switch (serviceId.toLowerCase(Locale.ROOT)) {
-            case "radarr":       return R.drawable.ic_service_radarr;
-            case "sonarr":       return R.drawable.ic_service_sonarr;
-            case "prowlarr":     return R.drawable.ic_service_prowlarr;
-            case "jackett":
-            case "jkt":
-            case "jk":           return R.drawable.ic_service_jackett;
-            case "transmission": return R.drawable.ic_service_transmission;
-            case "seerr":        return R.drawable.ic_service_seerr;
-            case "bazarr":       return R.drawable.ic_service_bazarr;
-            case "lidarr":       return R.drawable.ic_service_lidarr;
+            case "radarr":       return R.drawable.logo_radarr;
+            case "sonarr":       return R.drawable.logo_sonarr;
+            case "prowlarr":     return R.drawable.logo_prowlarr;
+            case "transmission": return R.drawable.logo_transmission;
             case "jellyfin":
-            default:             return R.drawable.ic_service_jellyfin;
+            default:             return R.drawable.logo_jellyfin;
         }
     }
 
     private int getServiceBrandTintColor(String serviceId, com.fishbowl.app.model.ServiceState state) {
-        if (state == null) return Color.WHITE;
+        if (state == null) return AppTheme.text();
         switch (state) {
             case RUNNING:
             case API_READY:
@@ -2851,7 +3139,7 @@ public final class FishbowlActivity extends AppCompatActivity
             case DISABLED:
             case BLOCKED:
             default:
-                return Color.WHITE;
+                return AppTheme.text();
         }
     }
 
@@ -2942,131 +3230,84 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setBackgroundColor(getBgColor());
-        layout.setPadding(dp(16), dp(10), dp(16), dp(8));
+        layout.setPadding(dp(16), dp(12), dp(16), dp(8));
         layout.setClipToPadding(false);
 
-        // Header Title Row: "SYSTEM CONSOLE" + subtitle
-        LinearLayout headerRow = new LinearLayout(this);
-        headerRow.setOrientation(LinearLayout.VERTICAL);
-        headerRow.setPadding(0, 0, 0, dp(10));
+        // Header: title + one-line subtitle (UiKit page header)
+        layout.addView(UiKit.header(this, "System Console", "Live logs from every service", null));
 
-        TextView title = new TextView(this);
-        title.setText("SYSTEM CONSOLE");
-        title.setTextSize(13);
-        title.setLetterSpacing(0.12f);
-        title.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        title.setTextColor(Color.WHITE);
-        headerRow.addView(title);
-
-        TextView subtitle = new TextView(this);
-        subtitle.setText("Live multi-daemon streams and error telemetry");
-        subtitle.setTextSize(10.5f);
-        subtitle.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
-        subtitle.setTextColor(Color.parseColor("#71717A"));
-        subtitle.setPadding(0, dp(2), 0, 0);
-        headerRow.addView(subtitle);
-
-        layout.addView(headerRow);
-
-        // Service Selector Chips (Horizontally Scrollable)
-        HorizontalScrollView hScrollServices = new HorizontalScrollView(this);
-        hScrollServices.setHorizontalScrollBarEnabled(false);
-        hScrollServices.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        LinearLayout.LayoutParams hParams = new LinearLayout.LayoutParams(-1, -2);
-        hParams.bottomMargin = dp(8);
-        hScrollServices.setLayoutParams(hParams);
-
+        // Service selector chips (horizontally scrollable; tagged so the drawer swipe leaves it alone)
         logServiceChipsContainer = new LinearLayout(this);
         logServiceChipsContainer.setOrientation(LinearLayout.HORIZONTAL);
-
         refreshLogServiceChips();
-        hScrollServices.addView(logServiceChipsContainer);
-        layout.addView(hScrollServices);
+        HorizontalScrollView hScrollServices = UiKit.chipScroller(this, logServiceChipsContainer);
+        LinearLayout.LayoutParams hParams = new LinearLayout.LayoutParams(-1, -2);
+        hParams.bottomMargin = dp(8);
+        layout.addView(hScrollServices, hParams);
 
-        // Controls Toolbar: Level Filters (Left) + Action Buttons (Right)
+        // Controls toolbar: level filters (start) + actions (end)
         LinearLayout controlsRow = new LinearLayout(this);
         controlsRow.setOrientation(LinearLayout.HORIZONTAL);
         controlsRow.setGravity(Gravity.CENTER_VERTICAL);
-        controlsRow.setPadding(0, 0, 0, dp(8));
+        controlsRow.setPadding(0, 0, 0, dp(10));
 
         logLevelChipsContainer = new LinearLayout(this);
         logLevelChipsContainer.setOrientation(LinearLayout.HORIZONTAL);
-        String[] levels = {"ALL", "ERR", "WRN", "INF"};
-        for (String lvl : levels) {
-            Button lvlChip = new Button(this);
-            lvlChip.setText(lvl);
-            lvlChip.setTextSize(9.5f);
-            lvlChip.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            lvlChip.setAllCaps(true);
-            lvlChip.setMinHeight(0);
-            lvlChip.setMinimumHeight(0);
-            lvlChip.setMinWidth(0);
-            lvlChip.setMinimumWidth(0);
-            lvlChip.setPadding(dp(7), dp(4), dp(7), dp(4));
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                lvlChip.setStateListAnimator(null);
-            }
+        String[] levels = {"ALL", "ERROR", "WARNING", "INFO"};
+        String[] levelLabels = {"All", "Errors", "Warnings", "Info"};
+        for (int li = 0; li < levels.length; li++) {
+            final String lvl = levels[li];
+            TextView lvlChip = UiKit.chip(this, levelLabels[li], lvl.equals(selectedLogLevel));
+            lvlChip.setTag(lvl);   // logic reads the tag, never the (translated) label
+            lvlChip.setPadding(dp(12), dp(6), dp(12), dp(6));
             lvlChip.setOnClickListener(v -> {
-                if ("ERR".equals(lvl)) selectedLogLevel = "ERROR";
-                else if ("WRN".equals(lvl)) selectedLogLevel = "WARNING";
-                else if ("INF".equals(lvl)) selectedLogLevel = "INFO";
-                else selectedLogLevel = "ALL";
+                selectedLogLevel = lvl;
                 updateLogLevelChips();
                 refreshUnifiedLogsDisplay();
             });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(26));
-            lp.rightMargin = dp(4);
-            logLevelChipsContainer.addView(lvlChip, lp);
+            logLevelChipsContainer.addView(lvlChip, UiKit.chipLp(this));
         }
-        controlsRow.addView(logLevelChipsContainer);
+        HorizontalScrollView levelScroll = UiKit.chipScroller(this, logLevelChipsContainer);
+        controlsRow.addView(levelScroll, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        // Spacer between filters and actions
-        View spacer = new View(this);
-        controlsRow.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
-
-        // Auto-Scroll Toggle Button
-        btnToggleAutoScroll = createPixelButton(autoScrollEnabled ? "AUTO: ON" : "AUTO: OFF",
-                autoScrollEnabled ? Color.argb(35, 16, 185, 129) : getSurfaceElevatedColor(),
-                autoScrollEnabled ? getSuccessColor() : getSecondaryTextColor());
-        btnToggleAutoScroll.setTextSize(9);
-        btnToggleAutoScroll.setPadding(dp(6), dp(2), dp(6), dp(2));
+        // Auto-scroll toggle
+        btnToggleAutoScroll = UiKit.button(this, I18n.tr("Auto-scroll"), AppTheme.card(), AppTheme.textSecondary(), AppTheme.outline(), null);
+        btnToggleAutoScroll.setTextSize(12f);
+        btnToggleAutoScroll.setPadding(dp(10), 0, dp(10), 0);
+        styleAutoScrollButton();
         btnToggleAutoScroll.setOnClickListener(v -> {
             autoScrollEnabled = !autoScrollEnabled;
-            btnToggleAutoScroll.setText(autoScrollEnabled ? "AUTO: ON" : "AUTO: OFF");
-            btnToggleAutoScroll.setTextColor(autoScrollEnabled ? getSuccessColor() : getSecondaryTextColor());
-            btnToggleAutoScroll.setBackground(createBorderedRoundedDrawable(
-                    autoScrollEnabled ? Color.argb(35, 16, 185, 129) : getSurfaceElevatedColor(),
-                    autoScrollEnabled ? getSuccessColor() : getBorderColor(), dp(1), dp(8)));
+            styleAutoScrollButton();
             if (autoScrollEnabled && logsScrollView != null) {
                 logsScrollView.post(() -> logsScrollView.fullScroll(View.FOCUS_DOWN));
             }
         });
-        LinearLayout.LayoutParams pAuto = new LinearLayout.LayoutParams(-2, dp(26));
-        pAuto.rightMargin = dp(4);
+        LinearLayout.LayoutParams pAuto = new LinearLayout.LayoutParams(-2, dp(34));
+        pAuto.setMarginStart(dp(8));
         controlsRow.addView(btnToggleAutoScroll, pAuto);
 
         // Copy Button
-        Button btnCopy = createPixelButton("COPY", getSurfaceElevatedColor(), getPrimaryTextColor());
-        btnCopy.setTextSize(9);
-        btnCopy.setPadding(dp(6), dp(2), dp(6), dp(2));
+        Button btnCopy = UiKit.outline(this, buttonLabel("COPY"), null);
+        btnCopy.setTextSize(12f);
+        btnCopy.setPadding(dp(10), 0, dp(10), 0);
         btnCopy.setOnClickListener(v -> {
             String content = (logsOutputText != null) ? logsOutputText.getText().toString() : "";
             if (!content.isEmpty()) {
                 ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                 if (cm != null) {
-                    cm.setPrimaryClip(ClipData.newPlainText("Fishbowl Console Logs", content));
-                    Toast.makeText(this, "Logs copied (" + selectedLogService + ")", Toast.LENGTH_SHORT).show();
+                    cm.setPrimaryClip(ClipData.newPlainText("Jellyarr Console Logs", content));
+                    Toast.makeText(this, I18n.tr("Logs copied (" + selectedLogService + ")"), Toast.LENGTH_SHORT).show();
                 }
             }
         });
-        LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(-2, dp(26));
-        pCopy.rightMargin = dp(4);
+        LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(-2, dp(34));
+        pCopy.setMarginStart(dp(6));
         controlsRow.addView(btnCopy, pCopy);
 
         // Clear Button
-        Button btnClear = createPixelButton("CLEAR", getSurfaceElevatedColor(), Color.parseColor("#EF4444"));
-        btnClear.setTextSize(9);
-        btnClear.setPadding(dp(6), dp(2), dp(6), dp(2));
+        Button btnClear = UiKit.danger(this, buttonLabel("CLEAR"), null);
+        btnClear.setTextSize(12f);
+        btnClear.setPadding(dp(10), 0, dp(10), 0);
         btnClear.setOnClickListener(v -> {
             if ("ALL".equalsIgnoreCase(selectedLogService)) {
                 if (controller != null) controller.clearDisplayedLogs();
@@ -3083,9 +3324,11 @@ public final class FishbowlActivity extends AppCompatActivity
             }
             if (logsOutputText != null) logsOutputText.setText("--- No logs recorded for [" + selectedLogService + "] ---");
             refreshUnifiedLogsDisplay();
-            Toast.makeText(this, "Cleared " + selectedLogService + " logs", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Cleared " + selectedLogService + " logs"), Toast.LENGTH_SHORT).show();
         });
-        controlsRow.addView(btnClear, new LinearLayout.LayoutParams(-2, dp(26)));
+        LinearLayout.LayoutParams pClear = new LinearLayout.LayoutParams(-2, dp(34));
+        pClear.setMarginStart(dp(6));
+        controlsRow.addView(btnClear, pClear);
 
         layout.addView(controlsRow);
 
@@ -3095,29 +3338,25 @@ public final class FishbowlActivity extends AppCompatActivity
         logsScrollView.setHorizontalScrollBarEnabled(false);
         logsScrollView.setOverScrollMode(View.OVER_SCROLL_NEVER);
         logsScrollView.setFillViewport(true);
-        logsScrollView.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#090C10"),
-                Color.parseColor("#1B222C"),
-                dp(1),
-                dp(10)
-        ));
+        logsScrollView.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_INNER));
 
         logsOutputText = new TextView(this);
-        logsOutputText.setTextColor(Color.parseColor("#D4D4D8"));
+        logsOutputText.setTextColor(AppTheme.text());
         logsOutputText.setTextSize(10.5f);
         logsOutputText.setTypeface(Typeface.MONOSPACE);
         logsOutputText.setLineSpacing(dp(2), 1.15f);
         logsOutputText.setPadding(dp(12), dp(10), dp(12), dp(10));
         logsOutputText.setTextIsSelectable(true);
+        // Log lines are English / machine text: keep them left-to-right even in the Arabic UI.
+        logsOutputText.setTextDirection(View.TEXT_DIRECTION_LTR);
+        logsOutputText.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        logsOutputText.setGravity(Gravity.START);
 
         logsScrollView.addView(logsOutputText);
         layout.addView(logsScrollView, new LinearLayout.LayoutParams(-1, 0, 1.0f));
 
         // Subtitle status line at bottom of terminal
-        logsStatusSubtitle = new TextView(this);
-        logsStatusSubtitle.setTextSize(9.5f);
-        logsStatusSubtitle.setTypeface(Typeface.MONOSPACE);
-        logsStatusSubtitle.setTextColor(Color.parseColor("#71717A"));
+        logsStatusSubtitle = UiKit.caption(this, "");
         logsStatusSubtitle.setPadding(dp(4), dp(6), dp(4), 0);
         layout.addView(logsStatusSubtitle);
 
@@ -3140,7 +3379,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Subtle 1dp hairline divider on top
         View topDivider = new View(this);
-        topDivider.setBackgroundColor(Color.argb(10, 255, 255, 255));
+        topDivider.setBackgroundColor(AppTheme.outline());
         LinearLayout.LayoutParams pDiv = new LinearLayout.LayoutParams(-1, dp(1));
         pDiv.bottomMargin = dp(12);
         card.addView(topDivider, pDiv);
@@ -3154,32 +3393,48 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("DOWNLOAD CENTER");
         title.setTextSize(10.5f);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#71717A"));
+        title.setTextColor(AppTheme.textMuted());
         title.setLetterSpacing(0.08f);
         headerRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        styleSectionLabel(title);
 
         downloadSummaryBadge = new TextView(this);
         downloadSummaryBadge.setText("0 Active");
         downloadSummaryBadge.setTextSize(10);
         downloadSummaryBadge.setTypeface(Typeface.MONOSPACE);
-        downloadSummaryBadge.setTextColor(Color.parseColor("#71717A"));
+        downloadSummaryBadge.setTextColor(AppTheme.textMuted());
         headerRow.addView(downloadSummaryBadge);
 
         View sp = new View(this);
         headerRow.addView(sp, new LinearLayout.LayoutParams(dp(8), 1));
 
+        TextView btnHistoryDl = new TextView(this);
+        btnHistoryDl.setText("HISTORY");
+        btnHistoryDl.setTextSize(9.5f);
+        btnHistoryDl.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        btnHistoryDl.setTextColor(AppTheme.accent());
+        btnHistoryDl.setGravity(Gravity.CENTER);
+        btnHistoryDl.setBackground(createBorderedRoundedDrawable(AppTheme.accentContainer(), AppTheme.accent(), dp(1), dp(4)));
+        btnHistoryDl.setPadding(dp(8), dp(4), dp(8), dp(4));
+        btnHistoryDl.setClickable(true);
+        btnHistoryDl.setFocusable(true);
+        btnHistoryDl.setOnClickListener(v -> showTransmissionHistoryDialog());
+        headerRow.addView(btnHistoryDl, new LinearLayout.LayoutParams(-2, -2));
+        View spHist = new View(this);
+        headerRow.addView(spHist, new LinearLayout.LayoutParams(dp(6), 1));
+
         TextView btnRefreshDl = new TextView(this);
         btnRefreshDl.setText("REFRESH");
         btnRefreshDl.setTextSize(9.5f);
         btnRefreshDl.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnRefreshDl.setTextColor(Color.WHITE);
+        btnRefreshDl.setTextColor(AppTheme.text());
         btnRefreshDl.setGravity(Gravity.CENTER);
-        btnRefreshDl.setBackground(createBorderedRoundedDrawable(Color.parseColor("#27272A"), Color.argb(40, 255, 255, 255), dp(1), dp(4)));
+        btnRefreshDl.setBackground(createBorderedRoundedDrawable(AppTheme.outline(), Color.argb(40, 255, 255, 255), dp(1), dp(4)));
         btnRefreshDl.setPadding(dp(8), dp(4), dp(8), dp(4));
         btnRefreshDl.setClickable(true);
         btnRefreshDl.setFocusable(true);
         btnRefreshDl.setOnClickListener(v -> {
-            Toast.makeText(this, "Refreshing downloads...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Refreshing downloads..."), Toast.LENGTH_SHORT).show();
             refreshDownloadCenter();
         });
         headerRow.addView(btnRefreshDl, new LinearLayout.LayoutParams(-2, -2));
@@ -3191,9 +3446,9 @@ public final class FishbowlActivity extends AppCompatActivity
         btnClearDl.setText("CLEAR");
         btnClearDl.setTextSize(9.5f);
         btnClearDl.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnClearDl.setTextColor(Color.parseColor("#FDA4AF"));
+        btnClearDl.setTextColor(AppTheme.danger());
         btnClearDl.setGravity(Gravity.CENTER);
-        btnClearDl.setBackground(createBorderedRoundedDrawable(Color.parseColor("#1C1014"), Color.parseColor("#E11D48"), dp(1), dp(4)));
+        btnClearDl.setBackground(createBorderedRoundedDrawable(AppTheme.dangerContainer(), AppTheme.danger(), dp(1), dp(4)));
         btnClearDl.setPadding(dp(8), dp(4), dp(8), dp(4));
         btnClearDl.setClickable(true);
         btnClearDl.setFocusable(true);
@@ -3207,7 +3462,7 @@ public final class FishbowlActivity extends AppCompatActivity
         destNote.setText("Target: /storage/emulated/0/FishbowlMedia/Downloads");
         destNote.setTextSize(10);
         destNote.setTypeface(Typeface.MONOSPACE);
-        destNote.setTextColor(Color.parseColor("#52525B"));
+        destNote.setTextColor(AppTheme.textMuted());
         destNote.setPadding(0, dp(4), 0, dp(8));
         card.addView(destNote);
 
@@ -3226,10 +3481,12 @@ public final class FishbowlActivity extends AppCompatActivity
         ProgressBar progressBar;
         TextView metaLeftTv;
         TextView btnDelete;
+        TextView btnToggle;
+        int status;
     }
 
     private void refreshDownloadCenter() {
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             List<MediaStorageManager.TorrentInfo> torrents = MediaStorageManager.getInstance(this).queryTransmissionTorrents();
             runOnUiThread(() -> {
                 if (downloadItemsContainer == null) return;
@@ -3242,11 +3499,11 @@ public final class FishbowlActivity extends AppCompatActivity
 
                 if (downloadSummaryBadge != null) {
                     downloadSummaryBadge.setText(activeCount + " Active / " + torrents.size() + " Total");
-                    downloadSummaryBadge.setTextColor(activeCount > 0 ? getSuccessColor() : Color.parseColor("#71717A"));
+                    downloadSummaryBadge.setTextColor(activeCount > 0 ? getSuccessColor() : AppTheme.textMuted());
                 }
                 if (homeDownloadsCountBadge != null) {
                     homeDownloadsCountBadge.setText(activeCount > 0 ? (activeCount + " Active") : "Idle");
-                    homeDownloadsCountBadge.setTextColor(activeCount > 0 ? getSuccessColor() : Color.parseColor("#52525B"));
+                    homeDownloadsCountBadge.setTextColor(activeCount > 0 ? getSuccessColor() : AppTheme.textMuted());
                 }
                 if (homeDownloadsSummaryText != null) {
                     if (activeCount > 0) {
@@ -3270,7 +3527,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     empty.setTag("empty_downloads_view");
                     empty.setText("No active or queued downloads in Transmission.");
                     empty.setTextSize(11);
-                    empty.setTextColor(Color.parseColor("#71717A"));
+                    empty.setTextColor(AppTheme.textMuted());
                     empty.setPadding(0, dp(6), 0, dp(6));
                     downloadItemsContainer.addView(empty);
                     return;
@@ -3297,20 +3554,22 @@ public final class FishbowlActivity extends AppCompatActivity
                         holder.nameTv.setText(t.name != null ? t.name : "Torrent #" + t.id);
                         holder.pillTv.setText(t.getStatusString());
 
-                        int pillColor = Color.parseColor("#71717A");
+                        int pillColor = AppTheme.textMuted();
                         switch (t.getLifecycleState()) {
-                            case DOWNLOADING: pillColor = Color.parseColor("#38BDF8"); break;
+                            case DOWNLOADING: pillColor = AppTheme.accent(); break;
                             case WAITING_FINAL_PIECES: pillColor = getWarningColor(); break;
                             case SEEDING:
                             case COMPLETE: pillColor = getSuccessColor(); break;
-                            case STALLED: pillColor = Color.parseColor("#E57373"); break;
+                            case STALLED: pillColor = AppTheme.danger(); break;
                             case ERROR: pillColor = getDangerColor(); break;
-                            default: pillColor = Color.parseColor("#71717A"); break;
+                            default: pillColor = AppTheme.textMuted(); break;
                         }
                         holder.pillTv.setTextColor(pillColor);
                         holder.pillTv.setBackground(createBorderedRoundedDrawable(colorWithAlpha(pillColor, 20), colorWithAlpha(pillColor, 50), dp(1), dp(4)));
 
                         holder.progressBar.setProgress((int) Math.round(t.percentDone * 1000));
+                        holder.status = t.status;
+                        if (holder.btnToggle != null) holder.btnToggle.setText(t.status == 0 ? "PLAY" : "PAUSE");
 
                         StringBuilder meta = new StringBuilder();
                         if (t.sizeWhenDone > 0) {
@@ -3347,7 +3606,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     LinearLayout item = new LinearLayout(this);
                     item.setOrientation(LinearLayout.VERTICAL);
                     item.setPadding(dp(12), dp(10), dp(12), dp(10));
-                    item.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.argb(20, 255, 255, 255), dp(1), dp(8)));
+                    item.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(8)));
                     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
                     lp.topMargin = dp(6);
                     item.setLayoutParams(lp);
@@ -3364,7 +3623,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     name.setText(t.name != null ? t.name : "Torrent #" + t.id);
                     name.setTextSize(12);
                     name.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    name.setTextColor(Color.parseColor("#F4F4F5"));
+                    name.setTextColor(AppTheme.text());
                     name.setSingleLine(true);
                     name.setEllipsize(android.text.TextUtils.TruncateAt.END);
                     top.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -3376,15 +3635,15 @@ public final class FishbowlActivity extends AppCompatActivity
                     pill.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
                     pill.setPadding(dp(5), dp(2), dp(5), dp(2));
 
-                    int pillColor = Color.parseColor("#71717A");
+                    int pillColor = AppTheme.textMuted();
                     switch (t.getLifecycleState()) {
-                        case DOWNLOADING: pillColor = Color.parseColor("#38BDF8"); break;
+                        case DOWNLOADING: pillColor = AppTheme.accent(); break;
                         case WAITING_FINAL_PIECES: pillColor = getWarningColor(); break;
                         case SEEDING:
                         case COMPLETE: pillColor = getSuccessColor(); break;
-                        case STALLED: pillColor = Color.parseColor("#E57373"); break;
+                        case STALLED: pillColor = AppTheme.danger(); break;
                         case ERROR: pillColor = getDangerColor(); break;
-                        default: pillColor = Color.parseColor("#71717A"); break;
+                        default: pillColor = AppTheme.textMuted(); break;
                     }
                     pill.setTextColor(pillColor);
                     pill.setBackground(createBorderedRoundedDrawable(colorWithAlpha(pillColor, 20), colorWithAlpha(pillColor, 50), dp(1), dp(4)));
@@ -3398,10 +3657,10 @@ public final class FishbowlActivity extends AppCompatActivity
                     btnDeleteItem.setText("DEL");
                     btnDeleteItem.setTextSize(10f);
                     btnDeleteItem.setTypeface(Typeface.DEFAULT_BOLD);
-                    btnDeleteItem.setTextColor(Color.parseColor("#EF4444"));
+                    btnDeleteItem.setTextColor(AppTheme.danger());
                     btnDeleteItem.setGravity(Gravity.CENTER);
                     btnDeleteItem.setPadding(dp(6), dp(2), dp(6), dp(2));
-                    btnDeleteItem.setBackground(createBorderedRoundedDrawable(Color.parseColor("#271212"), Color.parseColor("#7F1D1D"), dp(1), dp(4)));
+                    btnDeleteItem.setBackground(createBorderedRoundedDrawable(AppTheme.dangerContainer(), AppTheme.danger(), dp(1), dp(4)));
                     btnDeleteItem.setClickable(true);
                     btnDeleteItem.setFocusable(true);
                     btnDeleteItem.setOnClickListener(v -> showRemoveSingleTorrentDialog(t));
@@ -3427,7 +3686,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     TextView metaLeft = new TextView(this);
                     metaLeft.setTextSize(9.5f);
                     metaLeft.setTypeface(Typeface.MONOSPACE);
-                    metaLeft.setTextColor(Color.parseColor("#A1A1AA"));
+                    metaLeft.setTextColor(AppTheme.textSecondary());
 
                     StringBuilder meta = new StringBuilder();
                     if (t.sizeWhenDone > 0) {
@@ -3459,6 +3718,46 @@ public final class FishbowlActivity extends AppCompatActivity
 
                     item.addView(metaRow);
 
+                    // Row 4: Actions (Pause/Play, Force start, Recheck)
+                    LinearLayout actionRow = new LinearLayout(this);
+                    actionRow.setOrientation(LinearLayout.HORIZONTAL);
+                    actionRow.setGravity(Gravity.CENTER_VERTICAL);
+                    actionRow.setPadding(0, dp(8), 0, 0);
+
+                    final TextView btnToggle = createTorrentActionButton(t.status == 0 ? "PLAY" : "PAUSE", AppTheme.accent());
+                    holder.btnToggle = btnToggle;
+                    holder.status = t.status;
+                    final int torrentId = t.id;
+                    btnToggle.setOnClickListener(v -> {
+                        final MediaStorageManager msm = MediaStorageManager.getInstance(this);
+                        if (holder.status == 0) {
+                            runTorrentAction("Resumed.", () -> msm.resumeTransmissionTorrent(torrentId));
+                        } else {
+                            runTorrentAction("Paused.", () -> msm.pauseTransmissionTorrent(torrentId));
+                        }
+                    });
+
+                    final TextView btnForce = createTorrentActionButton("FORCE START", AppTheme.success());
+                    btnForce.setOnClickListener(v -> {
+                        final MediaStorageManager msm = MediaStorageManager.getInstance(this);
+                        runTorrentAction("Force started.", () -> msm.forceStartTransmissionTorrent(torrentId));
+                    });
+
+                    final TextView btnRecheck = createTorrentActionButton("RECHECK", AppTheme.warning());
+                    btnRecheck.setOnClickListener(v -> {
+                        final MediaStorageManager msm = MediaStorageManager.getInstance(this);
+                        runTorrentAction("Recheck started.", () -> msm.recheckTransmissionTorrent(torrentId));
+                    });
+
+                    LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+                    alp.setMarginEnd(dp(6));
+                    actionRow.addView(btnToggle, alp);
+                    LinearLayout.LayoutParams alp2 = new LinearLayout.LayoutParams(0, -2, 1.3f);
+                    alp2.setMarginEnd(dp(6));
+                    actionRow.addView(btnForce, alp2);
+                    actionRow.addView(btnRecheck, new LinearLayout.LayoutParams(0, -2, 1.0f));
+                    item.addView(actionRow);
+
                     item.setTag(holder);
                     downloadItemsContainer.addView(item);
                 }
@@ -3470,7 +3769,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout tile = new LinearLayout(this);
         tile.setOrientation(LinearLayout.VERTICAL);
         tile.setPadding(dp(14), dp(10), dp(14), dp(10));
-        tile.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121316"), Color.parseColor("#27272A"), dp(1), dp(8)));
+        tile.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(8)));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.bottomMargin = dp(8);
         tile.setLayoutParams(lp);
@@ -3488,7 +3787,7 @@ public final class FishbowlActivity extends AppCompatActivity
             TextView tvSub = new TextView(this);
             tvSub.setText(subtitle);
             tvSub.setTextSize(10.5f);
-            tvSub.setTextColor(Color.parseColor("#A1A1AA"));
+            tvSub.setTextColor(AppTheme.textSecondary());
             tvSub.setPadding(0, dp(2), 0, 0);
             tile.addView(tvSub);
         }
@@ -3509,14 +3808,14 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(createOledDialogOptionTile(
                 "Clear Completed Tasks",
                 "Removes finished and inactive torrents • Retains downloaded files",
-                Color.parseColor("#10B981"),
+                AppTheme.success(),
                 () -> {
                     if (dRef[0] != null) dRef[0].dismiss();
-                    Toast.makeText(this, "Clearing completed downloads...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Clearing completed downloads..."), Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
                         int count = MediaStorageManager.getInstance(this).clearCompletedTransmissionTorrents(false);
                         runOnUiThread(() -> {
-                            Toast.makeText(this, "Cleared " + count + " item(s).", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, I18n.tr("Cleared " + count + " item(s)."), Toast.LENGTH_SHORT).show();
                             refreshDownloadCenter();
                         });
                     }).start();
@@ -3527,14 +3826,14 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(createOledDialogOptionTile(
                 "Remove All from Queue",
                 "Clears all downloads from list • Keeps media files on disk",
-                Color.parseColor("#38BDF8"),
+                AppTheme.accent(),
                 () -> {
                     if (dRef[0] != null) dRef[0].dismiss();
-                    Toast.makeText(this, "Clearing queue items...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Clearing queue items..."), Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
                         int count = MediaStorageManager.getInstance(this).clearAllTransmissionTorrents(false);
                         runOnUiThread(() -> {
-                            Toast.makeText(this, "Cleared " + count + " item(s).", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, I18n.tr("Cleared " + count + " item(s)."), Toast.LENGTH_SHORT).show();
                             refreshDownloadCenter();
                         });
                     }).start();
@@ -3545,14 +3844,14 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(createOledDialogOptionTile(
                 "Erase All & Delete Files",
                 "Permanently purges torrents and deletes all downloaded files from storage",
-                Color.parseColor("#EF4444"),
+                AppTheme.danger(),
                 () -> {
                     if (dRef[0] != null) dRef[0].dismiss();
-                    Toast.makeText(this, "Purging downloads and disk storage...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Purging downloads and disk storage..."), Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
                         int count = MediaStorageManager.getInstance(this).clearAllTransmissionTorrents(true);
                         runOnUiThread(() -> {
-                            Toast.makeText(this, "Purged " + count + " download(s).", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, I18n.tr("Purged " + count + " download(s)."), Toast.LENGTH_SHORT).show();
                             refreshDownloadCenter();
                         });
                     }).start();
@@ -3560,6 +3859,85 @@ public final class FishbowlActivity extends AppCompatActivity
         ));
 
         dRef[0] = showOledDialog("Clear Downloads", "Select an action for active and completed tasks", content, null, 0, null, "CANCEL", null);
+    }
+
+    private TextView createTorrentActionButton(String label, int color) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setTextSize(9.5f);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setTextColor(color);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(4), dp(5), dp(4), dp(5));
+        b.setBackground(createBorderedRoundedDrawable(colorWithAlpha(color, 20), colorWithAlpha(color, 60), dp(1), dp(4)));
+        b.setClickable(true);
+        b.setFocusable(true);
+        return b;
+    }
+
+    private void runTorrentAction(final String okMessage, final java.util.concurrent.Callable<Boolean> action) {
+        new Thread(() -> {
+            boolean ok;
+            try {
+                ok = Boolean.TRUE.equals(action.call());
+            } catch (Throwable t) {
+                ok = false;
+            }
+            final boolean result = ok;
+            runOnUiThread(() -> {
+                Toast.makeText(this, I18n.tr(result ? okMessage : "Transmission did not accept the command."), Toast.LENGTH_SHORT).show();
+                refreshDownloadCenter();
+            });
+        }, "Fishbowl-TorrentAction").start();
+    }
+
+    private void showTransmissionHistoryDialog() {
+        final java.util.List<com.fishbowl.app.services.TransmissionHistory.Entry> entries =
+                com.fishbowl.app.services.TransmissionHistory.read(this, 300);
+        ScrollView sv = new ScrollView(this);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(4), dp(4), dp(4), dp(4));
+        sv.addView(list);
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("MM-dd HH:mm", Locale.US);
+        if (entries.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("No downloads logged yet. Events are recorded while Transmission is running.");
+            empty.setTextSize(11.5f);
+            empty.setTextColor(AppTheme.textSecondary());
+            list.addView(empty);
+        }
+        for (com.fishbowl.app.services.TransmissionHistory.Entry e : entries) {
+            int color = AppTheme.textSecondary();
+            switch (e.event) {
+                case "COMPLETED": color = getSuccessColor(); break;
+                case "FAILED": color = getDangerColor(); break;
+                case "CANCELLED": color = getWarningColor(); break;
+                case "REMOVED": color = AppTheme.warning(); break;
+                case "ADDED": color = AppTheme.accent(); break;
+                case "RECOVERED": color = getSuccessColor(); break;
+                case "AUTO-RECHECK":
+                case "AUTO-CLEANUP": color = Color.parseColor("#C084FC"); break;
+                default: break;
+            }
+            TextView head = new TextView(this);
+            head.setText(fmt.format(new java.util.Date(e.timeMs)) + "  " + e.event);
+            head.setTextSize(10.5f);
+            head.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+            head.setTextColor(color);
+            head.setPadding(0, dp(8), 0, 0);
+            list.addView(head);
+            TextView body = new TextView(this);
+            body.setText(e.name + (e.detail != null && !e.detail.isEmpty() ? "\n" + e.detail : ""));
+            body.setTextSize(11f);
+            body.setTextColor(AppTheme.text());
+            list.addView(body);
+        }
+        showOledDialog("Download History", entries.size() + " event(s), newest first", sv,
+                "CLEAR LOG", getDangerColor(), () -> {
+                    com.fishbowl.app.services.TransmissionHistory.clear(this);
+                    Toast.makeText(this, I18n.tr("History cleared."), Toast.LENGTH_SHORT).show();
+                }, "CLOSE", null);
     }
 
     private void showRemoveSingleTorrentDialog(MediaStorageManager.TorrentInfo torrent) {
@@ -3572,14 +3950,14 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(createOledDialogOptionTile(
                 "Remove from Queue",
                 "Removes task from Transmission • Retains downloaded files on disk",
-                Color.parseColor("#38BDF8"),
+                AppTheme.accent(),
                 () -> {
                     if (dRef[0] != null) dRef[0].dismiss();
-                    Toast.makeText(this, "Removing...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Removing..."), Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
                         boolean ok = MediaStorageManager.getInstance(this).removeTransmissionTorrent(torrent.id, false);
                         runOnUiThread(() -> {
-                            Toast.makeText(this, ok ? "Removed from queue." : "Failed to remove.", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, I18n.tr(ok ? "Removed from queue." : "Failed to remove."), Toast.LENGTH_SHORT).show();
                             refreshDownloadCenter();
                         });
                     }).start();
@@ -3589,14 +3967,14 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(createOledDialogOptionTile(
                 "Delete Files from Disk",
                 "Permanently deletes task and all downloaded files from storage",
-                Color.parseColor("#EF4444"),
+                AppTheme.danger(),
                 () -> {
                     if (dRef[0] != null) dRef[0].dismiss();
-                    Toast.makeText(this, "Deleting files...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Deleting files..."), Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
                         boolean ok = MediaStorageManager.getInstance(this).removeTransmissionTorrent(torrent.id, true);
                         runOnUiThread(() -> {
-                            Toast.makeText(this, ok ? "Deleted files and task." : "Failed to delete.", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, I18n.tr(ok ? "Deleted files and task." : "Failed to delete."), Toast.LENGTH_SHORT).show();
                             refreshDownloadCenter();
                         });
                     }).start();
@@ -3610,7 +3988,6 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void refreshLogServiceChips() {
         if (logServiceChipsContainer == null) return;
-        logServiceChipsContainer.removeAllViews();
 
         List<String> installedServices = new ArrayList<>();
         installedServices.add("ALL");
@@ -3638,90 +4015,69 @@ public final class FishbowlActivity extends AppCompatActivity
             selectedLogService = "ALL";
         }
 
+        // Same set of chips as shown already: only restyle (keeps the row's scroll position, no flicker).
+        List<String> shown = new ArrayList<>();
+        for (int i = 0; i < logServiceChipsContainer.getChildCount(); i++) {
+            Object tag = logServiceChipsContainer.getChildAt(i).getTag();
+            if (tag instanceof String) shown.add((String) tag);
+        }
+        if (shown.equals(installedServices)) {
+            updateLogServiceChips();
+            return;
+        }
+        logServiceChipsContainer.removeAllViews();
+
         for (String svcName : installedServices) {
-            Button chip = new Button(this);
-            chip.setText(svcName);
-            chip.setTextSize(10);
-            chip.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            chip.setAllCaps(true);
-            chip.setMinHeight(0);
-            chip.setMinimumHeight(0);
-            chip.setMinWidth(0);
-            chip.setMinimumWidth(0);
-            chip.setPadding(dp(10), dp(5), dp(10), dp(5));
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                chip.setStateListAnimator(null);
-            }
+            String label = "ALL".equals(svcName) ? "All"
+                    : "JELLYFIN".equals(svcName) ? "Jellyfin" : displayNameForService(svcName.toLowerCase(Locale.ROOT));
+            TextView chip = UiKit.chip(this, label, svcName.equalsIgnoreCase(selectedLogService));
+            chip.setTag(svcName);   // selection logic reads the tag, never the (translated) label
+            chip.setPadding(dp(12), dp(6), dp(12), dp(6));
             chip.setOnClickListener(v -> {
                 selectedLogService = svcName;
                 updateLogServiceChips();
                 refreshUnifiedLogsDisplay();
             });
-
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(28));
-            lp.rightMargin = dp(6);
-            logServiceChipsContainer.addView(chip, lp);
+            logServiceChipsContainer.addView(chip, UiKit.chipLp(this));
         }
         updateLogServiceChips();
     }
 
+    private String displayNameForService(String id) {
+        try {
+            ManagedService ms = MediaServiceManager.getInstance(this).getService(id);
+            if (ms != null && ms.getDisplayName() != null) return ms.getDisplayName();
+        } catch (Throwable ignored) {}
+        return id.isEmpty() ? id : id.substring(0, 1).toUpperCase(Locale.ROOT) + id.substring(1);
+    }
+
+    /** Selected chip uses the accent container; running services get a small green dot before the name. */
     private void updateLogServiceChips() {
         if (logServiceChipsContainer == null) return;
         for (int i = 0; i < logServiceChipsContainer.getChildCount(); i++) {
             View child = logServiceChipsContainer.getChildAt(i);
-            if (!(child instanceof Button)) continue;
-            Button chip = (Button) child;
-            String text = chip.getText().toString();
-            boolean isSel = text.equalsIgnoreCase(selectedLogService);
+            if (!(child instanceof TextView) || !(child.getTag() instanceof String)) continue;
+            TextView chip = (TextView) child;
+            String key = (String) child.getTag();
+            boolean isSel = key.equalsIgnoreCase(selectedLogService);
 
             boolean isSvcRunning;
-            if ("ALL".equalsIgnoreCase(text)) {
-                isSvcRunning = true;
-            } else if ("JELLYFIN".equalsIgnoreCase(text)) {
+            if ("ALL".equalsIgnoreCase(key)) {
+                isSvcRunning = false;
+            } else if ("JELLYFIN".equalsIgnoreCase(key)) {
                 isSvcRunning = (controller != null && controller.getState() == JellyfinController.State.RUNNING);
             } else {
-                ManagedService ms = MediaServiceManager.getInstance(this).getService(text.toLowerCase(Locale.ROOT));
+                ManagedService ms = MediaServiceManager.getInstance(this).getService(key.toLowerCase(Locale.ROOT));
                 isSvcRunning = (ms != null && ms.isRunning());
             }
-
-            int brandColor = "ALL".equalsIgnoreCase(text) ? Color.WHITE : getServiceBrandColor(text.toLowerCase(Locale.ROOT));
-
-            if (isSel) {
-                if (isSvcRunning && !"ALL".equalsIgnoreCase(text)) {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            brandColor,
-                            brandColor,
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(Color.BLACK);
-                } else {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            Color.WHITE,
-                            Color.WHITE,
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(Color.BLACK);
-                }
+            UiKit.styleChip(this, chip, isSel);
+            if (isSvcRunning) {
+                GradientDrawable dot = createCircleDrawable(AppTheme.success());
+                dot.setSize(dp(6), dp(6));
+                chip.setCompoundDrawablesRelativeWithIntrinsicBounds(dot, null, null, null);
+                chip.setCompoundDrawablePadding(dp(6));
             } else {
-                if (isSvcRunning && !"ALL".equalsIgnoreCase(text)) {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            Color.BLACK,
-                            brandColor,
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(brandColor);
-                } else {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            Color.BLACK,
-                            Color.argb(20, 255, 255, 255),
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(Color.parseColor("#71717A"));
-                }
+                chip.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, null, null);
             }
         }
     }
@@ -3730,40 +4086,22 @@ public final class FishbowlActivity extends AppCompatActivity
         if (logLevelChipsContainer == null) return;
         for (int i = 0; i < logLevelChipsContainer.getChildCount(); i++) {
             View child = logLevelChipsContainer.getChildAt(i);
-            if (!(child instanceof Button)) continue;
-            Button chip = (Button) child;
-            String text = chip.getText().toString();
-            boolean isSel = ("ALL".equals(text) && "ALL".equals(selectedLogLevel))
-                    || ("ERR".equals(text) && "ERROR".equals(selectedLogLevel))
-                    || ("WRN".equals(text) && "WARNING".equals(selectedLogLevel))
-                    || ("INF".equals(text) && "INFO".equals(selectedLogLevel));
-
-            int chipColor = "ERR".equals(text) ? getDangerColor()
-                    : ("WRN".equals(text) ? getWarningColor()
-                    : ("INF".equals(text) ? Color.parseColor("#34D399") : Color.WHITE));
-
-            if (isSel) {
-                chip.setBackground(createBorderedRoundedDrawable(
-                        Color.argb(35, Color.red(chipColor), Color.green(chipColor), Color.blue(chipColor)),
-                        chipColor,
-                        dp(1),
-                        dp(6)
-                ));
-                chip.setTextColor(chipColor);
-            } else {
-                chip.setBackground(createBorderedRoundedDrawable(
-                        Color.BLACK,
-                        Color.argb(20, 255, 255, 255),
-                        dp(1),
-                        dp(6)
-                ));
-                chip.setTextColor(Color.parseColor("#71717A"));
-            }
+            if (!(child instanceof TextView) || !(child.getTag() instanceof String)) continue;
+            UiKit.styleChip(this, (TextView) child, child.getTag().equals(selectedLogLevel));
         }
     }
 
+    private void styleAutoScrollButton() {
+        if (btnToggleAutoScroll == null) return;
+        btnToggleAutoScroll.setText(I18n.tr(autoScrollEnabled ? "Auto-scroll on" : "Auto-scroll off"));
+        btnToggleAutoScroll.setTextColor(autoScrollEnabled ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
+        btnToggleAutoScroll.setBackground(UiKit.pressable(this,
+                autoScrollEnabled ? AppTheme.accentContainer() : AppTheme.card(),
+                autoScrollEnabled ? 0 : AppTheme.outline(), UiKit.R_INNER));
+    }
+
     private int getServiceColor(String serviceTag) {
-        if ("ALL".equalsIgnoreCase(serviceTag)) return Color.WHITE;
+        if ("ALL".equalsIgnoreCase(serviceTag)) return AppTheme.text();
         return getServiceBrandColor(serviceTag.toLowerCase(Locale.ROOT));
     }
 
@@ -3774,8 +4112,8 @@ public final class FishbowlActivity extends AppCompatActivity
         // Determine service tag from line or fallback
         String serviceTag = defaultServiceTag;
         if (line.startsWith("[JELLYFIN]") || line.startsWith("[RADARR]") || line.startsWith("[SONARR]")
-                || line.startsWith("[PROWLARR]") || line.startsWith("[JACKETT]") || line.startsWith("[TRANSMISSION]") || line.startsWith("[SEERR]")
-                || line.startsWith("[BAZARR]") || line.startsWith("[LIDARR]")) {
+                || line.startsWith("[PROWLARR]") || line.startsWith("[TRANSMISSION]")
+                ) {
             int endTag = line.indexOf(']');
             if (endTag > 0) {
                 serviceTag = line.substring(1, endTag).toUpperCase(Locale.ROOT);
@@ -3785,7 +4123,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Determine level: ERR, WRN, INF, DBG
         String lower = line.toLowerCase(Locale.ROOT);
-        int levelColor = Color.parseColor("#34D399"); // Mint/Sage for INFO default
+        int levelColor = AppTheme.success(); // Mint/Sage for INFO default
         String levelBadge = "INF";
         if (lower.contains("[err]") || lower.contains("[error]") || lower.contains("error:")
                 || lower.contains("fail") || lower.contains("exception") || lower.contains("[ftl]")
@@ -3796,7 +4134,7 @@ public final class FishbowlActivity extends AppCompatActivity
             levelColor = getWarningColor(); // Warm Safety Orange
             levelBadge = "WRN";
         } else if (lower.contains("[dbg]") || lower.contains("[debug]")) {
-            levelColor = Color.parseColor("#94A3B8"); // Slate
+            levelColor = AppTheme.textSecondary(); // Slate
             levelBadge = "DBG";
         }
 
@@ -3826,13 +4164,55 @@ public final class FishbowlActivity extends AppCompatActivity
         ssb.append(cleanLine).append("\n");
         int lineEnd = ssb.length();
 
-        int msgColor = levelBadge.equals("ERR") ? Color.parseColor("#FCA5A5")
-                : (levelBadge.equals("WRN") ? Color.parseColor("#FDE68A") : Color.parseColor("#D4D4D8"));
+        int msgColor = levelBadge.equals("ERR") ? AppTheme.danger()
+                : (levelBadge.equals("WRN") ? AppTheme.warning() : AppTheme.text());
         ssb.setSpan(new ForegroundColorSpan(msgColor), lineStart, lineEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
     }
 
+    private static final class UnifiedLogsResult {
+        CharSequence text;
+        Integer color;
+        String subtitle;
+    }
+
+    private final java.util.concurrent.atomic.AtomicInteger unifiedLogsGen = new java.util.concurrent.atomic.AtomicInteger();
+
+    /** Reads and colorizes logs off the main thread, then applies the result on the UI thread. */
     private void refreshUnifiedLogsDisplay() {
         if (logsOutputText == null) return;
+        final int gen = unifiedLogsGen.incrementAndGet();
+        runBg(() -> {
+            final UnifiedLogsResult out;
+            try {
+                out = computeUnifiedLogs();
+            } catch (Throwable t) {
+                Log.w(TAG, "Unified logs compute failed: " + t.getMessage());
+                return;
+            }
+            runOnUiThread(() -> {
+                if (isFinishing() || gen != unifiedLogsGen.get() || logsOutputText == null) return;
+                if (out.text != null) logsOutputText.setText(out.text);
+                if (out.color != null) logsOutputText.setTextColor(out.color);
+                if (out.subtitle != null && logsStatusSubtitle != null) logsStatusSubtitle.setText(out.subtitle);
+                if (autoScrollEnabled && logsScrollView != null) {
+                    logsScrollView.postDelayed(() -> {
+                        if (logsScrollView != null) {
+                            View child = logsScrollView.getChildAt(0);
+                            if (child != null) {
+                                int diff = child.getBottom() - (logsScrollView.getHeight() + logsScrollView.getScrollY());
+                                if (diff <= dp(140)) logsScrollView.fullScroll(View.FOCUS_DOWN);
+                            } else {
+                                logsScrollView.fullScroll(View.FOCUS_DOWN);
+                            }
+                        }
+                    }, 40);
+                }
+            });
+        });
+    }
+
+    private UnifiedLogsResult computeUnifiedLogs() {
+        UnifiedLogsResult out = new UnifiedLogsResult();
 
         SpannableStringBuilder ssb = new SpannableStringBuilder();
         int lineCount = 0;
@@ -3868,16 +4248,12 @@ public final class FishbowlActivity extends AppCompatActivity
             }
         } else if ("JELLYFIN".equalsIgnoreCase(selectedLogService)) {
             if (!JellyfinBootstrapper.isInitialized(this)) {
-                logsOutputText.setText("--- Jellyfin server runtime is not installed ---");
-                logsOutputText.setTextColor(Color.parseColor("#71717A"));
-                if (logsStatusSubtitle != null) {
-                    logsStatusSubtitle.setText("[JELLYFIN] - Not installed");
-                }
-                return;
+                out.text = "--- Jellyfin server runtime is not installed ---";
+                out.color = AppTheme.textMuted();
+                out.subtitle = "[JELLYFIN] - Not installed";
+                return out;
             }
-            if (logsStatusSubtitle != null) {
-                logsStatusSubtitle.setText("[JELLYFIN] - Live Stream & Disk Log Output");
-            }
+            out.subtitle = "[JELLYFIN] - Live Stream & Disk Log Output";
             if (controller != null) {
                 String raw = showingDiskLog ? controller.getDiskLogs() : controller.getLogs();
                 if (showingDiskLog && (raw == null || raw.isEmpty())) {
@@ -3915,44 +4291,25 @@ public final class FishbowlActivity extends AppCompatActivity
                     }
                 }
             } else {
-                logsOutputText.setText("--- Service [" + selectedLogService + "] is not installed ---");
-                logsOutputText.setTextColor(Color.parseColor("#71717A"));
-                if (logsStatusSubtitle != null) {
-                    logsStatusSubtitle.setText("[" + selectedLogService + "] - Not installed");
-                }
-                return;
+                out.text = "--- Service [" + selectedLogService + "] is not installed ---";
+                out.color = AppTheme.textMuted();
+                out.subtitle = "[" + selectedLogService + "] - Not installed";
+                return out;
             }
         }
 
         if (ssb.length() == 0) {
-            logsOutputText.setText("--- No logs recorded for [" + selectedLogService + "] with filter [" + selectedLogLevel + "] ---");
-            logsOutputText.setTextColor(Color.parseColor("#71717A"));
+            out.text = "--- No logs recorded for [" + selectedLogService + "] with filter [" + selectedLogLevel + "] ---";
+            out.color = AppTheme.textMuted();
         } else {
-            logsOutputText.setText(ssb);
+            out.text = ssb;
+            out.color = Color.parseColor("#D4D4D8");
         }
 
-        if (logsStatusSubtitle != null) {
-            logsStatusSubtitle.setText("[" + selectedLogService + "] - " + lineCount + " lines (" + selectedLogLevel + ") - Auto-scroll: " + (autoScrollEnabled ? "ON" : "OFF"));
-        }
-
-        if (autoScrollEnabled && logsScrollView != null) {
-            logsScrollView.postDelayed(() -> {
-                if (logsScrollView != null) {
-                    View child = logsScrollView.getChildAt(0);
-                    if (child != null) {
-                        int diff = child.getBottom() - (logsScrollView.getHeight() + logsScrollView.getScrollY());
-                        if (diff <= dp(140)) {
-                            logsScrollView.fullScroll(View.FOCUS_DOWN);
-                        }
-                    } else {
-                        logsScrollView.fullScroll(View.FOCUS_DOWN);
-                    }
-                }
-            }, 40);
-        }
+        out.subtitle = "[" + selectedLogService + "] - " + lineCount + " lines (" + selectedLogLevel + ") - Auto-scroll: " + (autoScrollEnabled ? "ON" : "OFF");
+        return out;
     }
 
-    
     public boolean isMediaStackEnabled() {
         return getFishbowlPrefs().getBoolean("media_stack_enabled", true);
     }
@@ -3960,9 +4317,20 @@ public final class FishbowlActivity extends AppCompatActivity
     public void setMediaStackEnabled(boolean enabled) {
         getFishbowlPrefs().edit().putBoolean("media_stack_enabled", enabled).apply();
         if (!enabled) {
-            try {
-                MediaServiceManager.getInstance(this).uninstallAllCompanionServices();
-            } catch (Throwable ignored) {}
+            // Stopping services and deleting their folders (hundreds of MB) must not block the UI thread.
+            final Context app = getApplicationContext();
+            runBg(() -> {
+                try {
+                    MediaServiceManager.getInstance(app).uninstallAllCompanionServices();
+                } catch (Throwable ignored) {}
+                runOnUiThread(() -> {
+                    if (!isUiAlive()) return;
+                    lastServicesSignature = null;
+                    rebuildHomeServiceTiles();
+                    refreshHomeServicesBadge();
+                    refreshServicesTabUI();
+                });
+            });
             if (activeTab == 1) {
                 activeTab = 0;
             }
@@ -3975,13 +4343,346 @@ public final class FishbowlActivity extends AppCompatActivity
     private void refreshBottomNavBar() {
         if (bottomNavLayout == null) return;
         bottomNavLayout.removeAllViews();
-        addNavTab(bottomNavLayout, 0, R.drawable.ic_home);
-        if (isMediaStackEnabled()) {
-            addNavTab(bottomNavLayout, 1, R.drawable.ic_services);
-        }
-        addNavTab(bottomNavLayout, 2, R.drawable.ic_activity);
-        addNavTab(bottomNavLayout, 3, R.drawable.ic_settings);
+        populateNavTabs(bottomNavLayout);
+        rebuildDrawerItems();
         updateBottomNavSelection();
+    }
+
+    // -- Icon-only side drawer (Library / Sonarr), opened from the "Menu" item of the bottom bar ----
+
+    private FrameLayout sideDrawerScrim;
+    private LinearLayout sideDrawerPanel;
+    private LinearLayout sideDrawerItems;
+    private boolean sideDrawerOpen = false;
+
+    private static final int PLACEHOLDER_TAB_BASE = 10;
+    private static final String[] PLACEHOLDER_NAMES = {"Radarr", "Prowlarr", "Transmission"};
+    private static final int[] PLACEHOLDER_ICONS = {R.drawable.logo_radarr, R.drawable.logo_prowlarr,
+            R.drawable.logo_transmission};
+
+    /** True for the full-colour original service logos (PNG); they are never tinted. */
+    private static boolean isColorLogoRes(int res) {
+        return res == R.drawable.logo_jellyfin || res == R.drawable.logo_radarr || res == R.drawable.logo_sonarr || res == R.drawable.logo_prowlarr
+                || res == R.drawable.logo_transmission;
+    }
+
+    /** Colour logo: full colour when active, desaturated and faded when off. */
+    private static void applyColorLogoState(ImageView iv, boolean active) {
+        if (active) {
+            iv.clearColorFilter();
+            iv.setAlpha(1f);
+        } else {
+            android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
+            cm.setSaturation(0f);
+            iv.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
+            iv.setAlpha(0.4f);
+        }
+    }
+    private View cachedPlaceholderView;
+    private ImageView placeholderIcon;
+    private TextView placeholderTitle;
+
+    private void buildSideDrawer(FrameLayout shell) {
+        sideDrawerScrim = new FrameLayout(this);
+        sideDrawerScrim.setBackgroundColor(0x99000000);
+        sideDrawerScrim.setVisibility(View.GONE);
+        sideDrawerScrim.setAlpha(0f);
+        sideDrawerScrim.setOnClickListener(v -> closeSideDrawer());
+        shell.addView(sideDrawerScrim, new FrameLayout.LayoutParams(-1, -1));
+
+        sideDrawerPanel = new LinearLayout(this);
+        sideDrawerPanel.setOrientation(LinearLayout.VERTICAL);
+        sideDrawerPanel.setGravity(Gravity.CENTER_HORIZONTAL);
+        sideDrawerPanel.setBackground(drawerBackground());
+        sideDrawerPanel.setPadding(0, dp(24), 0, dp(24));
+        sideDrawerPanel.setVisibility(View.GONE);
+        sideDrawerPanel.setClickable(true);
+        sideDrawerPanel.setElevation(dp(12));
+        final float[] downX = new float[1];
+        sideDrawerPanel.setOnTouchListener((v, ev) -> {
+            if (ev.getAction() == android.view.MotionEvent.ACTION_DOWN) downX[0] = ev.getRawX();
+            else if (ev.getAction() == android.view.MotionEvent.ACTION_MOVE
+                    && (ev.getRawX() - downX[0]) * drawerOffscreenSign() > dp(36)) {
+                closeSideDrawer();
+                return true;
+            }
+            return false;
+        });
+        ScrollView drawerScroll = new ScrollView(this);
+        drawerScroll.setVerticalScrollBarEnabled(false);
+        drawerScroll.setFillViewport(false);
+        sideDrawerItems = new LinearLayout(this);
+        sideDrawerItems.setOrientation(LinearLayout.VERTICAL);
+        sideDrawerItems.setGravity(Gravity.CENTER_HORIZONTAL);
+        drawerScroll.addView(sideDrawerItems, new ViewGroup.LayoutParams(-1, -2));
+        sideDrawerPanel.addView(drawerScroll, new LinearLayout.LayoutParams(-1, -1));
+        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(dp(68), -1);
+        plp.gravity = Gravity.START;
+        shell.addView(sideDrawerPanel, plp);
+        rebuildDrawerItems();
+    }
+
+    /** Shared empty page for the services whose tab is not built yet. */
+    private View buildPlaceholderView() {
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setBackgroundColor(AppTheme.bg());
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER);
+        placeholderIcon = new ImageView(this);
+        placeholderIcon.setColorFilter(AppTheme.textMuted());
+        col.addView(placeholderIcon, new LinearLayout.LayoutParams(dp(56), dp(56)));
+        placeholderTitle = new TextView(this);
+        placeholderTitle.setTextSize(16f);
+        placeholderTitle.setTextColor(AppTheme.text());
+        placeholderTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        placeholderTitle.setPadding(0, dp(14), 0, dp(4));
+        col.addView(placeholderTitle);
+        TextView soon = UiKit.caption(this, "Coming soon");
+        col.addView(soon);
+        wrap.addView(col, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+        return wrap;
+    }
+
+    private void showPlaceholderFor(int tab) {
+        int i = tab - PLACEHOLDER_TAB_BASE;
+        if (i < 0 || i >= PLACEHOLDER_NAMES.length || placeholderIcon == null) return;
+        placeholderIcon.setImageResource(PLACEHOLDER_ICONS[i]);
+        placeholderTitle.setText(PLACEHOLDER_NAMES[i]);
+    }
+
+    private boolean isDrawerTab(int tab) {
+        return tab == 5 || tab == 6 || tab >= PLACEHOLDER_TAB_BASE;
+    }
+
+    private boolean isRtlLayout() {
+        return getResources().getConfiguration().getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+    }
+
+    /** Direction the drawer slides toward when hidden: -1 = off the left edge (LTR), +1 = off the right edge (RTL). */
+    private int drawerOffscreenSign() {
+        return isRtlLayout() ? 1 : -1;
+    }
+
+    /** Card-coloured panel whose rounded corners and hairline face the content, in both LTR and RTL. */
+    private android.graphics.drawable.Drawable drawerBackground() {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(AppTheme.card());
+        float r = dp(20);
+        // corner order: top-left, top-right, bottom-right, bottom-left (x,y pairs)
+        g.setCornerRadii(isRtlLayout()
+                ? new float[]{r, r, 0, 0, 0, 0, r, r}
+                : new float[]{0, 0, r, r, r, r, 0, 0});
+        g.setStroke(dp(1), AppTheme.outline());
+        return g;
+    }
+
+    private void applyDrawerInsets(int top, int bottom) {
+        if (sideDrawerPanel != null) sideDrawerPanel.setPadding(0, top + dp(24), 0, dp(24));
+    }
+
+    private void rebuildDrawerItems() {
+        if (sideDrawerPanel == null) return;
+        if (sideDrawerItems == null) return;
+        sideDrawerItems.removeAllViews();
+        addDrawerItem(5, R.drawable.logo_jellyfin, "Jellyfin Library");
+        if (isMediaStackEnabled()) {
+            addDrawerItem(6, R.drawable.logo_sonarr, "Sonarr");
+            View sep = new View(this);
+            sep.setBackgroundColor(AppTheme.outline());
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(28), dp(1));
+            slp.topMargin = dp(2);
+            slp.bottomMargin = dp(12);
+            sideDrawerItems.addView(sep, slp);
+            for (int i = 0; i < PLACEHOLDER_NAMES.length; i++) {
+                addDrawerItem(PLACEHOLDER_TAB_BASE + i, PLACEHOLDER_ICONS[i], PLACEHOLDER_NAMES[i]);
+            }
+        }
+        updateDrawerSelection();
+    }
+
+    private void addDrawerItem(final int tabIndex, int iconRes, String description) {
+        FrameLayout item = new FrameLayout(this);
+        item.setTag(tabIndex);
+        item.setClickable(true);
+        item.setFocusable(true);
+        item.setContentDescription(description);
+        ImageView icon = new ImageView(this);
+        icon.setTag(isColorLogoRes(iconRes) ? "logo" : "icon");
+        icon.setImageResource(iconRes);
+        FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(dp(26), dp(26));
+        ilp.gravity = Gravity.CENTER;
+        item.addView(icon, ilp);
+        item.setOnClickListener(v -> {
+            closeSideDrawer();
+            if (activeTab != tabIndex) {
+                activeTab = tabIndex;
+                updateBottomNavSelection();
+                renderActiveTab();
+            }
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(52), dp(52));
+        lp.bottomMargin = dp(10);
+        sideDrawerItems.addView(item, lp);
+    }
+
+    private void updateDrawerSelection() {
+        if (sideDrawerItems == null) return;
+        for (int i = 0; i < sideDrawerItems.getChildCount(); i++) {
+            View c = sideDrawerItems.getChildAt(i);
+            boolean sel = c.getTag() instanceof Integer && (Integer) c.getTag() == activeTab;
+            c.setBackground(UiKit.pressable(this, sel ? AppTheme.accentContainer() : Color.TRANSPARENT, 0, UiKit.R_CARD));
+            ImageView ic = c.findViewWithTag("icon");
+            if (ic != null) ic.setColorFilter(sel ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
+        }
+    }
+
+    private float edgeDownX, edgeDownY;
+    private long edgeDownTime;
+    private boolean edgeTracking = false;
+    private boolean swallowDrawerGesture = false;
+    private final int[] swipeHitLoc = new int[2];
+
+    /**
+     * True when the finger landed on something that scrolls or drags sideways (chip rows, sliders,
+     * seek bars, pagers, horizontal lists, wide tables...). Walks the visible view tree under the
+     * raw touch point, so tab views do not need to cooperate beyond tagging custom scrollers "h-scroll".
+     */
+    private boolean touchStartsOnHorizontalScroller(float rawX, float rawY) {
+        Window w = getWindow();
+        View root = w != null ? w.getDecorView() : null;
+        return root != null && blocksDrawerSwipe(root, Math.round(rawX), Math.round(rawY), 0);
+    }
+
+    private boolean blocksDrawerSwipe(View v, int x, int y, int depth) {
+        if (v == null || depth > 80 || v.getVisibility() != View.VISIBLE || v.getWidth() <= 0 || v.getHeight() <= 0) return false;
+        if (v == sideDrawerPanel || v == sideDrawerScrim) return false;
+        v.getLocationOnScreen(swipeHitLoc);
+        if (x < swipeHitLoc[0] || y < swipeHitLoc[1]
+                || x >= swipeHitLoc[0] + v.getWidth() || y >= swipeHitLoc[1] + v.getHeight()) return false;
+        if (v instanceof HorizontalScrollView || v instanceof android.widget.AbsSeekBar
+                || "h-scroll".equals(v.getTag())
+                || v.canScrollHorizontally(1) || v.canScrollHorizontally(-1)) return true;
+        String cls = v.getClass().getName();
+        if (cls.contains("ViewPager") || cls.endsWith("Slider")) return true;
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = g.getChildCount() - 1; i >= 0; i--) {
+                if (blocksDrawerSwipe(g.getChildAt(i), x, y, depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Swipe anywhere: a clearly horizontal fling toward the inside (rightwards in LTR, leftwards in RTL)
+     * opens the drawer; the opposite fling closes it. Gestures that start on a horizontal scroller,
+     * during setup, or with more than one finger are left to the views.
+     */
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent ev) {
+        int action = ev.getActionMasked();
+        if (swallowDrawerGesture) {
+            // The rest of a gesture that opened / closed the drawer belongs to nobody else.
+            if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
+                swallowDrawerGesture = false;
+            }
+            if (action != android.view.MotionEvent.ACTION_DOWN) return true;
+            swallowDrawerGesture = false;
+        }
+        try {
+            if (sideDrawerPanel != null) {
+                int slop = android.view.ViewConfiguration.get(this).getScaledTouchSlop();
+                boolean rtl = isRtlLayout();
+                switch (action) {
+                    case android.view.MotionEvent.ACTION_DOWN: {
+                        boolean setupShowing = setupOverlayView != null && setupOverlayView.getVisibility() == View.VISIBLE;
+                        edgeDownX = ev.getRawX();
+                        edgeDownY = ev.getRawY();
+                        edgeDownTime = ev.getEventTime();
+                        edgeTracking = !setupShowing
+                                && (sideDrawerOpen || !touchStartsOnHorizontalScroller(edgeDownX, edgeDownY));
+                        break;
+                    }
+                    case android.view.MotionEvent.ACTION_POINTER_DOWN:
+                        edgeTracking = false;
+                        break;
+                    case android.view.MotionEvent.ACTION_MOVE: {
+                        if (!edgeTracking) break;
+                        float dx = ev.getRawX() - edgeDownX;
+                        float dy = ev.getRawY() - edgeDownY;
+                        if (Math.abs(dy) > slop * 2 && Math.abs(dy) > Math.abs(dx)) {
+                            edgeTracking = false;   // vertical scroll: never steal it later
+                            break;
+                        }
+                        boolean quick = ev.getEventTime() - edgeDownTime < 700;
+                        if (quick && Math.abs(dx) > Math.max(slop * 4, dp(48)) && Math.abs(dx) > Math.abs(dy) * 2.5f) {
+                            boolean inward = rtl ? dx < 0 : dx > 0;
+                            edgeTracking = false;
+                            if (sideDrawerOpen != inward) {
+                                if (inward) openSideDrawer(); else closeSideDrawer();
+                                android.view.MotionEvent c = android.view.MotionEvent.obtain(ev);
+                                c.setAction(android.view.MotionEvent.ACTION_CANCEL);
+                                super.dispatchTouchEvent(c);
+                                c.recycle();
+                                swallowDrawerGesture = true;
+                                return true;
+                            }
+                        }
+                        break;
+                    }
+                    case android.view.MotionEvent.ACTION_UP:
+                    case android.view.MotionEvent.ACTION_CANCEL:
+                        edgeTracking = false;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return super.dispatchTouchEvent(ev);
+    }
+
+    private void toggleSideDrawer() {
+        if (sideDrawerOpen) closeSideDrawer(); else openSideDrawer();
+    }
+
+    /** Keeps the drawer and its scrim above the bottom navigation bar so they never cover it. */
+    private void syncDrawerBottomMargin() {
+        if (sideDrawerPanel == null || sideDrawerScrim == null || bottomNavLayout == null) return;
+        int h = bottomNavLayout.getVisibility() == View.VISIBLE ? bottomNavLayout.getHeight() : 0;
+        View[] vs = {sideDrawerPanel, sideDrawerScrim};
+        for (View v : vs) {
+            ViewGroup.LayoutParams lp = v.getLayoutParams();
+            if (lp instanceof FrameLayout.LayoutParams && ((FrameLayout.LayoutParams) lp).bottomMargin != h) {
+                ((FrameLayout.LayoutParams) lp).bottomMargin = h;
+                v.setLayoutParams(lp);
+            }
+        }
+    }
+
+    private void openSideDrawer() {
+        if (sideDrawerPanel == null || sideDrawerOpen) return;
+        syncDrawerBottomMargin();
+        sideDrawerOpen = true;
+        updateDrawerSelection();
+        sideDrawerScrim.setVisibility(View.VISIBLE);
+        sideDrawerPanel.setVisibility(View.VISIBLE);
+        sideDrawerPanel.setTranslationX(drawerOffscreenSign() * dp(68));
+        sideDrawerScrim.animate().alpha(1f).setDuration(200).start();
+        sideDrawerPanel.animate().translationX(0f).setDuration(220)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+    }
+
+    private void closeSideDrawer() {
+        if (sideDrawerPanel == null || !sideDrawerOpen) return;
+        sideDrawerOpen = false;
+        sideDrawerScrim.animate().alpha(0f).setDuration(180).withEndAction(() -> {
+            if (!sideDrawerOpen) sideDrawerScrim.setVisibility(View.GONE);
+        }).start();
+        sideDrawerPanel.animate().translationX(drawerOffscreenSign() * dp(68)).setDuration(180).withEndAction(() -> {
+            if (!sideDrawerOpen) sideDrawerPanel.setVisibility(View.GONE);
+        }).start();
     }
 
     public static class DiagnosticItem {
@@ -4011,7 +4712,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 "SYSTEM COMPATIBILITY",
                 "Device ABI: " + primaryAbi + (is64Bit ? " (64-bit Bionic)" : " (32-bit legacy)"),
                 is64Bit ? "COMPATIBLE" : "INCOMPATIBLE",
-                is64Bit ? Color.parseColor("#34D399") : Color.parseColor("#EF4444")
+                is64Bit ? AppTheme.success() : AppTheme.danger()
         ));
 
         // 2. Hardware RAM & Memory Health (Optimized via Kotlin Diagnostics)
@@ -4023,7 +4724,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     "HARDWARE & MEMORY",
                     MediaStorageManager.formatBytes(ram.getUsedBytes()) + " used of " + MediaStorageManager.formatBytes(ram.getTotalBytes()) + (ram.isLowMemory() ? " (Low Memory Alert)" : " (Normal Headroom)"),
                     ram.isLowMemory() ? "LOW MEMORY" : "HEALTHY",
-                    ram.isLowMemory() ? Color.parseColor("#EF4444") : Color.parseColor("#34D399")
+                    ram.isLowMemory() ? AppTheme.danger() : AppTheme.success()
             ));
         } catch (Throwable ignored) {}
 
@@ -4036,7 +4737,7 @@ public final class FishbowlActivity extends AppCompatActivity
             boolean hasEnough = availBytes >= (500L * 1024L * 1024L); // 500MB
             boolean isOptimal = availBytes >= (2L * 1024L * 1024L * 1024L); // 2GB
             String statText = isOptimal ? "EXCELLENT" : (hasEnough ? "ADEQUATE" : "LOW SPACE");
-            int statColor = isOptimal ? Color.parseColor("#34D399") : (hasEnough ? Color.parseColor("#F59E0B") : Color.parseColor("#EF4444"));
+            int statColor = isOptimal ? AppTheme.success() : (hasEnough ? AppTheme.warning() : AppTheme.danger());
             results.add(new DiagnosticItem(
                     "Internal Storage Headroom",
                     "STORAGE",
@@ -4053,7 +4754,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     "STORAGE",
                     "Cache & Logs: " + MediaStorageManager.formatBytes(fp.getAppCacheBytes()) + " | App Data: " + MediaStorageManager.formatBytes(fp.getAppDataBytes()),
                     "BOUNDED",
-                    Color.parseColor("#34D399")
+                    AppTheme.success()
             ));
 
             // 3b. Jellyfin Database & Journal Health Check
@@ -4067,11 +4768,11 @@ public final class FishbowlActivity extends AppCompatActivity
                         "STORAGE",
                         detail,
                         isDbOk ? "HEALTHY" : "CORRUPT / TORN WAL",
-                        isDbOk ? Color.parseColor("#34D399") : Color.parseColor("#EF4444")
+                        isDbOk ? AppTheme.success() : AppTheme.danger()
                 ));
             }
         } catch (Throwable t) {
-            results.add(new DiagnosticItem("Storage Check", "STORAGE", "Error: " + t.getMessage(), "UNKNOWN", Color.parseColor("#71717A")));
+            results.add(new DiagnosticItem("Storage Check", "STORAGE", "Error: " + t.getMessage(), "UNKNOWN", AppTheme.textMuted()));
         }
 
         // 4. Service Port Occupancy & Zombie Process Conflict Checks (via Kotlin Security Manager)
@@ -4085,18 +4786,18 @@ public final class FishbowlActivity extends AppCompatActivity
 
             if (audit.isManagedOnline()) {
                 portStatus = "ONLINE";
-                portColor = Color.parseColor("#34D399"); // Green
+                portColor = AppTheme.success(); // Green
                 portDetail = "Port " + audit.getPort() + " (Active daemon)";
             } else if (audit.isZombieConflict()) {
                 try {
                     MediaServiceManager.getInstance(this).reclaimPort(audit.getPort(), audit.getServiceName());
                 } catch (Throwable ignored) {}
                 portStatus = "AUTO-KILLED & RECLAIMED";
-                portColor = Color.parseColor("#34D399"); // Green
+                portColor = AppTheme.success(); // Green
                 portDetail = "Port " + audit.getPort() + " orphan/zombie process was automatically terminated";
             } else {
                 portStatus = "AVAILABLE";
-                portColor = Color.parseColor("#71717A"); // Muted
+                portColor = AppTheme.textMuted(); // Muted
                 portDetail = "Port " + audit.getPort() + " (Unoccupied)";
             }
 
@@ -4134,13 +4835,13 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("DIAGNOSTICS CENTRE");
         title.setTextSize(16);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.WHITE);
+        title.setTextColor(AppTheme.text());
         titleCol.addView(title);
 
         TextView sub = new TextView(this);
         sub.setText("Hardware architecture, zombie port collisions, and storage headroom.");
         sub.setTextSize(10f);
-        sub.setTextColor(Color.parseColor("#71717A"));
+        sub.setTextColor(AppTheme.textMuted());
         titleCol.addView(sub);
         hdr.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
@@ -4156,14 +4857,14 @@ public final class FishbowlActivity extends AppCompatActivity
         actionRow.setGravity(Gravity.CENTER_VERTICAL);
         actionRow.setPadding(0, 0, 0, dp(8));
 
-        Button btnPurgeCache = createPixelButton("PURGE CACHE & LOGS", Color.parseColor("#27272A"), Color.WHITE);
+        Button btnPurgeCache = createPixelButton("PURGE CACHE & LOGS", AppTheme.outline(), Color.WHITE);
         btnPurgeCache.setTextSize(9f);
         actionRow.addView(btnPurgeCache, new LinearLayout.LayoutParams(0, dp(30), 1.0f));
 
         View aGap = new View(this);
         actionRow.addView(aGap, new LinearLayout.LayoutParams(dp(6), 1));
 
-        Button btnKillZombies = createPixelButton("KILL ZOMBIES & RECLAIM PORTS", Color.parseColor("#DC2626"), Color.WHITE);
+        Button btnKillZombies = createPixelButton("KILL ZOMBIES & RECLAIM PORTS", AppTheme.danger(), Color.WHITE);
         btnKillZombies.setTextSize(9f);
         actionRow.addView(btnKillZombies, new LinearLayout.LayoutParams(0, dp(30), 1.2f));
 
@@ -4178,7 +4879,7 @@ public final class FishbowlActivity extends AppCompatActivity
             reportContainer.removeAllViews();
             TextView scanning = new TextView(this);
             scanning.setText("Running hardware, memory & port diagnostics...");
-            scanning.setTextColor(Color.parseColor("#71717A"));
+            scanning.setTextColor(AppTheme.textMuted());
             scanning.setTextSize(11f);
             scanning.setPadding(0, dp(6), 0, dp(6));
             reportContainer.addView(scanning);
@@ -4195,7 +4896,7 @@ public final class FishbowlActivity extends AppCompatActivity
                             catHeader.setText(lastCategory);
                             catHeader.setTextSize(9.5f);
                             catHeader.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                            catHeader.setTextColor(Color.parseColor("#A1A1AA"));
+                            catHeader.setTextColor(AppTheme.textSecondary());
                             catHeader.setLetterSpacing(0.08f);
                             catHeader.setPadding(0, dp(8), 0, dp(3));
                             reportContainer.addView(catHeader);
@@ -4205,8 +4906,8 @@ public final class FishbowlActivity extends AppCompatActivity
                         itemCard.setOrientation(LinearLayout.HORIZONTAL);
                         itemCard.setGravity(Gravity.CENTER_VERTICAL);
                         itemCard.setBackground(createBorderedRoundedDrawable(
-                                Color.parseColor("#0E1015"),
-                                Color.parseColor("#1C2028"),
+                                AppTheme.inner(),
+                                AppTheme.inner(),
                                 dp(1),
                                 dp(6)
                         ));
@@ -4221,13 +4922,13 @@ public final class FishbowlActivity extends AppCompatActivity
                         nameView.setText(item.name);
                         nameView.setTextSize(11.5f);
                         nameView.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-                        nameView.setTextColor(Color.WHITE);
+                        nameView.setTextColor(AppTheme.text());
                         leftCol.addView(nameView);
 
                         TextView detailView = new TextView(this);
                         detailView.setText(item.detail);
                         detailView.setTextSize(9.5f);
-                        detailView.setTextColor(Color.parseColor("#71717A"));
+                        detailView.setTextColor(AppTheme.textMuted());
                         leftCol.addView(detailView);
                         itemCard.addView(leftCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
@@ -4248,18 +4949,18 @@ public final class FishbowlActivity extends AppCompatActivity
 
         btnPurgeCache.setOnClickListener(v -> {
             long freed = com.fishbowl.app.diagnostics.DiagnosticsOptimizer.purgeTemporaryCache(this);
-            Toast.makeText(this, "Purged temporary cache: " + MediaStorageManager.formatBytes(freed) + " reclaimed.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Purged temporary cache: " + MediaStorageManager.formatBytes(freed) + " reclaimed."), Toast.LENGTH_SHORT).show();
             runAudit.run();
         });
 
         btnKillZombies.setOnClickListener(v -> {
             int reclaimed = com.fishbowl.app.security.FishbowlSecurityManager.reclaimAllZombiePorts(this);
-            Toast.makeText(this, "Terminated zombie processes and released socket locks.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Terminated zombie processes and released socket locks."), Toast.LENGTH_SHORT).show();
             runAudit.run();
         });
 
         // Re-run Button
-        Button btnRefresh = createOutlinePixelButton("RE-SCAN DIAGNOSTICS", Color.parseColor("#38BDF8"), Color.parseColor("#38BDF8"));
+        Button btnRefresh = createOutlinePixelButton("RE-SCAN DIAGNOSTICS", AppTheme.accent(), AppTheme.accent());
         btnRefresh.setTextSize(10f);
         btnRefresh.setOnClickListener(v -> runAudit.run());
         LinearLayout.LayoutParams prParams = new LinearLayout.LayoutParams(-1, dp(36));
@@ -4267,8 +4968,8 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(btnRefresh, prParams);
 
         scroll.addView(content);
-        dialog.setContentView(scroll);
-        dialog.show();
+        dialog.setContentView(I18n.attach(scroll));
+        safeShow(dialog);
         runAudit.run();
     }
 
@@ -4286,100 +4987,61 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setSmoothScrollingEnabled(true);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(getBgColor());
-        scroll.setPadding(dp(20), dp(14), dp(20), dp(125));
+        scroll.setPadding(dp(16), dp(12), dp(16), dp(125));
         scroll.setClipToPadding(false);
 
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
 
-        // -- Clean Unboxed Stack Header ------------------------------------
+        // -- Page header: title + live "x / y Active" summary ------------------
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(0, dp(4), 0, dp(12));
 
-        // Title row
-        LinearLayout topRow = new LinearLayout(this);
-        topRow.setOrientation(LinearLayout.HORIZONTAL);
-        topRow.setGravity(Gravity.CENTER_VERTICAL);
+        servicesSummaryBadge = UiKit.caption(this, "Loading...");
+        servicesSummaryBadge.setTypeface(UiKit.MEDIUM);
+        header.addView(UiKit.header(this, "Media Stack", null, servicesSummaryBadge));
 
-        TextView title = new TextView(this);
-        title.setText("MEDIA STACK");
-        title.setTextSize(18);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#F4F4F5"));
-        topRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        servicesSummaryBadge = new TextView(this);
-        servicesSummaryBadge.setText("Loading...");
-        servicesSummaryBadge.setTextSize(11);
-        servicesSummaryBadge.setTypeface(Typeface.MONOSPACE);
-        servicesSummaryBadge.setTextColor(getSuccessColor());
-        topRow.addView(servicesSummaryBadge);
-        topRow.setPadding(0, 0, 0, dp(12));
-        header.addView(topRow);
-
-        // -- Master controls row: Unified Dynamic Master Toggle + SYNC STACK -----------
+        // -- Master controls row: START ALL (only while everything is stopped) + SYNC STACK -----------
         LinearLayout masterRow = new LinearLayout(this);
         masterRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams mrLp = new LinearLayout.LayoutParams(-1, -2);
-        mrLp.bottomMargin = dp(6);
+        mrLp.bottomMargin = dp(4);
         masterRow.setLayoutParams(mrLp);
 
-        masterStackToggleBtn = createOutlinePixelButton("START ALL", Color.WHITE, Color.WHITE);
-        masterStackToggleBtn.setTextSize(11f);
-        masterStackToggleBtn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        masterStackToggleBtn.setLetterSpacing(0.06f);
+        masterStackToggleBtn = UiKit.primary(this, buttonLabel("START ALL"), null);
         masterRow.addView(masterStackToggleBtn, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
 
-        View btnGap = new View(this);
-        masterRow.addView(btnGap, new LinearLayout.LayoutParams(dp(8), 1));
+        masterStackGap = new View(this);
+        masterRow.addView(masterStackGap, new LinearLayout.LayoutParams(dp(12), 1));
 
-        Button btnSyncAll = createOutlinePixelButton("SYNC STACK", Color.parseColor("#A1A1AA"), Color.parseColor("#E4E4E7"));
-        btnSyncAll.setTextSize(11f);
-        btnSyncAll.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnSyncAll.setLetterSpacing(0.06f);
-        btnSyncAll.setOnClickListener(v -> syncAndAutoWireAllServices());
+        Button btnSyncAll = UiKit.outline(this, buttonLabel("SYNC STACK"), v -> syncAndAutoWireAllServices());
         masterRow.addView(btnSyncAll, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
 
         header.addView(masterRow);
 
-        // 1dp Hairline Divider
-        View hDiv = new View(this);
-        hDiv.setBackgroundColor(Color.argb(10, 255, 255, 255));
-        LinearLayout.LayoutParams hDivLp = new LinearLayout.LayoutParams(-1, dp(1));
-        hDivLp.topMargin = dp(10);
-        header.addView(hDiv, hDivLp);
-
-        // Clean Section Header above cards with compact [+ INSTALL] and [− UNINSTALL] actions
+        // Section header above the cards with compact Install / Uninstall actions
         LinearLayout cardsHeader = new LinearLayout(this);
         cardsHeader.setOrientation(LinearLayout.HORIZONTAL);
         cardsHeader.setGravity(Gravity.CENTER_VERTICAL);
-        cardsHeader.setPadding(dp(2), dp(12), dp(2), dp(2));
+        cardsHeader.setPadding(0, dp(20), 0, 0);
 
         TextView cardsTitle = new TextView(this);
         cardsTitle.setText("COMPANION SERVICES");
-        cardsTitle.setTextSize(11f);
-        cardsTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        cardsTitle.setLetterSpacing(0.08f);
-        cardsTitle.setTextColor(Color.parseColor("#71717A"));
+        styleSectionLabel(cardsTitle);
         cardsHeader.addView(cardsTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        Button btnInstallBatch = createOutlinePixelButton("+ INSTALL", Color.parseColor("#38BDF8"), Color.parseColor("#38BDF8"));
-        btnInstallBatch.setTextSize(9f);
-        btnInstallBatch.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnInstallBatch.setPadding(dp(10), 0, dp(10), 0);
-        btnInstallBatch.setOnClickListener(v -> showSelectiveInstallDialog());
-        cardsHeader.addView(btnInstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)));
+        Button btnInstallBatch = UiKit.tonal(this, buttonLabel("INSTALL"), v -> showSelectiveInstallDialog());
+        btnInstallBatch.setTextSize(12f);
+        btnInstallBatch.setPadding(dp(12), 0, dp(12), 0);
+        cardsHeader.addView(btnInstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
 
         View batchGap = new View(this);
         cardsHeader.addView(batchGap, new LinearLayout.LayoutParams(dp(8), 1));
 
-        Button btnUninstallBatch = createOutlinePixelButton("− UNINSTALL", Color.parseColor("#EF4444"), Color.parseColor("#EF4444"));
-        btnUninstallBatch.setTextSize(9f);
-        btnUninstallBatch.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnUninstallBatch.setPadding(dp(10), 0, dp(10), 0);
-        btnUninstallBatch.setOnClickListener(v -> showSelectiveUninstallDialog());
-        cardsHeader.addView(btnUninstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)));
+        Button btnUninstallBatch = UiKit.danger(this, buttonLabel("UNINSTALL"), v -> showSelectiveUninstallDialog());
+        btnUninstallBatch.setTextSize(12f);
+        btnUninstallBatch.setPadding(dp(12), 0, dp(12), 0);
+        cardsHeader.addView(btnUninstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
 
         header.addView(cardsHeader);
 
@@ -4394,55 +5056,60 @@ public final class FishbowlActivity extends AppCompatActivity
         lt.setDuration(220);
         servicesCardsContainer.setLayoutTransition(lt);
         LinearLayout.LayoutParams scParams = new LinearLayout.LayoutParams(-1, -2);
-        scParams.topMargin = dp(10);
+        scParams.topMargin = dp(12);
         servicesCardsContainer.setLayoutParams(scParams);
         layout.addView(servicesCardsContainer);
 
-        // Unified Torrent Download Manager directly integrated at bottom of Media Stack
-        layout.addView(buildDownloadCenterCard());
+        mediaToolsView = new MediaToolsView(this);
+        layout.addView(mediaToolsView.getView());
 
         scroll.addView(layout);
         refreshServicesTabUI();
-        refreshDownloadCenter();
         return scroll;
+    }
+
+    private String lastServicesSignature = null;
+
+    private String computeServicesSignature() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(isMediaStackEnabled()).append('|').append(isAvailableServicesDrawerOpen).append('|');
+        try {
+            sb.append(controller != null ? controller.getState() : "-").append('|');
+            for (ManagedService s : MediaServiceManager.getInstance(this).getAllServices()) {
+                sb.append(s.getId()).append(':').append(s.getState()).append(':')
+                        .append(s.isInstalled()).append(s.isRunning()).append(s.isStarting()).append(s.isBlocked()).append(';');
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        return sb.toString();
     }
 
     private void refreshServicesTabUI() {
         if (servicesCardsContainer == null) return;
+        // Skip all work while the tab is hidden; it is refreshed when the tab is opened.
+        if (activeTab != 1 && servicesCardsContainer.getChildCount() > 0) {
+            lastServicesSignature = null;
+            return;
+        }
+        String sig = computeServicesSignature();
+        if (sig != null && sig.equals(lastServicesSignature) && servicesCardsContainer.getChildCount() > 0) return;
+        lastServicesSignature = sig;
         servicesCardsContainer.removeAllViews();
 
         if (!isMediaStackEnabled()) {
-            LinearLayout disabledCard = new LinearLayout(this);
-            disabledCard.setOrientation(LinearLayout.VERTICAL);
-            disabledCard.setPadding(dp(16), dp(16), dp(16), dp(16));
-            disabledCard.setBackground(createBorderedRoundedDrawable(
-                    Color.parseColor("#0C0D10"),
-                    Color.parseColor("#27272A"),
-                    dp(1),
-                    dp(12)
-            ));
-            LinearLayout.LayoutParams dcp = new LinearLayout.LayoutParams(-1, -2);
-            dcp.bottomMargin = dp(14);
-            disabledCard.setLayoutParams(dcp);
+            LinearLayout disabledCard = UiKit.card(this);
 
-            TextView dTitle = new TextView(this);
-            dTitle.setText("MEDIA STACK IS PAUSED");
-            dTitle.setTextSize(12f);
-            dTitle.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-            dTitle.setTextColor(Color.parseColor("#F59E0B"));
+            TextView dTitle = UiKit.subtitle(this, "MEDIA STACK IS PAUSED");
+            dTitle.setTextColor(AppTheme.warning());
             disabledCard.addView(dTitle);
 
-            TextView dSub = new TextView(this);
-            dSub.setText("Fishbowl is currently operating in standalone Jellyfin mode to conserve storage and RAM. Companion services are paused.");
-            dSub.setTextSize(10.5f);
-            dSub.setTextColor(Color.parseColor("#A1A1AA"));
-            dSub.setPadding(0, dp(4), 0, dp(12));
+            TextView dSub = UiKit.body(this, "Jellyarr is currently operating in standalone Jellyfin mode to conserve storage and RAM. Companion services are paused.");
+            dSub.setPadding(0, dp(4), 0, dp(4));
             disabledCard.addView(dSub);
 
-            Button btnEnable = createPixelButton("ENABLE COMPANION SERVICES", Color.parseColor("#18191E"), Color.parseColor("#38BDF8"));
-            btnEnable.setTextSize(10f);
-            btnEnable.setOnClickListener(v -> setMediaStackEnabled(true));
-            disabledCard.addView(btnEnable, new LinearLayout.LayoutParams(-1, dp(36)));
+            disabledCard.addView(UiKit.buttonRow(this,
+                    UiKit.tonal(this, buttonLabel("ENABLE COMPANION SERVICES"), v -> setMediaStackEnabled(true))));
 
             servicesCardsContainer.addView(disabledCard);
             return;
@@ -4469,26 +5136,12 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // 1. Primary Installed Services Grid (2 Columns with 12dp Breathing Space)
         if (installedServices.isEmpty()) {
-            LinearLayout emptyBox = new LinearLayout(this);
-            emptyBox.setOrientation(LinearLayout.VERTICAL);
-            emptyBox.setGravity(Gravity.CENTER);
-            emptyBox.setPadding(dp(16), dp(20), dp(16), dp(16));
-
-            TextView emptyTitle = new TextView(this);
-            emptyTitle.setText("NO COMPANION SERVICES INSTALLED");
-            emptyTitle.setTextSize(11f);
-            emptyTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            emptyTitle.setTextColor(Color.parseColor("#71717A"));
-            emptyBox.addView(emptyTitle);
-
-            TextView emptySub = new TextView(this);
-            emptySub.setText("Tap available services in the drawer below to install.");
-            emptySub.setTextSize(9.5f);
-            emptySub.setTextColor(Color.parseColor("#52525B"));
-            emptySub.setPadding(0, dp(4), 0, 0);
-            emptyBox.addView(emptySub);
-
-            servicesCardsContainer.addView(emptyBox);
+            View emptyBox = UiKit.empty(this, "NO COMPANION SERVICES INSTALLED",
+                    "Tap available services in the drawer below to install.");
+            emptyBox.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+            LinearLayout.LayoutParams ebLp = new LinearLayout.LayoutParams(-1, -2);
+            ebLp.bottomMargin = dp(12);
+            servicesCardsContainer.addView(emptyBox, ebLp);
         } else {
             LinearLayout currentRow = null;
             for (int i = 0; i < installedServices.size(); i++) {
@@ -4539,21 +5192,19 @@ public final class FishbowlActivity extends AppCompatActivity
             LinearLayout drawerHeader = new LinearLayout(this);
             drawerHeader.setOrientation(LinearLayout.HORIZONTAL);
             drawerHeader.setGravity(Gravity.CENTER_VERTICAL);
-            drawerHeader.setPadding(dp(4), dp(8), dp(4), dp(8));
+            drawerHeader.setPadding(dp(8), dp(10), dp(8), dp(10));
             drawerHeader.setClickable(true);
             drawerHeader.setFocusable(true);
+            drawerHeader.setBackground(UiKit.rowRipple(this));
 
             TextView drawerTitle = new TextView(this);
             drawerTitle.setText("AVAILABLE SERVICES (" + uninstalledServices.size() + ")");
-            drawerTitle.setTextSize(11f);
-            drawerTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            drawerTitle.setLetterSpacing(0.08f);
-            drawerTitle.setTextColor(Color.parseColor("#71717A"));
+            styleSectionLabel(drawerTitle);
             drawerHeader.addView(drawerTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
             ImageView chevron = new ImageView(this);
             chevron.setImageResource(R.drawable.ic_chevron_down);
-            chevron.setColorFilter(Color.parseColor("#71717A"));
+            chevron.setColorFilter(AppTheme.textMuted());
             chevron.setRotation(isAvailableServicesDrawerOpen ? 180f : 0f);
             drawerHeader.addView(chevron, new LinearLayout.LayoutParams(dp(18), dp(18)));
 
@@ -4615,7 +5266,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         if (servicesSummaryBadge != null) {
             servicesSummaryBadge.setText(running + " / " + installedServices.size() + " Active");
-            servicesSummaryBadge.setTextColor(running > 0 ? Color.WHITE : Color.parseColor("#71717A"));
+            servicesSummaryBadge.setTextColor(running > 0 ? AppTheme.text() : AppTheme.textMuted());
         }
 
         boolean anyActive = false;
@@ -4628,22 +5279,15 @@ public final class FishbowlActivity extends AppCompatActivity
 
         if (masterStackToggleBtn != null) {
             if (anyActive) {
-                masterStackToggleBtn.setText("STOP ALL");
-                applyOutlineButtonStyle(masterStackToggleBtn, Color.parseColor("#E11D48"), Color.parseColor("#E11D48"));
-                masterStackToggleBtn.setOnClickListener(v -> {
-                    Toast.makeText(this, "Stopping companion media stack...", Toast.LENGTH_SHORT).show();
-                    MediaServiceManager.getInstance(this).stopCompanionServices();
-                    mainHandler.postDelayed(() -> {
-                        MediaServiceManager.getInstance(this).reconcileRunningServices();
-                        refreshServicesTabUI();
-                        refreshHomeServicesBadge();
-                    }, 2000);
-                });
+                masterStackToggleBtn.setVisibility(View.GONE);
+                if (masterStackGap != null) masterStackGap.setVisibility(View.GONE);
             } else {
-                masterStackToggleBtn.setText("START ALL");
-                applyOutlineButtonStyle(masterStackToggleBtn, Color.WHITE, Color.WHITE);
+                masterStackToggleBtn.setVisibility(View.VISIBLE);
+                if (masterStackGap != null) masterStackGap.setVisibility(View.VISIBLE);
+                masterStackToggleBtn.setEnabled(!installedServices.isEmpty());
+                masterStackToggleBtn.setAlpha(installedServices.isEmpty() ? 0.5f : 1f);
                 masterStackToggleBtn.setOnClickListener(v -> {
-                    Toast.makeText(this, "Starting companion media stack...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Starting companion media stack..."), Toast.LENGTH_SHORT).show();
                     for (ManagedService is : installedServices) {
                         if (!is.isRunning() && !is.isStarting()) {
                             mgr.startService(is.getId());
@@ -4665,7 +5309,7 @@ public final class FishbowlActivity extends AppCompatActivity
         tv.setText(msg);
         tv.setTextSize(10f);
         tv.setTypeface(Typeface.MONOSPACE);
-        tv.setTextColor(Color.parseColor("#D4D4D8"));
+        tv.setTextColor(AppTheme.text());
         tv.setPadding(0, dp(6), 0, 0);
         return tv;
     }
@@ -4673,7 +5317,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private View buildIndividualServiceCard(ManagedService svc) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(12), dp(11), dp(12), dp(11));
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
 
         String id = svc.getId().toLowerCase(Locale.ROOT);
         boolean isJellyfin = "jellyfin".equals(id);
@@ -4681,7 +5325,7 @@ public final class FishbowlActivity extends AppCompatActivity
         boolean isStarting;
         int iconTintColor;
         String stText = "OFF";
-        int stColor = Color.parseColor("#71717A");
+        int stColor = AppTheme.textMuted();
 
         if (isJellyfin) {
             JellyfinController.State js = controller != null ? controller.getState() : JellyfinController.State.STOPPED;
@@ -4691,7 +5335,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 case RUNNING:
                     iconTintColor = getServiceBrandColor("jellyfin");
                     stText = "RUNNING";
-                    stColor = Color.parseColor("#34D399");
+                    stColor = AppTheme.success();
                     break;
                 case STARTING:
                 case INITIALIZING:
@@ -4707,9 +5351,9 @@ public final class FishbowlActivity extends AppCompatActivity
                     stColor = getDangerColor();
                     break;
                 default:
-                    iconTintColor = Color.WHITE;
-                    stText = "OFF";
-                    stColor = Color.parseColor("#71717A");
+                    iconTintColor = AppTheme.text();
+                    stText = "STOPPED";
+                    stColor = AppTheme.textMuted();
                     break;
             }
         } else {
@@ -4727,168 +5371,143 @@ public final class FishbowlActivity extends AppCompatActivity
                 stColor = getDangerColor();
             } else if (isRunning) {
                 stText = "RUNNING";
-                stColor = Color.parseColor("#34D399");
+                stColor = AppTheme.success();
             } else if (svc.getState() == com.fishbowl.app.model.ServiceState.RECOVERING) {
                 stText = "RETRYING";
-                stColor = Color.parseColor("#FB923C");
+                stColor = AppTheme.warning();
             } else if (isStarting) {
-                stText = "WAIT";
+                stText = "STARTING";
                 stColor = getWarningColor();
             } else if (svc.isInstalled()) {
-                stText = "OFF";
-                stColor = Color.parseColor("#71717A");
+                stText = "STOPPED";
+                stColor = AppTheme.textMuted();
             } else {
                 stText = "AVAILABLE";
-                stColor = Color.parseColor("#52525B");
+                stColor = AppTheme.textMuted();
             }
         }
 
         boolean installed = isJellyfin || svc.isInstalled();
 
-        if (!installed) {
-            card.setBackground(createBorderedRoundedDrawable(Color.parseColor("#060608"), Color.parseColor("#1C1C20"), dp(1), dp(10)));
-            card.setAlpha(0.55f);
-        } else {
-            card.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(10)));
-            card.setAlpha(1.0f);
-        }
+        card.setBackground(UiKit.pressable(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+        card.setAlpha(installed ? 1.0f : 0.7f);   // available (not installed) services are dimmed
 
         card.setClickable(true);
         card.setFocusable(true);
+        // Tap: install flow for available services, details sheet for installed ones (long-press kept on the address).
         card.setOnClickListener(v -> {
-            if (installed) {
-                showServiceDetailsModal(svc);
-            } else {
+            if (!installed) {
                 showServiceInstallCompatibilityDialog(svc);
+            } else {
+                showServiceDetailsModal(svc);
             }
         });
-        card.setOnLongClickListener(v -> {
-            showServiceDetailsModal(svc);
-            return true;
-        });
 
-        // 1. Top Header Row: Icon + Name / Version + Status Badge
+        // 1. Header: logo + name / version
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setOnClickListener(v -> card.performClick());
-        top.setOnLongClickListener(v -> {
-            showServiceDetailsModal(svc);
-            return true;
-        });
 
         ImageView iconView = new ImageView(this);
         iconView.setImageResource(getServiceIconRes(id));
-        iconView.setColorFilter(iconTintColor);
-        top.addView(iconView, new LinearLayout.LayoutParams(dp(22), dp(22)));
-
-        View spIcon = new View(this);
-        top.addView(spIcon, new LinearLayout.LayoutParams(dp(8), 1));
+        if (isColorLogoRes(getServiceIconRes(id))) {
+            applyColorLogoState(iconView, isJellyfin ? (isRunning || isStarting) : tileCategory(svc.getState()) != 0);
+        } else {
+            iconView.setColorFilter(iconTintColor);
+        }
+        LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(dp(28), dp(28));
+        icLp.setMarginEnd(dp(10));
+        top.addView(iconView, icLp);
 
         LinearLayout titleCol = new LinearLayout(this);
         titleCol.setOrientation(LinearLayout.VERTICAL);
 
-        LinearLayout nameRow = new LinearLayout(this);
-        nameRow.setOrientation(LinearLayout.HORIZONTAL);
-        nameRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView name = UiKit.singleLine(UiKit.subtitle(this, svc.getDisplayName()));
+        name.setTextColor(installed ? AppTheme.text() : AppTheme.textSecondary());
+        titleCol.addView(name);
 
-        TextView name = new TextView(this);
-        name.setText(svc.getDisplayName());
-        name.setTextSize(12.5f);
-        name.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        name.setTextColor(installed ? Color.parseColor("#F4F4F5") : Color.parseColor("#A1A1AA"));
-        name.setSingleLine(true);
-        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        nameRow.addView(name);
-
-        TextView verTag = new TextView(this);
-        verTag.setText(" v" + svc.getManifest().getVersion());
-        verTag.setTextSize(8.5f);
-        verTag.setTypeface(Typeface.MONOSPACE);
-        verTag.setTextColor(Color.parseColor("#71717A"));
-        nameRow.addView(verTag);
-
-        titleCol.addView(nameRow);
+        TextView verTag = UiKit.singleLine(UiKit.text(this, "v" + svc.getManifest().getVersion(), 11f, AppTheme.textMuted(), Typeface.MONOSPACE));
+        titleCol.addView(verTag);
         top.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView stateBadge = new TextView(this);
-        stateBadge.setText("● " + stText);
-        stateBadge.setTextSize(8.5f);
-        stateBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        stateBadge.setTextColor(stColor);
-        top.addView(stateBadge);
 
         card.addView(top);
 
-        // 2. Compact Endpoint / IP Row
+        // 2. Status badge
+        TextView stateBadge = UiKit.badge(this, I18n.tr(stText), stColor);
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(-2, -2);
+        sbLp.topMargin = dp(10);
+        card.addView(stateBadge, sbLp);
+
+        // 3. Compact endpoint row (tap = copy, long-press = details)
         int defaultPort = svc.getManifest().getDefaultPort();
         String webPath = svc.getManifest().getWebPath();
         if (webPath == null) webPath = "/";
         String localUrl = "http://127.0.0.1:" + defaultPort + (webPath.equals("/") ? "" : webPath);
-        String rawLanIp = getRawLanIp();
+        String rawLanIp = cachedRawLanIp;
         String lanUrl = (rawLanIp != null) ? "http://" + rawLanIp + ":" + defaultPort + (webPath.equals("/") ? "" : webPath) : null;
         final String finalCopyUrl = lanUrl != null ? lanUrl : localUrl;
 
         LinearLayout epRow = new LinearLayout(this);
         epRow.setOrientation(LinearLayout.HORIZONTAL);
-        epRow.setGravity(Gravity.CENTER);
-        epRow.setPadding(dp(4), dp(4), dp(4), dp(4));
+        epRow.setGravity(Gravity.CENTER_VERTICAL);
+        epRow.setPadding(dp(10), dp(7), dp(10), dp(7));
         epRow.setClickable(true);
         epRow.setFocusable(true);
+        epRow.setBackground(UiKit.pressable(this, AppTheme.inner(), 0, UiKit.R_INNER));
         epRow.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " URL", finalCopyUrl));
         epRow.setOnLongClickListener(v -> {
             showServiceDetailsModal(svc);
             return true;
         });
         LinearLayout.LayoutParams epLp = new LinearLayout.LayoutParams(-1, -2);
-        epLp.topMargin = dp(6);
-        epLp.bottomMargin = dp(6);
+        epLp.topMargin = dp(10);
+        epLp.bottomMargin = dp(10);
         epRow.setLayoutParams(epLp);
 
         TextView epText = new TextView(this);
         epText.setText(lanUrl != null ? rawLanIp + ":" + defaultPort : "127.0.0.1:" + defaultPort);
-        epText.setTextSize(10.5f);
-        epText.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
-        epText.setTextColor(installed ? Color.WHITE : Color.parseColor("#71717A"));
-        epText.setGravity(Gravity.CENTER);
+        epText.setTextSize(12f);
+        epText.setTypeface(Typeface.MONOSPACE);
+        epText.setTextColor(installed ? AppTheme.text() : AppTheme.textMuted());
         epText.setSingleLine(true);
         epText.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-        epRow.addView(epText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, -2));
+        epText.setTextDirection(View.TEXT_DIRECTION_LTR);
+        epRow.addView(epText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+
+        ImageView epCopy = new ImageView(this);
+        epCopy.setImageResource(R.drawable.ic_copy);
+        epCopy.setColorFilter(AppTheme.textMuted());
+        epCopy.setContentDescription("Copy");
+        LinearLayout.LayoutParams ecLp = new LinearLayout.LayoutParams(dp(14), dp(14));
+        ecLp.setMarginStart(dp(6));
+        epRow.addView(epCopy, ecLp);
 
         card.addView(epRow);
 
-        // 3. Compact Bottom Action Row (Single Row, Adaptive)
+        // 4. Actions (single row, adaptive)
         LinearLayout bottomRow = new LinearLayout(this);
         bottomRow.setOrientation(LinearLayout.HORIZONTAL);
         bottomRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams brLp = new LinearLayout.LayoutParams(-1, dp(32));
-        brLp.topMargin = dp(2);
-        bottomRow.setLayoutParams(brLp);
+        bottomRow.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(38)));
 
         if (svc.isBlocked()) {
-            Button btnBlocked = createOutlinePixelButton("INCOMPATIBLE", Color.parseColor("#3F3F46"), Color.parseColor("#71717A"));
-            btnBlocked.setTextSize(9f);
+            Button btnBlocked = compactCardButton(UiKit.outline(this, buttonLabel("INCOMPATIBLE"), null));
             btnBlocked.setEnabled(false);
+            btnBlocked.setAlpha(0.6f);
             bottomRow.addView(btnBlocked, new LinearLayout.LayoutParams(-1, -1));
         } else if (!installed) {
-            Button btnInstall = createOutlinePixelButton("INSTALL", Color.parseColor("#3F3F46"), Color.parseColor("#D4D4D8"));
-            btnInstall.setTextSize(9.5f);
-            btnInstall.setOnClickListener(v -> showServiceInstallCompatibilityDialog(svc));
+            Button btnInstall = compactCardButton(UiKit.tonal(this, buttonLabel("INSTALL"), v -> showServiceInstallCompatibilityDialog(svc)));
             bottomRow.addView(btnInstall, new LinearLayout.LayoutParams(-1, -1));
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.CRASH_LOOP_PROTECTION) {
-            Button btnReset = createOutlinePixelButton("RESET CRASH LOOP", Color.parseColor("#E11D48"), Color.parseColor("#E11D48"));
-            btnReset.setTextSize(9f);
-            btnReset.setOnClickListener(v -> {
+            Button btnReset = compactCardButton(UiKit.danger(this, buttonLabel("RESET CRASH LOOP"), v -> {
                 MediaServiceManager.getInstance(this).resetCrashLoop(svc.getId());
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-            });
+            }));
             bottomRow.addView(btnReset, new LinearLayout.LayoutParams(-1, -1));
         } else if (!isRunning) {
             String startLabel = (svc.getState() == com.fishbowl.app.model.ServiceState.RECOVERING) ? "RETRY NOW" : "START";
-            Button btnStart = createOutlinePixelButton(startLabel, Color.WHITE, Color.WHITE);
-            btnStart.setTextSize(9.5f);
-            btnStart.setOnClickListener(v -> {
+            Button btnStart = compactCardButton(UiKit.primary(this, buttonLabel(startLabel), v -> {
                 if (isJellyfin) {
                     triggerServerAction(JellyfinServerService.ACTION_START);
                 } else {
@@ -4898,20 +5517,20 @@ public final class FishbowlActivity extends AppCompatActivity
                     refreshServicesTabUI();
                     refreshHomeServicesBadge();
                 }, 500);
-            });
+            }));
+            if (isStarting) {
+                btnStart.setEnabled(false);
+                btnStart.setAlpha(0.6f);
+            }
             bottomRow.addView(btnStart, new LinearLayout.LayoutParams(-1, -1));
         } else {
-            Button btnWeb = createPixelButton("WEB UI", Color.WHITE, Color.BLACK);
-            btnWeb.setTextSize(9f);
-            btnWeb.setOnClickListener(v -> openServiceWeb(svc));
+            Button btnWeb = compactCardButton(UiKit.primary(this, buttonLabel("WEB UI"), v -> openServiceWeb(svc)));
             bottomRow.addView(btnWeb, new LinearLayout.LayoutParams(0, -1, 1.15f));
 
             View spB1 = new View(this);
-            bottomRow.addView(spB1, new LinearLayout.LayoutParams(dp(6), 1));
+            bottomRow.addView(spB1, new LinearLayout.LayoutParams(dp(8), 1));
 
-            Button btnStop = createOutlinePixelButton("STOP", Color.parseColor("#E11D48"), Color.parseColor("#E11D48"));
-            btnStop.setTextSize(9f);
-            btnStop.setOnClickListener(v -> {
+            Button btnStop = compactCardButton(UiKit.danger(this, buttonLabel("STOP"), v -> {
                 if (isJellyfin) {
                     controller.stop();
                     triggerServerAction(JellyfinServerService.ACTION_STOP);
@@ -4922,7 +5541,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     refreshServicesTabUI();
                     refreshHomeServicesBadge();
                 }, 500);
-            });
+            }));
             bottomRow.addView(btnStop, new LinearLayout.LayoutParams(0, -1, 0.95f));
         }
 
@@ -4930,19 +5549,28 @@ public final class FishbowlActivity extends AppCompatActivity
         return card;
     }
 
+    /** UiKit button sized for the narrow two-column service cards. */
+    private Button compactCardButton(Button b) {
+        b.setTextSize(12.5f);
+        b.setPadding(dp(8), 0, dp(8), 0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        return b;
+    }
+
     private void showServiceDetailsModal(ManagedService svc) {
-        Dialog d = new Dialog(this);
+        if (svc == null || !isUiAlive()) return;
+        final Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
         scroll.setHorizontalScrollBarEnabled(false);
         scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        scroll.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(14)));
+        scroll.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
         scroll.addView(root);
 
         String id = svc.getId().toLowerCase(Locale.ROOT);
@@ -4950,377 +5578,169 @@ public final class FishbowlActivity extends AppCompatActivity
         boolean isRunning = isJellyfin ? (controller != null && controller.getState() == JellyfinController.State.RUNNING) : svc.isRunning();
         boolean installed = isJellyfin || svc.isInstalled();
 
-        // 1. Header: Icon + Title + Version + Category + Status Badge
-        LinearLayout headerRow = new LinearLayout(this);
-        headerRow.setOrientation(LinearLayout.HORIZONTAL);
-        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        // 1. Header: logo + name / version + close
+        LinearLayout headerRow = UiKit.row(this);
 
         ImageView icon = new ImageView(this);
         icon.setImageResource(getServiceIconRes(id));
-        icon.setColorFilter(getServiceBrandColor(id));
-        headerRow.addView(icon, new LinearLayout.LayoutParams(dp(32), dp(32)));
+        if (!isColorLogoRes(getServiceIconRes(id))) icon.setColorFilter(getServiceBrandColor(id));
+        LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(dp(36), dp(36));
+        icLp.setMarginEnd(dp(12));
+        headerRow.addView(icon, icLp);
 
-        View spH = new View(this);
-        headerRow.addView(spH, new LinearLayout.LayoutParams(dp(10), 1));
-
-        LinearLayout titleCol = new LinearLayout(this);
-        titleCol.setOrientation(LinearLayout.VERTICAL);
-
-        TextView title = new TextView(this);
-        title.setText(svc.getDisplayName().toUpperCase(Locale.ROOT));
-        title.setTextSize(15f);
-        title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        title.setTextColor(Color.WHITE);
-        titleCol.addView(title);
-
-        TextView subTitle = new TextView(this);
-        subTitle.setText("v" + svc.getManifest().getVersion());
-        subTitle.setTextSize(9.5f);
-        subTitle.setTypeface(Typeface.MONOSPACE);
-        subTitle.setTextColor(Color.parseColor("#71717A"));
-        subTitle.setPadding(0, dp(1), 0, 0);
-        titleCol.addView(subTitle);
-
+        LinearLayout titleCol = UiKit.column(this);
+        titleCol.addView(UiKit.singleLine(UiKit.title(this, svc.getDisplayName())));
+        titleCol.addView(UiKit.singleLine(UiKit.text(this, "v" + svc.getManifest().getVersion(), 12f, AppTheme.textMuted(), Typeface.MONOSPACE)));
         headerRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        headerRow.addView(dialogCloseButton(d));
+        root.addView(headerRow);
 
-        TextView stateBadge = new TextView(this);
+        // 2. Status badge
         String stBadgeText;
         int stBadgeColor;
         if (svc.isBlocked()) {
-            stBadgeText = "● BLOCKED";
+            stBadgeText = "BLOCKED";
             stBadgeColor = getDangerColor();
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.CRASH_LOOP_PROTECTION) {
-            stBadgeText = "● CRASH LOOP";
+            stBadgeText = "CRASH LOOP";
             stBadgeColor = getDangerColor();
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.ERROR || svc.getState() == com.fishbowl.app.model.ServiceState.FAILED) {
-            stBadgeText = "● ERROR";
+            stBadgeText = "FAILED";
             stBadgeColor = getDangerColor();
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.RECOVERING) {
-            stBadgeText = "● RETRYING";
-            stBadgeColor = Color.parseColor("#FB923C");
+            stBadgeText = "RETRYING";
+            stBadgeColor = AppTheme.warning();
         } else if (svc.isStarting()) {
-            stBadgeText = "● STARTING";
+            stBadgeText = "STARTING";
             stBadgeColor = getWarningColor();
         } else if (isRunning) {
-            stBadgeText = "● RUNNING";
-            stBadgeColor = Color.parseColor("#34D399");
+            stBadgeText = "RUNNING";
+            stBadgeColor = AppTheme.success();
         } else if (installed) {
-            stBadgeText = "● STOPPED";
-            stBadgeColor = Color.parseColor("#71717A");
+            stBadgeText = "STOPPED";
+            stBadgeColor = AppTheme.textMuted();
         } else {
-            stBadgeText = "● AVAILABLE";
-            stBadgeColor = Color.parseColor("#38BDF8");
+            stBadgeText = "AVAILABLE";
+            stBadgeColor = AppTheme.accent();
         }
-        stateBadge.setText(stBadgeText);
-        stateBadge.setTextSize(9f);
-        stateBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        stateBadge.setTextColor(stBadgeColor);
-        stateBadge.setPadding(dp(8), dp(4), dp(8), dp(4));
-        stateBadge.setBackground(createBorderedRoundedDrawable(Color.BLACK, stBadgeColor, dp(1), dp(4)));
-        headerRow.addView(stateBadge);
-
-        root.addView(headerRow);
+        TextView stateBadge = UiKit.badge(this, I18n.tr(stBadgeText), stBadgeColor);
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(-2, -2);
+        sbLp.topMargin = dp(12);
+        root.addView(stateBadge, sbLp);
 
         if (!isJellyfin && svc.getLastError() != null && !svc.getLastError().trim().isEmpty() && !isRunning) {
-            LinearLayout errBox = new LinearLayout(this);
-            errBox.setOrientation(LinearLayout.VERTICAL);
-            errBox.setPadding(dp(12), dp(10), dp(12), dp(10));
-            errBox.setBackground(createBorderedRoundedDrawable(Color.parseColor("#1C0A0E"), Color.parseColor("#E11D48"), dp(1), dp(8)));
+            LinearLayout errBox = UiKit.inset(this);
+            errBox.setBackground(UiKit.shape(this, AppTheme.dangerContainer(), 0, UiKit.R_INNER));
             LinearLayout.LayoutParams ebLp = new LinearLayout.LayoutParams(-1, -2);
-            ebLp.topMargin = dp(10);
+            ebLp.topMargin = dp(12);
             errBox.setLayoutParams(ebLp);
 
-            TextView errTitle = new TextView(this);
-            errTitle.setText("DIAGNOSTIC NOTICE");
-            errTitle.setTextSize(9f);
-            errTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            errTitle.setTextColor(Color.parseColor("#FB7185"));
+            TextView errTitle = UiKit.text(this, "DIAGNOSTIC NOTICE", 11f, AppTheme.danger(), UiKit.BOLD);
+            errTitle.setLetterSpacing(0.06f);
             errBox.addView(errTitle);
 
-            TextView errDesc = new TextView(this);
-            errDesc.setText(svc.getLastError());
-            errDesc.setTextSize(10f);
-            errDesc.setTypeface(Typeface.MONOSPACE);
-            errDesc.setTextColor(Color.parseColor("#FECDD3"));
-            errDesc.setPadding(0, dp(2), 0, 0);
+            TextView errDesc = UiKit.body(this, svc.getLastError());
+            errDesc.setTextColor(AppTheme.text());
+            errDesc.setTextIsSelectable(true);
+            errDesc.setPadding(0, dp(4), 0, 0);
             errBox.addView(errDesc);
 
             root.addView(errBox);
         }
 
-        // Divider
-        View div1 = new View(this);
-        div1.setBackgroundColor(Color.parseColor("#18181B"));
-        LinearLayout.LayoutParams d1Lp = new LinearLayout.LayoutParams(-1, dp(1));
-        d1Lp.topMargin = dp(12);
-        d1Lp.bottomMargin = dp(12);
-        root.addView(div1, d1Lp);
-
-        // 2. Single Unified Info Card
-        LinearLayout infoBox = new LinearLayout(this);
-        infoBox.setOrientation(LinearLayout.VERTICAL);
-        infoBox.setPadding(dp(14), dp(12), dp(14), dp(12));
-        infoBox.setBackground(createBorderedRoundedDrawable(Color.parseColor("#09090B"), Color.parseColor("#27272A"), dp(1), dp(8)));
-        LinearLayout.LayoutParams ibLp = new LinearLayout.LayoutParams(-1, -2);
-        ibLp.bottomMargin = dp(16);
-        infoBox.setLayoutParams(ibLp);
-
-        // Item A: URL / Endpoints (All available LAN endpoints + Local Loopback)
+        // 3. Addresses: every LAN endpoint + local loopback
         int defaultPort = svc.getManifest().getDefaultPort();
-        String webPath = svc.getManifest().getWebPath();
-        if (webPath == null) webPath = "/";
+        String webPathRaw = svc.getManifest().getWebPath();
+        final String webPath = webPathRaw == null ? "/" : webPathRaw;
         String localUrl = "http://127.0.0.1:" + defaultPort + (webPath.equals("/") ? "" : webPath);
 
-        TextView lblUrl = new TextView(this);
-        lblUrl.setText("NETWORK & LAN ACCESS URLS");
-        lblUrl.setTextSize(8.5f);
-        lblUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblUrl.setTextColor(Color.parseColor("#71717A"));
-        infoBox.addView(lblUrl);
-
+        root.addView(detailSectionLabel("NETWORK & LAN ACCESS URLS"));
+        LinearLayout urlBox = UiKit.inset(this);
         java.util.List<NetworkUtils.LanEndpoint> endpoints = NetworkUtils.getAllAvailableLanEndpoints();
-        if (endpoints != null && !endpoints.isEmpty()) {
+        if (endpoints != null) {
             for (NetworkUtils.LanEndpoint ep : endpoints) {
                 String epUrl = ep.getUrl(defaultPort, webPath);
-
-                LinearLayout urlRow = new LinearLayout(this);
-                urlRow.setOrientation(LinearLayout.HORIZONTAL);
-                urlRow.setGravity(Gravity.CENTER_VERTICAL);
-                urlRow.setPadding(0, dp(2), 0, dp(4));
-
-                TextView lblBadge = new TextView(this);
-                lblBadge.setText(ep.label.toUpperCase(Locale.ROOT));
-                lblBadge.setTextSize(7.5f);
-                lblBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                lblBadge.setTextColor(Color.parseColor("#38BDF8"));
-                lblBadge.setPadding(dp(4), dp(2), dp(4), dp(2));
-                lblBadge.setBackground(createBorderedRoundedDrawable(Color.parseColor("#0C2333"), Color.parseColor("#0284C7"), dp(1), dp(3)));
-                LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(-2, -2);
-                badgeLp.rightMargin = dp(6);
-                urlRow.addView(lblBadge, badgeLp);
-
-                TextView valUrl = new TextView(this);
-                valUrl.setText(epUrl);
-                valUrl.setTextSize(10f);
-                valUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                valUrl.setTextColor(Color.WHITE);
-                valUrl.setSingleLine(true);
-                valUrl.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-                urlRow.addView(valUrl, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-                TextView btnCopyUrl = new TextView(this);
-                btnCopyUrl.setText("COPY");
-                btnCopyUrl.setTextSize(9f);
-                btnCopyUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                btnCopyUrl.setTextColor(Color.parseColor("#38BDF8"));
-                btnCopyUrl.setPadding(dp(8), dp(4), dp(4), dp(4));
-                btnCopyUrl.setClickable(true);
-                btnCopyUrl.setFocusable(true);
-                btnCopyUrl.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " " + ep.label + " URL", epUrl));
-                urlRow.addView(btnCopyUrl);
-
-                infoBox.addView(urlRow);
+                urlBox.addView(detailCopyRow(ep.label, epUrl, true, svc.getDisplayName() + " " + ep.label + " URL", epUrl));
             }
         }
+        urlBox.addView(detailCopyRow("LOCAL", localUrl, true, svc.getDisplayName() + " Local URL", localUrl));
+        TextView sopNotice = UiKit.caption(this, "Note: Browsers isolate cookies per IP/host (Same-Origin Policy). Logging in on USB/Wi-Fi IP does not transfer to 127.0.0.1 or other IPs.");
+        sopNotice.setPadding(0, dp(6), 0, dp(2));
+        urlBox.addView(sopNotice);
+        root.addView(urlBox);
 
-        // Always show Local Loopback (127.0.0.1)
-        LinearLayout localRow = new LinearLayout(this);
-        localRow.setOrientation(LinearLayout.HORIZONTAL);
-        localRow.setGravity(Gravity.CENTER_VERTICAL);
-        localRow.setPadding(0, dp(2), 0, dp(4));
-
-        TextView lblLocal = new TextView(this);
-        lblLocal.setText("LOCAL");
-        lblLocal.setTextSize(7.5f);
-        lblLocal.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblLocal.setTextColor(Color.parseColor("#94A3B8"));
-        lblLocal.setPadding(dp(4), dp(2), dp(4), dp(2));
-        lblLocal.setBackground(createBorderedRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#475569"), dp(1), dp(3)));
-        LinearLayout.LayoutParams localBadgeLp = new LinearLayout.LayoutParams(-2, -2);
-        localBadgeLp.rightMargin = dp(6);
-        localRow.addView(lblLocal, localBadgeLp);
-
-        TextView valLocalUrl = new TextView(this);
-        valLocalUrl.setText(localUrl);
-        valLocalUrl.setTextSize(10f);
-        valLocalUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        valLocalUrl.setTextColor(Color.WHITE);
-        valLocalUrl.setSingleLine(true);
-        valLocalUrl.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-        localRow.addView(valLocalUrl, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView btnCopyLocal = new TextView(this);
-        btnCopyLocal.setText("COPY");
-        btnCopyLocal.setTextSize(9f);
-        btnCopyLocal.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        btnCopyLocal.setTextColor(Color.parseColor("#38BDF8"));
-        btnCopyLocal.setPadding(dp(8), dp(4), dp(4), dp(4));
-        btnCopyLocal.setClickable(true);
-        btnCopyLocal.setFocusable(true);
-        btnCopyLocal.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " Local URL", localUrl));
-        localRow.addView(btnCopyLocal);
-
-        infoBox.addView(localRow);
-
-        TextView sopNotice = new TextView(this);
-        sopNotice.setText("Note: Browsers isolate cookies per IP/host (Same-Origin Policy). Logging in on USB/Wi-Fi IP does not transfer to 127.0.0.1 or other IPs.");
-        sopNotice.setTextSize(8f);
-        sopNotice.setTypeface(Typeface.MONOSPACE);
-        sopNotice.setTextColor(Color.parseColor("#71717A"));
-        sopNotice.setPadding(0, dp(2), 0, dp(6));
-        infoBox.addView(sopNotice);
-
-        // Item B: Credentials / API Key
-        String credVal;
-        final String copyCredVal;
+        // 4. Credentials: unified account login (when set) and the service API key
+        root.addView(detailSectionLabel("CREDENTIALS / AUTHENTICATION"));
+        LinearLayout credBox = UiKit.inset(this);
+        boolean unified = UnifiedAccount.isConfigured(this);
+        String unifiedUser = UnifiedAccount.getUsername(this);
+        if (unified) {
+            credBox.addView(detailCopyRow(null, I18n.tr("Unified account") + ": " + unifiedUser, false,
+                    svc.getDisplayName() + " Username", unifiedUser));
+        }
         if ("jellyfin".equalsIgnoreCase(id)) {
-            credVal = "Admin account created during initial setup";
-            copyCredVal = "http://127.0.0.1:8096";
+            if (!unified) {
+                credBox.addView(detailCopyRow(null, "Admin account created during initial setup", false,
+                        svc.getDisplayName() + " URL", "http://127.0.0.1:8096"));
+            }
         } else if ("transmission".equalsIgnoreCase(id)) {
-            credVal = "Username: fishbowl  |  Password: fishbowl";
-            copyCredVal = "User: fishbowl | Password: fishbowl";
-        } else if ("seerr".equalsIgnoreCase(id)) {
-            String seerrKey = MediaServiceManager.getInstance(this).getServiceApiKey("seerr");
-            if (seerrKey != null && !seerrKey.trim().isEmpty()) {
-                credVal = "API Key: " + seerrKey + "\n(Or Jellyfin SSO Admin user)";
-                copyCredVal = seerrKey;
-            } else {
-                credVal = "Jellyfin Single Sign-On (Admin user)";
-                copyCredVal = "http://127.0.0.1:5055";
+            if (!unified) {
+                credBox.addView(detailCopyRow(null, "No login required. Set a unified account in Settings > Security & Identity to protect it.", false,
+                        svc.getDisplayName() + " URL", "http://127.0.0.1:9091/transmission/web/"));
             }
         } else {
             String apiKey = MediaServiceManager.getInstance(this).getServiceApiKey(id);
             if (apiKey != null && !apiKey.isEmpty()) {
-                credVal = "API Key: " + apiKey;
-                copyCredVal = apiKey;
-            } else {
-                credVal = "Zero-Auth (Auto-generated on startup)";
-                copyCredVal = "http://127.0.0.1:" + svc.getManifest().getDefaultPort();
+                credBox.addView(detailCopyRow("API", apiKey, true, svc.getDisplayName() + " API Key", apiKey));
+            } else if (!unified) {
+                credBox.addView(detailCopyRow(null, "Zero-Auth (Auto-generated on startup)", false,
+                        svc.getDisplayName() + " URL", "http://127.0.0.1:" + defaultPort));
             }
         }
+        root.addView(credBox);
 
-        View divInfo1 = new View(this);
-        divInfo1.setBackgroundColor(Color.parseColor("#18181B"));
-        infoBox.addView(divInfo1, new LinearLayout.LayoutParams(-1, dp(1)));
-
-        TextView lblCred = new TextView(this);
-        lblCred.setText("CREDENTIALS / AUTHENTICATION");
-        lblCred.setTextSize(8.5f);
-        lblCred.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblCred.setTextColor(Color.parseColor("#71717A"));
-        lblCred.setPadding(0, dp(8), 0, 0);
-        infoBox.addView(lblCred);
-
-        LinearLayout credRow = new LinearLayout(this);
-        credRow.setOrientation(LinearLayout.HORIZONTAL);
-        credRow.setGravity(Gravity.CENTER_VERTICAL);
-        credRow.setPadding(0, dp(2), 0, dp(8));
-
-        TextView valCred = new TextView(this);
-        valCred.setText(credVal);
-        valCred.setTextSize(10f);
-        valCred.setTypeface(Typeface.MONOSPACE);
-        valCred.setTextColor(Color.parseColor("#D4D4D8"));
-        valCred.setSingleLine(true);
-        valCred.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        credRow.addView(valCred, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView btnCopyCred = new TextView(this);
-        btnCopyCred.setText("COPY");
-        btnCopyCred.setTextSize(9f);
-        btnCopyCred.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        btnCopyCred.setTextColor(Color.parseColor("#38BDF8"));
-        btnCopyCred.setPadding(dp(8), dp(4), dp(4), dp(4));
-        btnCopyCred.setClickable(true);
-        btnCopyCred.setFocusable(true);
-        btnCopyCred.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " Credentials", copyCredVal));
-        credRow.addView(btnCopyCred);
-
-        infoBox.addView(credRow);
-
-        // Item C: Status & Storage
-        View divInfo2 = new View(this);
-        divInfo2.setBackgroundColor(Color.parseColor("#18181B"));
-        infoBox.addView(divInfo2, new LinearLayout.LayoutParams(-1, dp(1)));
-
-        TextView lblFoot = new TextView(this);
-        lblFoot.setText("STATUS & STORAGE");
-        lblFoot.setTextSize(8.5f);
-        lblFoot.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblFoot.setTextColor(Color.parseColor("#71717A"));
-        lblFoot.setPadding(0, dp(8), 0, 0);
-        infoBox.addView(lblFoot);
-
-        File instDir = new File(svc.getManifest().getInstallDir());
-        File confDir = new File(svc.getManifest().getConfigDir());
-        long binBytes = calculateDirSize(instDir);
-        long cfgBytes = calculateDirSize(confDir);
-        String footStr = installed ?
-                ("Port: " + defaultPort + " • Size: " + MediaStorageManager.formatBytes(binBytes + cfgBytes)) :
-                ("Port: " + defaultPort + " • Est. Size: ~" + svc.getManifest().getStorageRequiredMb() + " MB");
-
+        // 5. Status & storage (folder sizes are computed off the UI thread)
+        root.addView(detailSectionLabel("STATUS & STORAGE"));
+        LinearLayout statBox = UiKit.inset(this);
+        addDetailKv(statBox, "Port", String.valueOf(defaultPort), true);
+        final TextView sizeValue = addDetailKv(statBox, installed ? "Size" : "Est. Size",
+                installed ? I18n.tr("Calculating...") : "~" + svc.getManifest().getStorageRequiredMb() + " MB", false);
         File mediaTargetDir = null;
         if ("radarr".equalsIgnoreCase(id)) {
             mediaTargetDir = MediaStorageManager.getInstance(this).getMoviesDir();
         } else if ("sonarr".equalsIgnoreCase(id)) {
             mediaTargetDir = MediaStorageManager.getInstance(this).getTvDir();
-        } else if ("lidarr".equalsIgnoreCase(id)) {
-            mediaTargetDir = MediaStorageManager.getInstance(this).getMusicDir();
         } else if ("transmission".equalsIgnoreCase(id)) {
             mediaTargetDir = MediaStorageManager.getInstance(this).getDownloadsDir();
         } else if ("jellyfin".equalsIgnoreCase(id)) {
             mediaTargetDir = MediaStorageManager.getInstance(this).getMediaRoot();
         }
-
         if (mediaTargetDir != null) {
-            footStr += "\nPath: " + mediaTargetDir.getAbsolutePath();
+            TextView pathLabel = UiKit.caption(this, "Path");
+            pathLabel.setPadding(0, dp(6), 0, dp(2));
+            statBox.addView(pathLabel);
+            TextView pathVal = UiKit.mono(this, mediaTargetDir.getAbsolutePath());
+            pathVal.setTextDirection(View.TEXT_DIRECTION_LTR);
+            statBox.addView(pathVal);
         }
+        root.addView(statBox);
 
-        TextView valFoot = new TextView(this);
-        valFoot.setText(footStr);
-        valFoot.setTextSize(10f);
-        valFoot.setTypeface(Typeface.MONOSPACE);
-        valFoot.setTextColor(Color.parseColor("#D4D4D8"));
-        valFoot.setPadding(0, dp(2), 0, dp(2));
-        infoBox.addView(valFoot);
-
-        root.addView(infoBox);
-
-        // 7. Modal Bottom Action Buttons Row
-        LinearLayout actionRow = new LinearLayout(this);
-        actionRow.setOrientation(LinearLayout.HORIZONTAL);
-        actionRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams aLp = new LinearLayout.LayoutParams(-1, -2);
-        aLp.topMargin = dp(4);
-        actionRow.setLayoutParams(aLp);
-
+        // 6. Actions: primary row, then secondary row (logs / uninstall)
         if (!installed) {
-            Button btnInstall = createPixelButton("INSTALL", Color.WHITE, Color.BLACK);
-            btnInstall.setTextSize(10f);
-            btnInstall.setOnClickListener(v -> {
+            root.addView(UiKit.buttonRow(this, UiKit.primary(this, buttonLabel("INSTALL"), v -> {
                 d.dismiss();
                 showServiceInstallCompatibilityDialog(svc);
-            });
-            actionRow.addView(btnInstall, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+            })));
         } else {
             if (isRunning) {
-                Button btnWeb = createPixelButton("WEB UI", Color.WHITE, Color.BLACK);
-                btnWeb.setTextSize(10f);
-                btnWeb.setOnClickListener(v -> {
+                Button btnWeb = UiKit.primary(this, buttonLabel("WEB UI"), v -> {
                     d.dismiss();
                     openServiceWeb(svc);
                 });
-                actionRow.addView(btnWeb, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
-
-                View spB1 = new View(this);
-                actionRow.addView(spB1, new LinearLayout.LayoutParams(dp(6), 1));
-
-                Button btnStop = createOutlinePixelButton("STOP", Color.parseColor("#E11D48"), Color.parseColor("#E11D48"));
-                btnStop.setTextSize(10f);
-                btnStop.setOnClickListener(v -> {
+                Button btnStop = UiKit.danger(this, buttonLabel("STOP"), v -> {
                     d.dismiss();
                     if (isJellyfin) {
-                        controller.stop();
+                        if (controller != null) controller.stop();
                         triggerServerAction(JellyfinServerService.ACTION_STOP);
                     } else {
                         MediaServiceManager.getInstance(this).stopService(svc.getId());
@@ -5330,11 +5750,9 @@ public final class FishbowlActivity extends AppCompatActivity
                         refreshHomeServicesBadge();
                     }, 500);
                 });
-                actionRow.addView(btnStop, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+                root.addView(UiKit.buttonRow(this, btnWeb, btnStop));
             } else {
-                Button btnStart = createOutlinePixelButton("START", Color.WHITE, Color.WHITE);
-                btnStart.setTextSize(10f);
-                btnStart.setOnClickListener(v -> {
+                Button btnStart = UiKit.primary(this, buttonLabel("START"), v -> {
                     d.dismiss();
                     if (isJellyfin) {
                         triggerServerAction(JellyfinServerService.ACTION_START);
@@ -5346,60 +5764,116 @@ public final class FishbowlActivity extends AppCompatActivity
                         refreshHomeServicesBadge();
                     }, 500);
                 });
-                actionRow.addView(btnStart, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+                root.addView(UiKit.buttonRow(this, btnStart));
             }
 
             if (!isJellyfin) {
-                View spBLog = new View(this);
-                actionRow.addView(spBLog, new LinearLayout.LayoutParams(dp(6), 1));
-
-                Button btnLogs = createOutlinePixelButton("LOGS", Color.parseColor("#38BDF8"), Color.parseColor("#38BDF8"));
-                btnLogs.setTextSize(9.5f);
-                btnLogs.setOnClickListener(v -> {
+                Button btnLogs = UiKit.outline(this, buttonLabel("LOGS"), v -> {
                     d.dismiss();
                     showServiceLogsDialog(svc);
                 });
-                actionRow.addView(btnLogs, new LinearLayout.LayoutParams(0, dp(36), 0.9f));
-
-                View spB2 = new View(this);
-                actionRow.addView(spB2, new LinearLayout.LayoutParams(dp(6), 1));
-
-                Button btnUninst = createOutlinePixelButton("UNINSTALL", Color.parseColor("#E11D48"), Color.parseColor("#E11D48"));
-                btnUninst.setTextSize(9.5f);
-                btnUninst.setOnClickListener(v -> {
+                Button btnUninst = UiKit.danger(this, buttonLabel("UNINSTALL"), v -> {
                     d.dismiss();
                     confirmUninstallService(svc);
                 });
-                actionRow.addView(btnUninst, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+                root.addView(UiKit.buttonRow(this, btnLogs, btnUninst));
             }
         }
 
-        View spB4 = new View(this);
-        actionRow.addView(spB4, new LinearLayout.LayoutParams(dp(6), 1));
+        d.setContentView(I18n.attach(scroll));
+        applyDialogWindow(d, 0.94f);
+        if (!safeShow(d)) return;
 
-        Button btnClose = createOutlinePixelButton("CLOSE", Color.parseColor("#3F3F46"), Color.parseColor("#A1A1AA"));
-        btnClose.setTextSize(10f);
-        btnClose.setOnClickListener(v -> d.dismiss());
-        actionRow.addView(btnClose, new LinearLayout.LayoutParams(-2, dp(36)));
-
-        root.addView(actionRow);
-
-        d.setContentView(scroll);
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
-            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
-            wlp.copyFrom(d.getWindow().getAttributes());
-            wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.94);
-            wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(wlp);
+        if (installed) {
+            final File instDir = new File(svc.getManifest().getInstallDir());
+            final File confDir = new File(svc.getManifest().getConfigDir());
+            runBg(() -> {
+                long total = calculateDirSize(instDir) + calculateDirSize(confDir);
+                runOnUiThread(() -> {
+                    if (d.isShowing()) sizeValue.setText(MediaStorageManager.formatBytes(total));
+                });
+            });
         }
-        d.show();
+    }
+
+    /** Section label inside a dialog sheet (UiKit overline with the 16dp section gap above). */
+    private TextView detailSectionLabel(String text) {
+        TextView t = UiKit.overline(this, text);
+        t.setPadding(0, dp(16), 0, dp(6));
+        return t;
+    }
+
+    /** Key / value line inside an inset box; returns the value view so it can be updated later. */
+    private TextView addDetailKv(LinearLayout parent, String key, String value, boolean mono) {
+        LinearLayout r = UiKit.row(this);
+        r.setPadding(0, dp(3), 0, dp(3));
+        r.addView(UiKit.caption(this, key), new LinearLayout.LayoutParams(0, -2, 1.0f));
+        TextView v = UiKit.text(this, value, 13f, AppTheme.text(), mono ? Typeface.MONOSPACE : UiKit.MEDIUM);
+        r.addView(v);
+        parent.addView(r);
+        return v;
+    }
+
+    /** One value (URL, key, login) with an optional small label pill and a copy button. */
+    private View detailCopyRow(String label, String value, boolean mono, final String copyLabel, final String copyValue) {
+        LinearLayout row = UiKit.row(this);
+        row.setPadding(0, dp(2), 0, dp(2));
+        if (label != null && !label.isEmpty()) {
+            TextView b = UiKit.text(this, label, 10.5f, AppTheme.onAccentContainer(), UiKit.BOLD);
+            b.setAllCaps(true);
+            b.setSingleLine(true);
+            b.setPadding(dp(8), dp(2), dp(8), dp(2));
+            b.setBackground(UiKit.shape(this, AppTheme.accentContainer(), 0, UiKit.R_PILL));
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+            blp.setMarginEnd(dp(8));
+            row.addView(b, blp);
+        }
+        TextView v = UiKit.text(this, value, mono ? 12.5f : 13f, AppTheme.text(), mono ? Typeface.MONOSPACE : null);
+        v.setSingleLine(true);
+        v.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        if (mono) v.setTextDirection(View.TEXT_DIRECTION_LTR);
+        row.addView(v, new LinearLayout.LayoutParams(0, -2, 1.0f));
+
+        ImageView copy = new ImageView(this);
+        copy.setImageResource(R.drawable.ic_copy);
+        copy.setColorFilter(AppTheme.textSecondary());
+        copy.setPadding(dp(9), dp(9), dp(9), dp(9));
+        copy.setBackground(UiKit.rowRipple(this));
+        copy.setContentDescription("Copy");
+        copy.setOnClickListener(x -> copyUrlToClipboard(copyLabel, copyValue));
+        row.addView(copy, new LinearLayout.LayoutParams(dp(36), dp(36)));
+        return row;
+    }
+
+    /** Compact "✕" icon button that dismisses {@code d}. */
+    private View dialogCloseButton(final Dialog d) {
+        TextView close = UiKit.text(this, "✕", 16f, AppTheme.textSecondary(), UiKit.MEDIUM);
+        close.setGravity(Gravity.CENTER);
+        close.setContentDescription("Close");
+        close.setClickable(true);
+        close.setFocusable(true);
+        close.setBackground(UiKit.rowRipple(this));
+        close.setOnClickListener(v -> d.dismiss());
+        close.setLayoutParams(new LinearLayout.LayoutParams(dp(36), dp(36)));
+        return close;
+    }
+
+    /** Transparent window (the content draws its own rounded card), themed dim, width fraction of the screen. */
+    private void applyDialogWindow(Dialog d, float widthFraction) {
+        Window w = d.getWindow();
+        if (w == null) return;
+        w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        w.setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
+        WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
+        wlp.copyFrom(w.getAttributes());
+        wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * widthFraction);
+        wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
+        w.setAttributes(wlp);
     }
 
     private void openServiceWeb(ManagedService svc) {
         if (svc.isBlocked()) {
-            Toast.makeText(this, svc.getDisplayName() + " is blocked: " + svc.getBlockedReason(), Toast.LENGTH_LONG).show();
+            Toast.makeText(this, I18n.tr(svc.getDisplayName() + " is blocked: " + svc.getBlockedReason()), Toast.LENGTH_LONG).show();
             return;
         }
 
@@ -5408,7 +5882,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         if ("jellyfin".equalsIgnoreCase(svc.getId())) {
             if (controller == null || controller.getState() != JellyfinController.State.RUNNING) {
-                Toast.makeText(this, "Starting FishBowl...", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, I18n.tr("Starting Jellyarr..."), Toast.LENGTH_SHORT).show();
                 triggerServerAction(JellyfinServerService.ACTION_START);
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
@@ -5418,7 +5892,7 @@ public final class FishbowlActivity extends AppCompatActivity
         }
 
         if (!svc.isRunning()) {
-            Toast.makeText(this, "Starting " + svc.getDisplayName() + "...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Starting " + svc.getDisplayName() + "..."), Toast.LENGTH_SHORT).show();
             MediaServiceManager.getInstance(this).startService(svc.getId());
             refreshServicesTabUI();
             refreshHomeServicesBadge();
@@ -5435,7 +5909,7 @@ public final class FishbowlActivity extends AppCompatActivity
         try {
             startActivity(intent);
         } catch (Exception e) {
-            Toast.makeText(this, "Could not open " + svc.getDisplayName() + " in-app webview", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Could not open " + svc.getDisplayName() + " in-app webview"), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -5444,10 +5918,9 @@ public final class FishbowlActivity extends AppCompatActivity
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         d.setCancelable(true);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(16), dp(16), dp(16));
-        root.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
         // Title row with "✕" close button
         LinearLayout titleRow = new LinearLayout(this);
@@ -5457,54 +5930,35 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout titleCol = new LinearLayout(this);
         titleCol.setOrientation(LinearLayout.VERTICAL);
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText((svc != null ? svc.getDisplayName() : "Service") + " Logs");
-        titleTv.setTextSize(14f);
-        titleTv.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        titleTv.setTextColor(Color.WHITE);
+        TextView titleTv = UiKit.singleLine(UiKit.title(this, (svc != null ? svc.getDisplayName() : "Service") + " " + buttonLabel("LOGS")));
         titleCol.addView(titleTv);
 
-        TextView subTv = new TextView(this);
-        subTv.setText("Errors, crashes & diagnostics");
-        subTv.setTextSize(10.5f);
-        subTv.setTextColor(Color.parseColor("#71717A"));
+        TextView subTv = UiKit.caption(this, "Errors, crashes & diagnostics");
+        subTv.setPadding(0, dp(2), 0, 0);
         titleCol.addView(subTv);
 
         titleRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView closeBtn = new TextView(this);
-        closeBtn.setText("✕");
-        closeBtn.setTextSize(13f);
-        closeBtn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        closeBtn.setTextColor(Color.parseColor("#A1A1AA"));
-        closeBtn.setGravity(Gravity.CENTER);
-        closeBtn.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(6)));
-        closeBtn.setClickable(true);
-        closeBtn.setFocusable(true);
-        closeBtn.setOnClickListener(v -> d.dismiss());
-        titleRow.addView(closeBtn, new LinearLayout.LayoutParams(dp(28), dp(28)));
+        titleRow.addView(dialogCloseButton(d));
 
         root.addView(titleRow);
 
         // Filter Toggle Bar: [ERRORS & CRASHES] (Active by default) | [ALL LOGS]
         LinearLayout toggleBar = new LinearLayout(this);
         toggleBar.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams tbLp = new LinearLayout.LayoutParams(-1, dp(30));
-        tbLp.topMargin = dp(10);
+        LinearLayout.LayoutParams tbLp = new LinearLayout.LayoutParams(-1, dp(36));
+        tbLp.topMargin = dp(14);
         tbLp.bottomMargin = dp(8);
         toggleBar.setLayoutParams(tbLp);
 
-        Button btnErrors = createOutlinePixelButton("ERRORS & CRASHES", Color.parseColor("#EF4444"), Color.parseColor("#EF4444"));
-        btnErrors.setTextSize(9f);
-        btnErrors.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        Button btnErrors = createOutlinePixelButton("ERRORS & CRASHES", AppTheme.danger(), AppTheme.danger());
+        btnErrors.setTextSize(12f);
         toggleBar.addView(btnErrors, new LinearLayout.LayoutParams(0, -1, 1.0f));
 
         View toggleGap = new View(this);
         toggleBar.addView(toggleGap, new LinearLayout.LayoutParams(dp(8), 1));
 
-        Button btnAllLogs = createOutlinePixelButton("ALL LOGS", Color.parseColor("#3F3F46"), Color.parseColor("#71717A"));
-        btnAllLogs.setTextSize(9f);
-        btnAllLogs.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        Button btnAllLogs = createOutlinePixelButton("ALL LOGS", AppTheme.outlineStrong(), AppTheme.textMuted());
+        btnAllLogs.setTextSize(12f);
         toggleBar.addView(btnAllLogs, new LinearLayout.LayoutParams(0, -1, 1.0f));
 
         root.addView(toggleBar);
@@ -5514,16 +5968,17 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setVerticalScrollBarEnabled(true);
         scroll.setHorizontalScrollBarEnabled(false);
         scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        scroll.setBackground(createRoundedDrawable(Color.parseColor("#09090B"), dp(8)));
-        scroll.setPadding(dp(10), dp(10), dp(10), dp(10));
-        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(-1, dp(230));
+        scroll.setBackground(UiKit.shape(this, AppTheme.inner(), 0, UiKit.R_INNER));
+        scroll.setPadding(dp(12), dp(10), dp(12), dp(10));
+        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(-1, dp(260));
         scLp.bottomMargin = dp(12);
         scroll.setLayoutParams(scLp);
 
         TextView tvLogs = new TextView(this);
-        tvLogs.setTextSize(10f);
+        tvLogs.setTextSize(11f);
         tvLogs.setTypeface(Typeface.MONOSPACE);
         tvLogs.setTextIsSelectable(true);
+        tvLogs.setTextDirection(View.TEXT_DIRECTION_LTR);   // log lines stay left-to-right in the Arabic UI
         scroll.addView(tvLogs);
 
         root.addView(scroll);
@@ -5534,32 +5989,32 @@ public final class FishbowlActivity extends AppCompatActivity
 
         Runnable updateLogDisplay = () -> {
             if (isErrorViewHolder[0]) {
-                btnErrors.setTextColor(Color.parseColor("#EF4444"));
-                btnErrors.setBackground(createBorderedRoundedDrawable(Color.argb(30, 239, 68, 68), Color.parseColor("#EF4444"), dp(1), dp(6)));
-                btnAllLogs.setTextColor(Color.parseColor("#71717A"));
-                btnAllLogs.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121215"), Color.parseColor("#27272A"), dp(1), dp(6)));
+                btnErrors.setTextColor(AppTheme.danger());
+                btnErrors.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.danger(), 30), AppTheme.danger(), dp(1), dp(12)));
+                btnAllLogs.setTextColor(AppTheme.textMuted());
+                btnAllLogs.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(12)));
 
                 String errorLogs = svc != null ? svc.getErrorAndCrashLogs(200) : "";
                 if (errorLogs.trim().isEmpty()) {
-                    tvLogs.setTextColor(Color.parseColor("#34D399"));
+                    tvLogs.setTextColor(AppTheme.success());
                     String noErrText = "✔ No errors or crashes recorded for " + (svc != null ? svc.getDisplayName() : "this service") + ".\n\n"
                             + "Process is running normally with 0 error events.\n"
                             + "Tap [ALL LOGS] above to inspect routine operational output.";
                     tvLogs.setText(noErrText);
                     currentLogHolder[0] = noErrText;
                 } else {
-                    tvLogs.setTextColor(Color.parseColor("#FCA5A5"));
+                    tvLogs.setTextColor(AppTheme.danger());
                     tvLogs.setText(errorLogs);
                     currentLogHolder[0] = errorLogs;
                 }
             } else {
-                btnAllLogs.setTextColor(Color.parseColor("#38BDF8"));
-                btnAllLogs.setBackground(createBorderedRoundedDrawable(Color.argb(30, 56, 189, 248), Color.parseColor("#38BDF8"), dp(1), dp(6)));
-                btnErrors.setTextColor(Color.parseColor("#71717A"));
-                btnErrors.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121215"), Color.parseColor("#27272A"), dp(1), dp(6)));
+                btnAllLogs.setTextColor(AppTheme.accent());
+                btnAllLogs.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.accent(), 30), AppTheme.accent(), dp(1), dp(12)));
+                btnErrors.setTextColor(AppTheme.textMuted());
+                btnErrors.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(12)));
 
                 String allLogs = svc != null ? svc.getRecentLogs(200) : "";
-                tvLogs.setTextColor(Color.parseColor("#D4D4D8"));
+                tvLogs.setTextColor(AppTheme.text());
                 tvLogs.setText(allLogs);
                 currentLogHolder[0] = allLogs;
             }
@@ -5582,57 +6037,46 @@ public final class FishbowlActivity extends AppCompatActivity
         actionsRow.setOrientation(LinearLayout.HORIZONTAL);
         actionsRow.setGravity(Gravity.CENTER_VERTICAL);
 
-        Button btnCopy = createOutlinePixelButton("COPY", Color.parseColor("#3F3F46"), Color.WHITE);
-        btnCopy.setTextSize(9f);
-        btnCopy.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        Button btnCopy = createOutlinePixelButton("COPY", AppTheme.outlineStrong(), Color.WHITE);
+        btnCopy.setTextSize(12f);
         btnCopy.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
                 String copyText = currentLogHolder[0] != null ? currentLogHolder[0] : "";
                 cm.setPrimaryClip(ClipData.newPlainText("fishbowl_logs", copyText));
-                Toast.makeText(this, "Copied logs to clipboard", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, I18n.tr("Copied logs to clipboard"), Toast.LENGTH_SHORT).show();
             }
         });
-        actionsRow.addView(btnCopy, new LinearLayout.LayoutParams(0, dp(34), 1.0f));
+        actionsRow.addView(btnCopy, new LinearLayout.LayoutParams(0, dp(40), 1.0f));
 
         View aGap1 = new View(this);
         actionsRow.addView(aGap1, new LinearLayout.LayoutParams(dp(6), 1));
 
-        Button btnExportTxt = createOutlinePixelButton("EXPORT .TXT", Color.parseColor("#38BDF8"), Color.parseColor("#38BDF8"));
-        btnExportTxt.setTextSize(9f);
-        btnExportTxt.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        Button btnExportTxt = createOutlinePixelButton("EXPORT .TXT", AppTheme.accent(), AppTheme.accent());
+        btnExportTxt.setTextSize(12f);
         btnExportTxt.setOnClickListener(v -> {
             String fullReport = generateDiagnosticReport(svc);
             exportReportAsTxtFile(fullReport, svc != null ? svc.getId() : "system");
         });
-        actionsRow.addView(btnExportTxt, new LinearLayout.LayoutParams(0, dp(34), 1.3f));
+        actionsRow.addView(btnExportTxt, new LinearLayout.LayoutParams(0, dp(40), 1.3f));
 
         View aGap2 = new View(this);
         actionsRow.addView(aGap2, new LinearLayout.LayoutParams(dp(6), 1));
 
-        Button btnReport = createOutlinePixelButton("REPORT ISSUE", Color.parseColor("#F59E0B"), Color.parseColor("#F59E0B"));
-        btnReport.setTextSize(9f);
-        btnReport.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        Button btnReport = createOutlinePixelButton("REPORT ISSUE", AppTheme.warning(), AppTheme.warning());
+        btnReport.setTextSize(12f);
         btnReport.setOnClickListener(v -> {
             String fullReport = generateDiagnosticReport(svc);
             String svcName = svc != null ? svc.getDisplayName() : "Service";
             com.fishbowl.app.diagnostics.BugReportHelper.openBugReportFlow(this, "[" + svcName + "] Issue Report", fullReport);
         });
-        actionsRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(34), 1.4f));
+        actionsRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(40), 1.4f));
 
         root.addView(actionsRow);
 
-        d.setContentView(root);
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
-            lp.copyFrom(d.getWindow().getAttributes());
-            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.94);
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(lp);
-        }
-        d.show();
+        d.setContentView(I18n.attach(root));
+        applyDialogWindow(d, 0.94f);
+        safeShow(d);
     }
 
     private void exportReportAsTxtFile(String reportText, String serviceName) {
@@ -5655,13 +6099,13 @@ public final class FishbowlActivity extends AppCompatActivity
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
             shareIntent.setType("text/plain");
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
-            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "Fishbowl Diagnostic Report - " + (serviceName != null ? serviceName : "System"));
-            shareIntent.putExtra(Intent.EXTRA_TEXT, "Fishbowl Media Stack diagnostic report attached.");
+            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "Jellyarr Diagnostic Report - " + (serviceName != null ? serviceName : "System"));
+            shareIntent.putExtra(Intent.EXTRA_TEXT, "Jellyarr Media Stack diagnostic report attached.");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(shareIntent, "Save or Share Diagnostic Report"));
         } catch (Throwable t) {
             Log.e(TAG, "Failed to export report as txt: " + t.getMessage(), t);
-            Toast.makeText(this, "Failed to create .txt file: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Failed to create .txt file: " + t.getMessage()), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -5856,28 +6300,13 @@ public final class FishbowlActivity extends AppCompatActivity
         // 4. Runtime Environment Check
         File prefix = TermuxConstants.TERMUX_PREFIX_DIR;
         String id = svc.getId().toLowerCase(Locale.ROOT);
-        if ("radarr".equals(id) || "sonarr".equals(id) || "prowlarr".equals(id) || "lidarr".equals(id) || "jackett".equals(id)) {
+        if ("radarr".equals(id) || "sonarr".equals(id) || "prowlarr".equals(id)) {
             File dotnet = new File(prefix, "lib/dotnet/dotnet");
             if (!dotnet.exists()) dotnet = new File(prefix, "bin/dotnet");
             if (dotnet.exists()) {
                 checks.add("[OK] Runtime: .NET 10.0 ARM64 CoreCLR Installed");
             } else {
                 checks.add("[OK] Runtime: CoreCLR Bionic Decoupling Ready");
-            }
-        } else if ("bazarr".equals(id)) {
-            File python = new File(prefix, "bin/python3");
-            if (!python.exists()) python = new File(prefix, "bin/python");
-            if (python.exists()) {
-                checks.add("[OK] Runtime: Python 3 Installed");
-            } else {
-                checks.add("[WARN] Runtime: Python 3 needed for execution");
-            }
-        } else if ("seerr".equals(id)) {
-            File node = new File(prefix, "bin/node");
-            if (node.exists()) {
-                checks.add("[OK] Runtime: Node.js LTS Installed");
-            } else {
-                checks.add("[OK] Runtime: Embedded Node.js Engine Ready");
             }
         } else if ("transmission".equals(id)) {
             checks.add("[OK] Runtime: Native ARM64 Bionic Ready");
@@ -5886,87 +6315,483 @@ public final class FishbowlActivity extends AppCompatActivity
         return new CompatibilityReport(ok, checks, failReason);
     }
 
+    // ------------------------------------------------------------------ Unified account (first run + Settings)
+
+    private LinearLayout unifiedAccountBody;
+    private boolean firstRunFlowShowing = false;
+    private long lastUnifiedAutoApply = 0;
+
+    /** True while runUnifiedApply() is pushing the account to the services (UI thread state). */
+    private boolean unifiedApplyRunning = false;
+    private boolean unifiedApplyForced = false;
+    private boolean unifiedApplyRerun = false;
+    private boolean unifiedApplyRerunAnnounce = false;
+    /** Services that already reported a result during the current apply. */
+    private final Set<String> unifiedReportedThisRun = new HashSet<>();
+
+    /** Called from onResume: first-run restore + account dialogs, then silent apply of pending services. */
+    private void maybeRunFirstRunFlow() {
+        try {
+            if (!isUiAlive()) return;
+            if (!UnifiedAccount.isFirstRunDone(this) && !firstRunFlowShowing) {
+                if (UnifiedAccount.isConfigured(this)) {
+                    UnifiedAccount.setFirstRunDone(this);
+                } else {
+                    firstRunFlowShowing = true;
+                    final boolean restorePrompted = getSharedPreferences("fishbowl", MODE_PRIVATE)
+                            .getBoolean("first_run_restore_prompted", false);
+                    // Backup discovery scans storage: keep it off the UI thread.
+                    runBg(() -> {
+                        List<File> backups = new ArrayList<>();
+                        if (!restorePrompted) {
+                            try {
+                                List<File> found = BackupRestoreManager.listExistingBackups(getApplicationContext());
+                                if (found != null) backups.addAll(found);
+                            } catch (Throwable ignored) {}
+                            java.util.Collections.sort(backups, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+                        }
+                        final File newest = backups.isEmpty() ? null : backups.get(0);
+                        runOnUiThread(() -> {
+                            if (!isUiAlive()) {
+                                firstRunFlowShowing = false;
+                                return;
+                            }
+                            if (newest != null) showFirstRunRestoreDialog(newest);
+                            else showUnifiedAccountDialog(true);
+                        });
+                    });
+                }
+                return;
+            }
+            if (UnifiedAccount.hasDue(this) && !firstRunFlowShowing
+                    && System.currentTimeMillis() - lastUnifiedAutoApply > 45000L) {
+                lastUnifiedAutoApply = System.currentTimeMillis();
+                runUnifiedApply(false, false);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "first-run flow: " + t.getMessage());
+        }
+    }
+
+    private void showFirstRunRestoreDialog(final File backup) {
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        d.setCancelable(false);
+
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(20), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+
+        root.addView(UiKit.title(this, buttonLabel("RESTORE A BACKUP?")));
+
+        TextView sub = UiKit.body(this, I18n.tr("A Jellyarr backup was found on this phone. Restore it to bring back your settings, accounts and library."));
+        sub.setPadding(0, dp(6), 0, dp(12));
+        root.addView(sub);
+
+        LinearLayout fileBox = UiKit.inset(this);
+        TextView file = UiKit.mono(this, backup.getName());
+        file.setTextDirection(View.TEXT_DIRECTION_LTR);
+        fileBox.addView(file);
+        TextView meta = UiKit.caption(this, android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", backup.lastModified())
+                + "  •  " + android.text.format.Formatter.formatShortFileSize(this, backup.length()));
+        meta.setPadding(0, dp(4), 0, 0);
+        fileBox.addView(meta);
+        root.addView(fileBox);
+
+        Button skip = UiKit.outline(this, buttonLabel("SKIP"), v -> {
+            getSharedPreferences("fishbowl", MODE_PRIVATE).edit().putBoolean("first_run_restore_prompted", true).apply();
+            d.dismiss();
+            showUnifiedAccountDialog(true);
+        });
+        Button restore = UiKit.primary(this, buttonLabel("RESTORE"), v -> {
+            getSharedPreferences("fishbowl", MODE_PRIVATE).edit().putBoolean("first_run_restore_prompted", true).apply();
+            firstRunFlowShowing = false;
+            d.dismiss();
+            confirmAndRestoreFromFile(backup);
+        });
+        LinearLayout row = UiKit.buttonRow(this, skip, restore);
+        ((LinearLayout.LayoutParams) row.getLayoutParams()).topMargin = dp(18);
+        root.addView(row);
+
+        d.setContentView(I18n.attach(root));
+        styleDialogWindow(d);
+        if (!safeShow(d)) firstRunFlowShowing = false;
+    }
+
+    private void styleDialogWindow(Dialog d) {
+        applyDialogWindow(d, 0.92f);
+    }
+
+    private EditText accountInput(String hint, boolean password) {
+        EditText e = UiKit.input(this, I18n.tr(hint));
+        e.setInputType(password
+                ? (android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD)
+                : (android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS));
+        // the field keeps the UI font; password variation would otherwise switch it to monospace
+        e.setTypeface(Typeface.DEFAULT);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.topMargin = dp(10);
+        e.setLayoutParams(lp);
+        return e;
+    }
+
+    /** Sign in / create account dialog. firstRun = true shows SKIP FOR NOW instead of CANCEL. */
+    private void showUnifiedAccountDialog(final boolean firstRun) {
+        if (!isUiAlive()) {
+            if (firstRun) firstRunFlowShowing = false;
+            return;
+        }
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        d.setCancelable(!firstRun);
+
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(20), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+        sv.addView(root);
+
+        root.addView(UiKit.title(this, buttonLabel("ONE ACCOUNT FOR ALL SERVICES")));
+
+        TextView sub = UiKit.body(this, I18n.tr("The same username and password will be used for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission."));
+        sub.setPadding(0, dp(6), 0, dp(14));
+        root.addView(sub);
+
+        // Segmented choice: create a new account / sign in with an existing Jellyfin user
+        final boolean[] createMode = {true};
+        LinearLayout modes = UiKit.row(this);
+        final TextView tCreate = UiKit.chip(this, buttonLabel("CREATE ACCOUNT"), true);
+        final TextView tSign = UiKit.chip(this, buttonLabel("SIGN IN"), false);
+        final TextView[] pills = {tCreate, tSign};
+        for (int i = 0; i < 2; i++) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1f);
+            if (i == 1) lp.setMarginStart(dp(8));
+            modes.addView(pills[i], lp);
+        }
+        root.addView(modes);
+
+        final EditText user = accountInput("Username", false);
+        final EditText pass = accountInput("Password", true);
+        final EditText confirm = accountInput("Confirm password", true);
+        String existing = UnifiedAccount.getUsername(this);
+        if (existing != null && !existing.isEmpty()) user.setText(existing);
+        root.addView(user);
+        root.addView(pass);
+        root.addView(confirm);
+
+        final TextView err = UiKit.caption(this, "");
+        err.setTextColor(AppTheme.danger());
+        err.setPadding(dp(2), dp(8), dp(2), 0);
+        err.setVisibility(View.GONE);
+        root.addView(err);
+
+        final Runnable paint = () -> {
+            for (int i = 0; i < 2; i++) UiKit.styleChip(this, pills[i], (i == 0) == createMode[0]);
+            confirm.setVisibility(createMode[0] ? View.VISIBLE : View.GONE);
+            err.setVisibility(View.GONE);
+        };
+        tCreate.setOnClickListener(v -> { createMode[0] = true; paint.run(); });
+        tSign.setOnClickListener(v -> { createMode[0] = false; paint.run(); });
+        paint.run();
+
+        final Button later = UiKit.outline(this, buttonLabel(firstRun ? "SKIP FOR NOW" : "CANCEL"), v -> {
+            if (firstRun) UnifiedAccount.setFirstRunDone(this);
+            firstRunFlowShowing = false;
+            d.dismiss();
+        });
+        final Button go = UiKit.primary(this, buttonLabel("CONTINUE"), null);
+        go.setOnClickListener(v -> {
+            final String u = user.getText().toString().trim();
+            final String p = pass.getText().toString();
+            String problem = UnifiedAccount.validate(u, p);
+            if (problem == null && createMode[0] && !p.equals(confirm.getText().toString())) {
+                problem = "Passwords do not match";
+            }
+            if (problem != null) {
+                err.setText(I18n.tr(problem));
+                err.setVisibility(View.VISIBLE);
+                return;
+            }
+            final boolean signIn = !createMode[0];
+            go.setEnabled(false);
+            later.setEnabled(false);
+            go.setText(I18n.tr("Checking..."));
+            // Sign-in reads jellyfin.db and verifies a PBKDF2 hash: never on the UI thread.
+            runBg(() -> {
+                String bgProblem = null;
+                if (signIn) {
+                    if (!UnifiedAccount.jellyfinHasUser(getApplicationContext(), u)) {
+                        bgProblem = "No account with this name was found on this phone. Choose CREATE ACCOUNT.";
+                    } else if (!UnifiedAccount.verifyAgainstJellyfin(getApplicationContext(), u, p)) {
+                        bgProblem = "Wrong password for this account";
+                    }
+                }
+                final String result = bgProblem;
+                runOnUiThread(() -> {
+                    if (!isUiAlive()) return;
+                    go.setEnabled(true);
+                    later.setEnabled(true);
+                    go.setText(buttonLabel("CONTINUE"));
+                    if (result != null) {
+                        err.setText(I18n.tr(result));
+                        err.setVisibility(View.VISIBLE);
+                        return;
+                    }
+                    UnifiedAccount.save(this, u, p);
+                    UnifiedAccount.setFirstRunDone(this);
+                    firstRunFlowShowing = false;
+                    d.dismiss();
+                    lastUnifiedAutoApply = System.currentTimeMillis();
+                    runUnifiedApply(true, true);
+                });
+            });
+        });
+        LinearLayout row = UiKit.buttonRow(this, later, go);
+        ((LinearLayout.LayoutParams) row.getLayoutParams()).topMargin = dp(18);
+        root.addView(row);
+
+        d.setContentView(I18n.attach(sv));
+        styleDialogWindow(d);
+        if (!safeShow(d) && firstRun) firstRunFlowShowing = false;
+    }
+
+    /**
+     * Pushes the account to every service on a background thread; force = also re-apply services already OK.
+     * Only one apply runs at a time; a forced request that arrives meanwhile (new password) runs right after.
+     */
+    private void runUnifiedApply(final boolean force, final boolean announce) {
+        if (!UnifiedAccount.isConfigured(this)) {
+            renderUnifiedAccountBody();
+            return;
+        }
+        if (unifiedApplyRunning) {
+            if (force) {
+                unifiedApplyRerun = true;
+                unifiedApplyRerunAnnounce |= announce;
+            }
+            return;
+        }
+        unifiedApplyRunning = true;
+        unifiedApplyForced = force;
+        unifiedReportedThisRun.clear();
+        renderUnifiedAccountBody();
+        if (announce && isUiAlive()) {
+            Toast.makeText(this, I18n.tr("Applying the account to all services..."), Toast.LENGTH_SHORT).show();
+        }
+        final Context app = getApplicationContext();
+        runBg(() -> {
+            try {
+                UnifiedAccount.applyAll(app, force, (id, st, msg) -> runOnUiThread(() -> {
+                    unifiedReportedThisRun.add(id);
+                    renderUnifiedAccountBody();
+                }));
+            } catch (Throwable t) {
+                Log.w(TAG, "unified apply: " + t.getMessage());
+            }
+            runOnUiThread(() -> {
+                unifiedApplyRunning = false;
+                renderUnifiedAccountBody();
+                if (announce && isUiAlive()) {
+                    int ok = 0;
+                    for (String s : UnifiedAccount.SERVICES) if ("ok".equals(UnifiedAccount.getStatus(app, s))) ok++;
+                    Toast.makeText(this, ok + " / " + UnifiedAccount.SERVICES.length + " " + I18n.tr("services updated"),
+                            Toast.LENGTH_LONG).show();
+                }
+                if (unifiedApplyRerun && isUiAlive()) {
+                    boolean again = unifiedApplyRerunAnnounce;
+                    unifiedApplyRerun = false;
+                    unifiedApplyRerunAnnounce = false;
+                    runUnifiedApply(true, again);
+                }
+            });
+        });
+    }
+
+    private View buildUnifiedAccountCard() {
+        LinearLayout card = UiKit.column(this);
+        card.setPadding(0, 0, 0, dp(16));
+
+        TextView t = new TextView(this);
+        t.setText("UNIFIED ACCOUNT");
+        styleSectionLabel(t);
+        t.setPadding(0, dp(2), 0, dp(10));
+        card.addView(t);
+
+        unifiedAccountBody = UiKit.column(this);
+        card.addView(unifiedAccountBody);
+        renderUnifiedAccountBody();
+        return card;
+    }
+
+    /**
+     * Header ("Signed in as ..." + what is kept in sync), then one row per service: name and status badge
+     * on one line, the error (if any) as a full-width selectable caption below. Buttons are disabled and a
+     * progress line is shown while an apply runs.
+     */
+    private void renderUnifiedAccountBody() {
+        if (unifiedAccountBody == null) return;
+        unifiedAccountBody.removeAllViews();
+        boolean configured = UnifiedAccount.isConfigured(this);
+        boolean busy = unifiedApplyRunning;
+
+        if (!configured) {
+            TextView none = UiKit.body(this, I18n.tr("No unified account yet. One username and password for all services."));
+            unifiedAccountBody.addView(none);
+            unifiedAccountBody.addView(UiKit.buttonRow(this,
+                    UiKit.primary(this, buttonLabel("SIGN IN / CREATE"), v -> showUnifiedAccountDialog(false))));
+            return;
+        }
+
+        TextView who = UiKit.subtitle(this, I18n.tr("Signed in as") + " " + UnifiedAccount.getUsername(this));
+        who.setTypeface(UiKit.BOLD);
+        unifiedAccountBody.addView(who);
+
+        TextView explain = UiKit.caption(this, I18n.tr("This account is kept in sync for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission."));
+        explain.setPadding(0, dp(4), 0, dp(10));
+        unifiedAccountBody.addView(explain);
+
+        if (busy) {
+            LinearLayout prog = UiKit.row(this);
+            prog.setPadding(0, 0, 0, dp(10));
+            ProgressBar pb = new ProgressBar(this);
+            pb.setIndeterminate(true);
+            pb.setIndeterminateTintList(ColorStateList.valueOf(AppTheme.accent()));
+            LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(dp(16), dp(16));
+            pbLp.setMarginEnd(dp(8));
+            prog.addView(pb, pbLp);
+            TextView syncing = UiKit.text(this, I18n.tr("Syncing…"), 12.5f, AppTheme.accent(), UiKit.MEDIUM);
+            prog.addView(syncing);
+            unifiedAccountBody.addView(prog);
+        }
+
+        LinearLayout list = UiKit.inset(this);
+        String[] labels = {"Jellyfin", "Sonarr", "Radarr", "Prowlarr", "Transmission"};
+        for (int i = 0; i < labels.length && i < UnifiedAccount.SERVICES.length; i++) {
+            String id = UnifiedAccount.SERVICES[i];
+            String st = UnifiedAccount.getStatus(this, id);
+            String msg = UnifiedAccount.getMessage(this, id);
+            boolean syncingRow = busy && !unifiedReportedThisRun.contains(id) && (unifiedApplyForced || !"ok".equals(st));
+
+            int color;
+            String text;
+            if (syncingRow) {
+                color = AppTheme.accent();
+                text = I18n.tr("Syncing…");
+            } else if ("ok".equals(st)) {
+                color = AppTheme.success();
+                text = I18n.tr("Applied");
+            } else if ("failed".equals(st)) {
+                color = AppTheme.danger();
+                text = I18n.tr("Failed");
+            } else {
+                color = AppTheme.warning();
+                text = I18n.tr("Pending");
+            }
+
+            if (i > 0) {
+                View div = UiKit.divider(this);
+                ((LinearLayout.LayoutParams) div.getLayoutParams()).topMargin = dp(6);
+                ((LinearLayout.LayoutParams) div.getLayoutParams()).bottomMargin = dp(6);
+                list.addView(div);
+            }
+
+            LinearLayout r = UiKit.row(this);
+            r.setPadding(0, dp(2), 0, dp(2));
+            TextView name = UiKit.singleLine(UiKit.subtitle(this, labels[i]));
+            r.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
+            r.addView(UiKit.badge(this, text, color));
+            list.addView(r);
+
+            if (!syncingRow && msg != null && !msg.isEmpty() && !"ok".equals(st)) {
+                TextView detail = UiKit.caption(this, I18n.tr(msg));
+                detail.setTextColor("failed".equals(st) ? AppTheme.danger() : AppTheme.textMuted());
+                detail.setTextIsSelectable(true);
+                detail.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+                detail.setPadding(0, dp(4), 0, dp(2));
+                list.addView(detail, new LinearLayout.LayoutParams(-1, -2));
+            }
+        }
+        unifiedAccountBody.addView(list);
+
+        Button edit = UiKit.primary(this, buttonLabel("CHANGE"), v -> showUnifiedAccountDialog(false));
+        Button apply = UiKit.outline(this, busy ? I18n.tr("Syncing…") : buttonLabel("APPLY NOW"), v -> runUnifiedApply(true, true));
+        Button forget = UiKit.danger(this, buttonLabel("FORGET"), v -> confirmForgetUnifiedAccount());
+        for (Button b : new Button[]{edit, apply, forget}) {
+            b.setEnabled(!busy);
+            b.setAlpha(busy ? 0.5f : 1f);
+        }
+        unifiedAccountBody.addView(UiKit.buttonRow(this, edit, apply, forget));
+    }
+
+    private void confirmForgetUnifiedAccount() {
+        TextView msg = UiKit.body(this, I18n.tr("Only the copy stored in this app is removed. Sonarr, Radarr, Prowlarr and Jellyfin keep their current login; Transmission stops requiring a login the next time it starts."));
+        showOledDialog(I18n.tr("Forget the saved account?"), null, msg, "FORGET", AppTheme.danger(), () -> {
+            UnifiedAccount.clear(this);
+            renderUnifiedAccountBody();
+            refreshSecurityUsersUI();
+        }, "CANCEL", null);
+    }
+
     private Dialog showOledDialog(String title, String subtitle, View contentView, String posText, int posColor, Runnable onPos, String negText, Runnable onNeg) {
         Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(20), dp(20), dp(16));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText(title);
-        titleTv.setTextSize(14f);
-        titleTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        titleTv.setTextColor(Color.WHITE);
+        TextView titleTv = UiKit.title(this, title);
         root.addView(titleTv);
 
         if (subtitle != null && !subtitle.isEmpty()) {
-            TextView subTv = new TextView(this);
-            subTv.setText(subtitle);
-            subTv.setTextSize(10.5f);
-            subTv.setTypeface(Typeface.MONOSPACE);
-            subTv.setTextColor(Color.parseColor("#A1A1AA"));
-            subTv.setPadding(0, dp(2), 0, 0);
+            TextView subTv = UiKit.caption(this, subtitle);
+            subTv.setPadding(0, dp(4), 0, 0);
             root.addView(subTv);
         }
 
-        View div = new View(this);
-        div.setBackgroundColor(Color.parseColor("#18181B"));
-        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(-1, dp(1));
-        divLp.topMargin = dp(10);
-        divLp.bottomMargin = dp(10);
-        root.addView(div, divLp);
-
         if (contentView != null) {
-            root.addView(contentView);
+            ViewGroup.LayoutParams given = contentView.getLayoutParams();
+            LinearLayout.LayoutParams clp = given instanceof LinearLayout.LayoutParams
+                    ? (LinearLayout.LayoutParams) given
+                    : given != null ? new LinearLayout.LayoutParams(given) : new LinearLayout.LayoutParams(-1, -2);
+            clp.topMargin = Math.max(clp.topMargin, dp(14));
+            root.addView(contentView, clp);
         }
 
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setGravity(Gravity.END);
+        // Actions aligned to the end: secondary (outlined) then primary (filled in the requested colour)
+        LinearLayout btnRow = UiKit.row(this);
+        btnRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams btnRowLp = new LinearLayout.LayoutParams(-1, -2);
-        btnRowLp.topMargin = dp(14);
+        btnRowLp.topMargin = dp(18);
         btnRow.setLayoutParams(btnRowLp);
 
         if (negText != null) {
-            Button btnNeg = createOutlinePixelButton(negText, Color.parseColor("#3F3F46"), Color.parseColor("#A1A1AA"));
-            btnNeg.setTextSize(10f);
-            btnNeg.setOnClickListener(v -> {
+            Button btnNeg = UiKit.outline(this, buttonLabel(negText), v -> {
                 d.dismiss();
                 if (onNeg != null) onNeg.run();
             });
-            btnRow.addView(btnNeg, new LinearLayout.LayoutParams(-2, dp(34)));
+            btnNeg.setTextSize(13f);
+            btnRow.addView(btnNeg, new LinearLayout.LayoutParams(-2, dp(40)));
         }
 
         if (posText != null) {
-            if (negText != null) {
-                View sp = new View(this);
-                btnRow.addView(sp, new LinearLayout.LayoutParams(dp(8), 1));
-            }
-            Button btnPos = createOutlinePixelButton(posText, posColor, posColor);
-            btnPos.setTextSize(10f);
-            btnPos.setOnClickListener(v -> {
+            int fill = posColor == 0 ? AppTheme.accent() : posColor;
+            Button btnPos = UiKit.button(this, buttonLabel(posText), fill, AppTheme.contrastOn(fill), 0, v -> {
                 d.dismiss();
                 if (onPos != null) onPos.run();
             });
-            btnRow.addView(btnPos, new LinearLayout.LayoutParams(-2, dp(34)));
+            btnPos.setTextSize(13f);
+            LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-2, dp(40));
+            if (negText != null) plp.setMarginStart(dp(8));
+            btnRow.addView(btnPos, plp);
         }
 
-        root.addView(btnRow);
-        d.setContentView(root);
-
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
-            lp.copyFrom(d.getWindow().getAttributes());
-            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(lp);
-        }
-        d.show();
+        if (negText != null || posText != null) root.addView(btnRow);
+        d.setContentView(I18n.attach(root));
+        applyDialogWindow(d, 0.90f);
+        safeShow(d);
         return d;
     }
 
@@ -6098,84 +6923,55 @@ public final class FishbowlActivity extends AppCompatActivity
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         d.setCancelable(false);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        LinearLayout titleRow = new LinearLayout(this);
-        titleRow.setOrientation(LinearLayout.HORIZONTAL);
-        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout titleRow = UiKit.row(this);
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText(title);
-        titleTv.setTextSize(13.5f);
-        titleTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        titleTv.setTextColor(Color.WHITE);
+        TextView titleTv = UiKit.title(this, title);
         titleRow.addView(titleTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         TextView cancelBtn = null;
         if (cancellable) {
-            cancelBtn = new TextView(this);
-            cancelBtn.setText("✕");
-            cancelBtn.setTextSize(13f);
-            cancelBtn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-            cancelBtn.setTextColor(Color.parseColor("#A1A1AA"));
+            cancelBtn = UiKit.text(this, "✕", 16f, AppTheme.textSecondary(), UiKit.MEDIUM);
             cancelBtn.setGravity(Gravity.CENTER);
-            cancelBtn.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(6)));
+            cancelBtn.setContentDescription("Cancel");
+            cancelBtn.setBackground(UiKit.rowRipple(this));
             cancelBtn.setClickable(true);
             cancelBtn.setFocusable(true);
-            titleRow.addView(cancelBtn, new LinearLayout.LayoutParams(dp(28), dp(28)));
+            titleRow.addView(cancelBtn, new LinearLayout.LayoutParams(dp(36), dp(36)));
         }
         root.addView(titleRow);
 
-        TextView msgTv = new TextView(this);
-        msgTv.setText(initialMessage);
-        msgTv.setTextSize(10.5f);
-        msgTv.setTypeface(Typeface.MONOSPACE);
-        msgTv.setTextColor(Color.parseColor("#A1A1AA"));
-        msgTv.setPadding(0, dp(4), 0, dp(12));
+        TextView msgTv = UiKit.body(this, initialMessage);
+        msgTv.setPadding(0, dp(6), 0, dp(14));
         root.addView(msgTv);
 
         ProgressBar pb = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         pb.setMax(100);
         pb.setProgress(0);
         pb.setIndeterminate(false);
+        pb.setProgressTintList(ColorStateList.valueOf(AppTheme.accent()));
+        pb.setIndeterminateTintList(ColorStateList.valueOf(AppTheme.accent()));
         root.addView(pb, new LinearLayout.LayoutParams(-1, dp(6)));
 
-        LinearLayout footer = new LinearLayout(this);
-        footer.setOrientation(LinearLayout.HORIZONTAL);
-        footer.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout footer = UiKit.row(this);
         footer.setPadding(0, dp(8), 0, 0);
 
-        TextView statsTv = new TextView(this);
-        statsTv.setText("");
-        statsTv.setTextSize(9.5f);
-        statsTv.setTypeface(Typeface.MONOSPACE);
-        statsTv.setTextColor(Color.parseColor("#71717A"));
+        // byte counts / speeds are machine values: monospace keeps the digits from jumping around
+        TextView statsTv = UiKit.text(this, "", 11f, AppTheme.textMuted(), Typeface.MONOSPACE);
         footer.addView(statsTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        TextView pctTv = new TextView(this);
-        pctTv.setText("0%");
-        pctTv.setTextSize(9.5f);
-        pctTv.setTypeface(Typeface.MONOSPACE);
-        pctTv.setTextColor(Color.parseColor("#A1A1AA"));
+        TextView pctTv = UiKit.text(this, "0%", 11f, AppTheme.textSecondary(), UiKit.MEDIUM);
         pctTv.setGravity(Gravity.END);
         footer.addView(pctTv, new LinearLayout.LayoutParams(-2, -2));
 
         root.addView(footer);
 
-        d.setContentView(root);
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
-            lp.copyFrom(d.getWindow().getAttributes());
-            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(lp);
-        }
-        d.show();
+        d.setContentView(I18n.attach(root));
+        applyDialogWindow(d, 0.90f);
+        safeShow(d);
         return new OledProgressDialog(d, titleTv, msgTv, pb, statsTv, pctTv, cancelBtn);
     }
 
@@ -6188,7 +6984,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout list = new LinearLayout(this);
         list.setOrientation(LinearLayout.VERTICAL);
         list.setPadding(dp(10), dp(8), dp(10), dp(8));
-        list.setBackground(createBorderedRoundedDrawable(Color.parseColor("#09090B"), Color.parseColor("#27272A"), dp(1), dp(6)));
+        list.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(6)));
 
         for (String item : rep.details) {
             TextView itemTv = new TextView(this);
@@ -6196,11 +6992,11 @@ public final class FishbowlActivity extends AppCompatActivity
             itemTv.setTextSize(10f);
             itemTv.setTypeface(Typeface.MONOSPACE);
             if (item.startsWith("[OK]")) {
-                itemTv.setTextColor(Color.parseColor("#34D399"));
+                itemTv.setTextColor(AppTheme.success());
             } else if (item.startsWith("[WARN]")) {
-                itemTv.setTextColor(Color.parseColor("#FB923C"));
+                itemTv.setTextColor(AppTheme.warning());
             } else {
-                itemTv.setTextColor(Color.parseColor("#E11D48"));
+                itemTv.setTextColor(AppTheme.danger());
             }
             itemTv.setPadding(0, dp(2), 0, dp(2));
             list.addView(itemTv);
@@ -6213,7 +7009,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 "Environment warning: " + rep.failureReason);
         note.setTextSize(10f);
         note.setTypeface(Typeface.MONOSPACE);
-        note.setTextColor(Color.parseColor("#A1A1AA"));
+        note.setTextColor(AppTheme.textSecondary());
         note.setPadding(0, dp(8), 0, 0);
         content.addView(note);
 
@@ -6222,7 +7018,7 @@ public final class FishbowlActivity extends AppCompatActivity
             "v" + svc.getManifest().getVersion() + " • " + svc.getManifest().getCategory().toUpperCase(Locale.ROOT) + " : " + svc.getManifest().getDefaultPort(),
             content,
             rep.isCompatible ? "PROCEED & INSTALL" : null,
-            Color.WHITE,
+            AppTheme.accent(),
             () -> installServiceAutomatically(svc),
             rep.isCompatible ? "CANCEL" : "CLOSE",
             null
@@ -6231,68 +7027,53 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void confirmUninstallService(ManagedService svc) {
         if ("jellyfin".equalsIgnoreCase(svc.getId())) {
-            Toast.makeText(this, "Jellyfin is the core media server and cannot be uninstalled.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Jellyfin is the core media server and cannot be uninstalled."), Toast.LENGTH_SHORT).show();
             return;
         }
 
-        File installDir = new File(svc.getManifest().getInstallDir());
-        File configDir = new File(svc.getManifest().getConfigDir());
+        final File installDir = new File(svc.getManifest().getInstallDir());
+        final File configDir = new File(svc.getManifest().getConfigDir());
+        // Walking the install tree (.NET runtimes: thousands of files) must not block the UI thread.
+        runBg(() -> {
+            long bin = calculateDirSize(installDir);
+            long cfg = calculateDirSize(configDir);
+            runOnUiThread(() -> {
+                if (isUiAlive()) showUninstallOptionsDialog(svc, bin, cfg);
+            });
+        });
+    }
 
-        long binBytes = calculateDirSize(installDir);
-        long cfgBytes = calculateDirSize(configDir);
+    private void showUninstallOptionsDialog(ManagedService svc, long binBytes, long cfgBytes) {
         long totalBytes = binBytes + cfgBytes;
 
         Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText("UNINSTALL " + svc.getDisplayName().toUpperCase(Locale.ROOT));
-        titleTv.setTextSize(14f);
-        titleTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        titleTv.setTextColor(Color.WHITE);
-        root.addView(titleTv);
+        LinearLayout head = UiKit.row(this);
+        LinearLayout headText = UiKit.column(this);
+        headText.addView(UiKit.title(this, buttonLabel("UNINSTALL") + " " + svc.getDisplayName()));
+        TextView subTv = UiKit.caption(this, "Storage Reclaim & Data Retention Options");
+        subTv.setPadding(0, dp(2), 0, 0);
+        headText.addView(subTv);
+        head.addView(headText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        head.addView(dialogCloseButton(d));
+        root.addView(head);
 
-        TextView subTv = new TextView(this);
-        subTv.setText("Storage Reclaim & Data Retention Options");
-        subTv.setTextSize(10f);
-        subTv.setTypeface(Typeface.MONOSPACE);
-        subTv.setTextColor(Color.parseColor("#A1A1AA"));
-        subTv.setPadding(0, dp(2), 0, dp(10));
-        root.addView(subTv);
-
-        // Stats Box
-        LinearLayout statBox = new LinearLayout(this);
-        statBox.setOrientation(LinearLayout.VERTICAL);
-        statBox.setPadding(dp(10), dp(8), dp(10), dp(8));
-        statBox.setBackground(createBorderedRoundedDrawable(Color.parseColor("#09090B"), Color.parseColor("#18181B"), dp(1), dp(6)));
-
-        TextView statLine1 = new TextView(this);
-        statLine1.setText("Binaries Footprint: " + MediaStorageManager.formatBytes(binBytes));
-        statLine1.setTextSize(10f);
-        statLine1.setTypeface(Typeface.MONOSPACE);
-        statLine1.setTextColor(Color.parseColor("#E11D48"));
-        statBox.addView(statLine1);
-
-        TextView statLine2 = new TextView(this);
-        statLine2.setText("Database & Configs: " + MediaStorageManager.formatBytes(cfgBytes));
-        statLine2.setTextSize(10f);
-        statLine2.setTypeface(Typeface.MONOSPACE);
-        statLine2.setTextColor(Color.parseColor("#A1A1AA"));
-        statBox.addView(statLine2);
-
+        // Stats box
+        LinearLayout statBox = UiKit.inset(this);
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(-1, -2);
+        sbLp.topMargin = dp(14);
+        statBox.setLayoutParams(sbLp);
+        addDetailKv(statBox, I18n.tr("Binaries"), MediaStorageManager.formatBytes(binBytes), false);
+        addDetailKv(statBox, I18n.tr("Database & Configs"), MediaStorageManager.formatBytes(cfgBytes), false);
         root.addView(statBox);
 
-        // Option 1 Button: Reclaim Binaries Only (Preserve Database)
-        Button btnKeepDb = createOutlinePixelButton("RECLAIM BINARIES ONLY (KEEP DATABASE)", Color.WHITE, Color.WHITE);
-        btnKeepDb.setTextSize(10f);
-        LinearLayout.LayoutParams kLp = new LinearLayout.LayoutParams(-1, dp(38));
-        kLp.topMargin = dp(12);
-        btnKeepDb.setLayoutParams(kLp);
+        // Option 1: reclaim binaries only (preserve database)
+        Button btnKeepDb = UiKit.outline(this, buttonLabel("RECLAIM BINARIES ONLY (KEEP DATABASE)"), null);
         btnKeepDb.setOnClickListener(v -> {
             d.dismiss();
             OledProgressDialog progress = showOledProgressDialog("UNINSTALLING " + svc.getDisplayName().toUpperCase(Locale.ROOT), "Stopping process and reclaiming binaries...");
@@ -6300,25 +7081,19 @@ public final class FishbowlActivity extends AppCompatActivity
                 progress.dismiss();
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-                Toast.makeText(this, svc.getDisplayName() + " binaries removed. Database & config preserved!", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr(svc.getDisplayName() + " binaries removed. Database & config preserved!"), Toast.LENGTH_LONG).show();
             });
         });
-        root.addView(btnKeepDb);
+        LinearLayout.LayoutParams kLp = new LinearLayout.LayoutParams(-1, dp(44));
+        kLp.topMargin = dp(16);
+        root.addView(btnKeepDb, kLp);
 
-        TextView noteKeep = new TextView(this);
-        noteKeep.setText("Reclaims ~" + MediaStorageManager.formatBytes(binBytes) + ". Settings, API keys, and library mappings remain saved. Reinstalling later restores your existing library instantly.");
-        noteKeep.setTextSize(9f);
-        noteKeep.setTypeface(Typeface.MONOSPACE);
-        noteKeep.setTextColor(Color.parseColor("#71717A"));
-        noteKeep.setPadding(dp(4), dp(3), dp(4), dp(8));
+        TextView noteKeep = UiKit.caption(this, "Reclaims ~" + MediaStorageManager.formatBytes(binBytes) + ". Settings, API keys, and library mappings remain saved. Reinstalling later restores your existing library instantly.");
+        noteKeep.setPadding(dp(4), dp(6), dp(4), dp(4));
         root.addView(noteKeep);
 
-        // Option 2 Button: Clean Wipe (Purge All Data)
-        Button btnPurge = createOutlinePixelButton("PURGE EVERYTHING (CLEAN WIPE)", Color.parseColor("#E11D48"), Color.parseColor("#E11D48"));
-        btnPurge.setTextSize(10f);
-        LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(-1, dp(38));
-        pLp.topMargin = dp(4);
-        btnPurge.setLayoutParams(pLp);
+        // Option 2: clean wipe (purge all data)
+        Button btnPurge = UiKit.danger(this, buttonLabel("PURGE EVERYTHING (CLEAN WIPE)"), null);
         btnPurge.setOnClickListener(v -> {
             d.dismiss();
             OledProgressDialog progress = showOledProgressDialog("PURGING " + svc.getDisplayName().toUpperCase(Locale.ROOT), "Stopping process and removing all data...");
@@ -6326,36 +7101,20 @@ public final class FishbowlActivity extends AppCompatActivity
                 progress.dismiss();
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-                Toast.makeText(this, svc.getDisplayName() + " completely purged. " + MediaStorageManager.formatBytes(totalBytes) + " reclaimed!", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr(svc.getDisplayName() + " completely purged. " + MediaStorageManager.formatBytes(totalBytes) + " reclaimed!"), Toast.LENGTH_LONG).show();
             });
         });
-        root.addView(btnPurge);
+        LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(-1, dp(44));
+        pLp.topMargin = dp(12);
+        root.addView(btnPurge, pLp);
 
-        TextView notePurge = new TextView(this);
-        notePurge.setText("Permanently deletes binaries, SQLite databases, and all configuration files. Downloaded media files in FishbowlMedia are NEVER deleted.");
-        notePurge.setTextSize(9f);
-        notePurge.setTypeface(Typeface.MONOSPACE);
-        notePurge.setTextColor(Color.parseColor("#71717A"));
-        notePurge.setPadding(dp(4), dp(3), dp(4), dp(10));
+        TextView notePurge = UiKit.caption(this, "Permanently deletes binaries, SQLite databases, and all configuration files. Downloaded media files in FishbowlMedia are NEVER deleted.");
+        notePurge.setPadding(dp(4), dp(6), dp(4), 0);
         root.addView(notePurge);
 
-        // Cancel Button
-        Button btnCancel = createOutlinePixelButton("CANCEL", Color.parseColor("#3F3F46"), Color.parseColor("#A1A1AA"));
-        btnCancel.setTextSize(10f);
-        btnCancel.setOnClickListener(v -> d.dismiss());
-        root.addView(btnCancel, new LinearLayout.LayoutParams(-1, dp(34)));
-
-        d.setContentView(root);
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
-            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
-            wlp.copyFrom(d.getWindow().getAttributes());
-            wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.92);
-            wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(wlp);
-        }
-        d.show();
+        d.setContentView(I18n.attach(root));
+        applyDialogWindow(d, 0.92f);
+        safeShow(d);
     }
 
     public interface DownloadProgressCallback {
@@ -6397,7 +7156,7 @@ public final class FishbowlActivity extends AppCompatActivity
                         for (int i = 0; i < assets.length(); i++) {
                             JSONObject a = assets.getJSONObject(i);
                             String name = a.optString("name", "");
-                            if ((name.contains(pattern) || (pattern.equals("bazarr.zip") && name.equalsIgnoreCase("bazarr.zip"))) && !name.contains("musl")) {
+                            if ((name.contains(pattern)) && !name.contains("musl")) {
                                 String bUrl = a.optString("browser_download_url", "");
                                 if (!bUrl.isEmpty()) return bUrl;
                                 return a.optString("url", "");
@@ -6416,9 +7175,6 @@ public final class FishbowlActivity extends AppCompatActivity
         if ("radarr".equalsIgnoreCase(id)) return fetchGitHubApiAssetUrl("Radarr/Radarr", "linux-core-arm64.tar.gz");
         if ("sonarr".equalsIgnoreCase(id)) return fetchGitHubApiAssetUrl("Sonarr/Sonarr", "linux-arm64.tar.gz");
         if ("prowlarr".equalsIgnoreCase(id)) return fetchGitHubApiAssetUrl("Prowlarr/Prowlarr", "linux-core-arm64.tar.gz");
-        if ("lidarr".equalsIgnoreCase(id)) return fetchGitHubApiAssetUrl("Lidarr/Lidarr", "linux-core-arm64.tar.gz");
-        if ("jackett".equalsIgnoreCase(id)) return fetchGitHubApiAssetUrl("Jackett/Jackett", "LinuxARM64.tar.gz");
-        if ("bazarr".equalsIgnoreCase(id)) return fetchGitHubApiAssetUrl("morpheus65535/bazarr", "bazarr.zip");
         return null;
     }
 
@@ -7172,137 +7928,6 @@ public final class FishbowlActivity extends AppCompatActivity
 
         String id = svc.getId().toLowerCase(Locale.ROOT);
 
-        if ("seerr".equalsIgnoreCase(id)) {
-            File nodeBin = new File(prefix, "bin/node");
-            File libssl = new File(prefix, "lib/libssl.so.3");
-            ensureIcuSymlinks(prefix);
-            ensureLibrarySymlinks(prefix);
-            File libicu79 = new File(prefix, "lib/libicui18n.so.79");
-            File libicu79Full = new File(prefix, "lib/libicui18n.so.79.1");
-            if (!nodeBin.exists() || !libssl.exists() || (!libicu79.exists() && !libicu79Full.exists())) {
-                String[] nodeDeps = {"libc++", "zlib", "openssl", "c-ares", "libicu", "libsqlite", "nodejs-lts"};
-                for (String dep : nodeDeps) {
-                    if (progress != null && progress.isCancelled()) {
-                        throw new InterruptedException("Installation cancelled");
-                    }
-                    downloadAndInstallDebPackage(dep, prefix, progress, "Installing Node.js runtime (" + dep + ")...");
-                }
-                ensureIcuSymlinks(prefix);
-                ensureLibrarySymlinks(prefix);
-                if (nodeBin.exists()) {
-                    nodeBin.setExecutable(true, false);
-                    try { android.system.Os.chmod(nodeBin.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
-                }
-            }
-
-            if (progress != null && progress.isCancelled()) {
-                throw new InterruptedException("Installation cancelled");
-            }
-
-            runOnUiThread(() -> {
-                if (progress != null) progress.setMessage("Deploying Seerr Request Engine...");
-            });
-            MediaServiceManager.getInstance(this).deploySeerrService(true);
-            MediaServiceManager.getInstance(this).autoWireStack(null);
-            svc.reconcileInstalledState();
-            return;
-        }
-
-        if ("bazarr".equalsIgnoreCase(id)) {
-            ensurePythonSymlinks(prefix);
-            ensureLibrarySymlinks(prefix);
-            File pythonBin = new File(prefix, "bin/python3");
-            if (!pythonBin.exists()) pythonBin = new File(prefix, "bin/python");
-            File bzLibSsl = new File(prefix, "lib/libssl.so.3");
-            File bzLibSqlite = new File(prefix, "lib/libsqlite3.so");
-            File bzExpat = new File(prefix, "lib/libexpat.so.1.13.1");
-            if (!pythonBin.exists() || !bzLibSsl.exists() || !bzLibSqlite.exists() || !bzExpat.exists()
-                    || !isDebPackageAlreadyInstalled("libexpat", prefix)) {
-                String[] pyDeps = {
-                    "libc++", "zlib", "openssl", "libbz2", "libcrypt", "libexpat", "libffi",
-                    "liblzma", "libsqlite", "libandroid-support", "libandroid-posix-semaphore",
-                    "ncurses", "ncurses-ui-libs", "readline", "zstd", "python"
-                };
-                for (String dep : pyDeps) {
-                    if (progress != null && progress.isCancelled()) {
-                        throw new InterruptedException("Installation cancelled");
-                    }
-                    downloadAndInstallDebPackage(dep, prefix, progress, "Setting up Python 3 runtime (" + dep + ")...");
-                }
-                ensurePythonSymlinks(prefix);
-                ensureLibrarySymlinks(prefix);
-                if (pythonBin.exists()) {
-                    pythonBin.setExecutable(true, false);
-                    try { android.system.Os.chmod(pythonBin.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
-                }
-            }
-
-            File sevenZipBin = new File(prefix, "bin/7z");
-            if (!sevenZipBin.exists()) {
-                downloadAndInstallDebPackage("7zip", prefix, progress, "Setting up 7-Zip archiver utility...");
-                ensureLibrarySymlinks(prefix);
-            }
-
-            if (progress != null && progress.isCancelled()) {
-                throw new InterruptedException("Installation cancelled");
-            }
-
-            runOnUiThread(() -> {
-                if (progress != null) progress.setMessage("Downloading Bazarr release...");
-            });
-            File cacheZip = new File(getCacheDir(), "bazarr.zip");
-            String bzUrl = "https://github.com/morpheus65535/bazarr/releases/latest/download/bazarr.zip";
-            final String bzStep = "Downloading Bazarr release...";
-            DownloadProgressCallback bzCallback = new DownloadProgressCallback() {
-                @Override
-                public void onProgress(long current, long total, double speedKbps) {
-                    if (progress != null) {
-                        runOnUiThread(() -> progress.updateDownloadProgress(bzStep, current, total, speedKbps));
-                    }
-                }
-                @Override
-                public boolean isCancelled() {
-                    return progress != null && progress.isCancelled();
-                }
-            };
-
-            try {
-                downloadWithRedirects(bzUrl, cacheZip, bzCallback);
-            } catch (Exception dlEx) {
-                if (progress != null && progress.isCancelled()) throw dlEx;
-                String fallbackUrl = fetchGitHubApiAssetUrl("morpheus65535/bazarr", "bazarr.zip");
-                if (fallbackUrl != null && !fallbackUrl.isEmpty()) {
-                    Log.i(TAG, "Direct Bazarr download failed, falling back to GitHub API stream: " + fallbackUrl);
-                    runOnUiThread(() -> {
-                        if (progress != null) progress.setMessage("Resolving direct asset stream for Bazarr...");
-                    });
-                    downloadWithRedirects(fallbackUrl, cacheZip, bzCallback);
-                } else {
-                    throw dlEx;
-                }
-            }
-
-            if (progress != null && progress.isCancelled()) {
-                if (cacheZip.exists()) cacheZip.delete();
-                throw new InterruptedException("Installation cancelled");
-            }
-
-            runOnUiThread(() -> {
-                if (progress != null) {
-                    progress.setStep("Extracting Bazarr packages...", "Unpacking python components...");
-                }
-            });
-            File bzTarget = new File(servicesDir, "bazarr");
-            if (!bzTarget.exists()) bzTarget.mkdirs();
-            extractZipArchive(cacheZip, bzTarget);
-            cacheZip.delete();
-
-            MediaServiceManager.getInstance(this).ensureServiceConfigSanitized("bazarr");
-            MediaServiceManager.getInstance(this).autoWireStack(null);
-            svc.reconcileInstalledState();
-            return;
-        }
-
         if ("transmission".equalsIgnoreCase(id)) {
             String[] trDeps = {"libc++", "libpsl", "libidn2", "libevent", "miniupnpc", "natpmpc", "transmission"};
             for (String dep : trDeps) {
@@ -7326,7 +7951,7 @@ public final class FishbowlActivity extends AppCompatActivity
             return;
         }
 
-        // Servarr applications (.NET 10.0 ARM64): Radarr, Sonarr, Prowlarr, Lidarr, Jackett
+        // Servarr applications (.NET 10.0 ARM64): Radarr, Sonarr, Prowlarr
         String downloadUrl;
         if ("sonarr".equalsIgnoreCase(id)) {
             downloadUrl = "https://services.sonarr.tv/v1/download/main/latest?version=4&os=linux&arch=arm64";
@@ -7334,10 +7959,6 @@ public final class FishbowlActivity extends AppCompatActivity
             downloadUrl = "https://prowlarr.servarr.com/v1/update/master/updatefile?os=linux&runtime=netcore&arch=arm64";
         } else if ("radarr".equalsIgnoreCase(id)) {
             downloadUrl = "https://radarr.servarr.com/v1/update/master/updatefile?os=linux&runtime=netcore&arch=arm64";
-        } else if ("lidarr".equalsIgnoreCase(id)) {
-            downloadUrl = "https://lidarr.servarr.com/v1/update/master/updatefile?os=linux&runtime=netcore&arch=arm64";
-        } else if ("jackett".equalsIgnoreCase(id)) {
-            downloadUrl = "https://github.com/Jackett/Jackett/releases/latest/download/Jackett.Binaries.LinuxARM64.tar.gz";
         } else {
             return;
         }
@@ -7347,7 +7968,7 @@ public final class FishbowlActivity extends AppCompatActivity
         }
 
         runOnUiThread(() -> {
-            if (progress != null) progress.setMessage("Downloading " + svc.getDisplayName() + "...");
+            if (progress != null) progress.setMessage(I18n.tr("Downloading " + svc.getDisplayName() + "..."));
         });
         File cacheTar = new File(getCacheDir(), id + ".tar.gz");
         final String svStep = "Downloading " + svc.getDisplayName() + "...";
@@ -7372,7 +7993,7 @@ public final class FishbowlActivity extends AppCompatActivity
             if (fallbackUrl != null && !fallbackUrl.isEmpty() && !fallbackUrl.equals(downloadUrl)) {
                 Log.i(TAG, "Direct download failed for " + id + ", falling back to GitHub API stream: " + fallbackUrl);
                 runOnUiThread(() -> {
-                    if (progress != null) progress.setMessage("Resolving direct asset stream for " + svc.getDisplayName() + "...");
+                    if (progress != null) progress.setMessage(I18n.tr("Resolving direct asset stream for " + svc.getDisplayName() + "..."));
                 });
                 downloadWithRedirects(fallbackUrl, cacheTar, svCallback);
             } else {
@@ -7432,23 +8053,13 @@ public final class FishbowlActivity extends AppCompatActivity
                 dll = checkCap;
             } else if (checkLow.exists()) {
                 dll = checkLow;
-            } else if ("jackett".equalsIgnoreCase(id)) {
-                File checkJackett = new File(targetDir, "jackett.dll");
-                File checkCapJackett = new File(targetDir, "Jackett.dll");
-                if (checkJackett.exists()) dll = checkJackett;
-                else if (checkCapJackett.exists()) dll = checkCapJackett;
             }
         }
-        File jackettBin = new File(targetDir, "jackett");
-        if (jackettBin.exists()) {
-            jackettBin.setExecutable(true, false);
-            try { android.system.Os.chmod(jackettBin.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
-        }
-        if (!dll.exists() && !"jackett".equalsIgnoreCase(id)) {
+        if (!dll.exists()) {
             File foundDll = findDllRecursively(targetDir, id);
             if (foundDll != null) dll = foundDll;
         }
-        if (!dll.exists() && !("jackett".equalsIgnoreCase(id) && jackettBin.exists())) {
+        if (!dll.exists()) {
             throw new IllegalStateException("Service binary not found after extraction: " + svc.getManifest().getExecutableOrDllPath());
         }
         if (dll.exists()) {
@@ -7587,7 +8198,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     svc.reconcileInstalledState();
                     refreshServicesTabUI();
                     refreshHomeServicesBadge();
-                    Toast.makeText(this, svc.getDisplayName() + " installed successfully!", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, I18n.tr(svc.getDisplayName() + " installed successfully!"), Toast.LENGTH_LONG).show();
                 });
             } catch (Throwable t) {
                 boolean isCancel = (progress != null && progress.isCancelled()) || (t instanceof InterruptedException);
@@ -7599,7 +8210,7 @@ public final class FishbowlActivity extends AppCompatActivity
                         svc.reconcileInstalledState();
                         refreshServicesTabUI();
                         refreshHomeServicesBadge();
-                        Toast.makeText(this, "Installation cancelled.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, I18n.tr("Installation cancelled."), Toast.LENGTH_SHORT).show();
                     });
                     return;
                 }
@@ -7607,7 +8218,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 cleanupPartialServiceInstall(svc.getId());
                 runOnUiThread(() -> {
                     progress.dismiss();
-                    Toast.makeText(this, "Installation failed: " + t.getMessage(), Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, I18n.tr("Installation failed: " + t.getMessage()), Toast.LENGTH_LONG).show();
                 });
             }
         }).start();
@@ -7630,8 +8241,8 @@ public final class FishbowlActivity extends AppCompatActivity
                 final int total = services.size();
                 runOnUiThread(() -> {
                     if (progress != null) {
-                        progress.setTitle("INSTALLING (" + idx + "/" + total + ") " + svc.getDisplayName().toUpperCase(Locale.ROOT));
-                        progress.setMessage("Preparing runtime environment...");
+                        progress.setTitle(I18n.tr("INSTALLING (" + idx + "/" + total + ") " + svc.getDisplayName().toUpperCase(Locale.ROOT)));
+                        progress.setMessage(I18n.tr("Preparing runtime environment..."));
                         progress.setProgress(0);
                     }
                 });
@@ -7658,9 +8269,9 @@ public final class FishbowlActivity extends AppCompatActivity
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
                 if (wasCancelled) {
-                    Toast.makeText(this, "Installation cancelled (" + finalSuccess + " installed).", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, I18n.tr("Installation cancelled (" + finalSuccess + " installed)."), Toast.LENGTH_LONG).show();
                 } else {
-                    Toast.makeText(this, "Batch installation complete (" + finalSuccess + " installed)!", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, I18n.tr("Batch installation complete (" + finalSuccess + " installed)!"), Toast.LENGTH_LONG).show();
                 }
             });
         }).start();
@@ -7677,8 +8288,8 @@ public final class FishbowlActivity extends AppCompatActivity
                 final int total = services.size();
                 runOnUiThread(() -> {
                     if (progress != null) {
-                        progress.setTitle("UNINSTALLING (" + current + "/" + total + ") " + s.getDisplayName().toUpperCase(Locale.ROOT));
-                        progress.setMessage("Reclaiming binaries...");
+                        progress.setTitle(I18n.tr("UNINSTALLING (" + current + "/" + total + ") " + s.getDisplayName().toUpperCase(Locale.ROOT)));
+                        progress.setMessage(I18n.tr("Reclaiming binaries..."));
                         progress.setProgress((current * 100) / total);
                     }
                 });
@@ -7694,7 +8305,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 if (progress != null) progress.dismiss();
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-                Toast.makeText(this, "Uninstalled " + uninstalledCount + " service(s).", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr("Uninstalled " + uninstalledCount + " service(s)."), Toast.LENGTH_LONG).show();
             });
         }).start();
     }
@@ -7710,7 +8321,7 @@ public final class FishbowlActivity extends AppCompatActivity
             }
         }
         if (candidates.isEmpty()) {
-            Toast.makeText(this, "All companion services are already installed!", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("All companion services are already installed!"), Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -7724,14 +8335,14 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(Color.parseColor("#09090B"), Color.parseColor("#27272A"), dp(1), dp(16)));
+        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(16)));
 
         // Header badge
         TextView badge = new TextView(this);
         badge.setText("MEDIA STACK INSTALLER");
         badge.setTextSize(9f);
         badge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        badge.setTextColor(Color.parseColor("#38BDF8"));
+        badge.setTextColor(AppTheme.accent());
         badge.setLetterSpacing(0.08f);
         root.addView(badge);
 
@@ -7739,14 +8350,14 @@ public final class FishbowlActivity extends AppCompatActivity
         titleTv.setText("Select Services to Install");
         titleTv.setTextSize(15f);
         titleTv.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        titleTv.setTextColor(Color.WHITE);
+        titleTv.setTextColor(AppTheme.text());
         titleTv.setPadding(0, dp(2), 0, 0);
         root.addView(titleTv);
 
         TextView subTv = new TextView(this);
         subTv.setText("Choose companion engines to deploy to your media stack:");
         subTv.setTextSize(11f);
-        subTv.setTextColor(Color.parseColor("#A1A1AA"));
+        subTv.setTextColor(AppTheme.textSecondary());
         subTv.setPadding(0, dp(2), 0, dp(12));
         root.addView(subTv);
 
@@ -7755,7 +8366,7 @@ public final class FishbowlActivity extends AppCompatActivity
         selectAllCard.setOrientation(LinearLayout.HORIZONTAL);
         selectAllCard.setGravity(Gravity.CENTER_VERTICAL);
         selectAllCard.setPadding(dp(12), dp(8), dp(12), dp(8));
-        selectAllCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121215"), Color.parseColor("#27272A"), dp(1), dp(10)));
+        selectAllCard.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
         LinearLayout.LayoutParams sacLp = new LinearLayout.LayoutParams(-1, -2);
         sacLp.bottomMargin = dp(10);
         selectAllCard.setLayoutParams(sacLp);
@@ -7768,8 +8379,8 @@ public final class FishbowlActivity extends AppCompatActivity
         selectAllLabel.setText("Select All (" + candidates.size() + " available)");
         selectAllLabel.setTextSize(11.5f);
         selectAllLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        selectAllLabel.setTextColor(Color.WHITE);
-        selectAllLabel.setPadding(dp(8), 0, 0, 0);
+        selectAllLabel.setTextColor(AppTheme.text());
+        selectAllLabel.setPaddingRelative(dp(8), 0, 0, 0);
         selectAllCard.addView(selectAllLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         selectAllCard.setClickable(true);
@@ -7782,7 +8393,7 @@ public final class FishbowlActivity extends AppCompatActivity
         list.setOrientation(LinearLayout.VERTICAL);
 
         List<CheckBox> itemCbs = new ArrayList<>();
-        Button actionBtn = createPixelButton("INSTALL (" + selectedIds.size() + ")", Color.parseColor("#0284C7"), Color.WHITE);
+        Button actionBtn = createPixelButton("INSTALL (" + selectedIds.size() + ")", AppTheme.accent(), Color.WHITE);
 
         Runnable updateButtonText = () -> {
             actionBtn.setText("INSTALL (" + selectedIds.size() + ")");
@@ -7795,7 +8406,7 @@ public final class FishbowlActivity extends AppCompatActivity
             itemCard.setOrientation(LinearLayout.HORIZONTAL);
             itemCard.setGravity(Gravity.CENTER_VERTICAL);
             itemCard.setPadding(dp(12), dp(10), dp(12), dp(10));
-            itemCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121215"), Color.parseColor("#27272A"), dp(1), dp(10)));
+            itemCard.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
             LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(-1, -2);
             icLp.bottomMargin = dp(6);
             itemCard.setLayoutParams(icLp);
@@ -7803,7 +8414,7 @@ public final class FishbowlActivity extends AppCompatActivity
             ImageView iconView = new ImageView(this);
             iconView.setImageResource(getServiceIconRes(s.getId()));
             iconView.setPadding(dp(4), dp(4), dp(4), dp(4));
-            iconView.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
+            iconView.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
             itemCard.addView(iconView, new LinearLayout.LayoutParams(dp(32), dp(32)));
 
             LinearLayout textCol = new LinearLayout(this);
@@ -7814,7 +8425,7 @@ public final class FishbowlActivity extends AppCompatActivity
             nameTv.setText(s.getDisplayName());
             nameTv.setTextSize(12f);
             nameTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            nameTv.setTextColor(Color.WHITE);
+            nameTv.setTextColor(AppTheme.text());
             textCol.addView(nameTv);
 
             int port = (s.getManifest() != null) ? s.getManifest().getDefaultPort() : 0;
@@ -7822,7 +8433,7 @@ public final class FishbowlActivity extends AppCompatActivity
             TextView descTv = new TextView(this);
             descTv.setText("Port " + port + " â€¢ ~" + reqMb + " MB");
             descTv.setTextSize(10f);
-            descTv.setTextColor(Color.parseColor("#71717A"));
+            descTv.setTextColor(AppTheme.textMuted());
             textCol.addView(descTv);
 
             itemCard.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -7858,7 +8469,7 @@ public final class FishbowlActivity extends AppCompatActivity
         footer.setOrientation(LinearLayout.HORIZONTAL);
         footer.setPadding(0, dp(14), 0, 0);
 
-        Button cancelBtn = createOutlinePixelButton("CANCEL", Color.parseColor("#3F3F46"), Color.parseColor("#A1A1AA"));
+        Button cancelBtn = createOutlinePixelButton("CANCEL", AppTheme.outlineStrong(), AppTheme.textSecondary());
         cancelBtn.setTextSize(10f);
         cancelBtn.setOnClickListener(v -> d.dismiss());
         footer.addView(cancelBtn, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
@@ -7882,17 +8493,17 @@ public final class FishbowlActivity extends AppCompatActivity
         footer.addView(actionBtn, new LinearLayout.LayoutParams(0, dp(38), 1.2f));
 
         root.addView(footer);
-        d.setContentView(root);
+        d.setContentView(I18n.attach(root));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
             lp.copyFrom(d.getWindow().getAttributes());
             lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.92);
             lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(lp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void showSelectiveUninstallDialog() {
@@ -7906,7 +8517,7 @@ public final class FishbowlActivity extends AppCompatActivity
             }
         }
         if (candidates.isEmpty()) {
-            Toast.makeText(this, "No companion services installed to uninstall.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("No companion services installed to uninstall."), Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -7920,14 +8531,14 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(Color.parseColor("#09090B"), Color.parseColor("#27272A"), dp(1), dp(16)));
+        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(16)));
 
         // Header badge
         TextView badge = new TextView(this);
         badge.setText("STORAGE MANAGEMENT");
         badge.setTextSize(9f);
         badge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        badge.setTextColor(Color.parseColor("#EF4444"));
+        badge.setTextColor(AppTheme.danger());
         badge.setLetterSpacing(0.08f);
         root.addView(badge);
 
@@ -7935,14 +8546,14 @@ public final class FishbowlActivity extends AppCompatActivity
         titleTv.setText("Select Services to Uninstall");
         titleTv.setTextSize(15f);
         titleTv.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        titleTv.setTextColor(Color.WHITE);
+        titleTv.setTextColor(AppTheme.text());
         titleTv.setPadding(0, dp(2), 0, 0);
         root.addView(titleTv);
 
         TextView subTv = new TextView(this);
         subTv.setText("Choose services to remove and reclaim storage:");
         subTv.setTextSize(11f);
-        subTv.setTextColor(Color.parseColor("#A1A1AA"));
+        subTv.setTextColor(AppTheme.textSecondary());
         subTv.setPadding(0, dp(2), 0, dp(12));
         root.addView(subTv);
 
@@ -7951,7 +8562,7 @@ public final class FishbowlActivity extends AppCompatActivity
         selectAllCard.setOrientation(LinearLayout.HORIZONTAL);
         selectAllCard.setGravity(Gravity.CENTER_VERTICAL);
         selectAllCard.setPadding(dp(12), dp(8), dp(12), dp(8));
-        selectAllCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121215"), Color.parseColor("#27272A"), dp(1), dp(10)));
+        selectAllCard.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
         LinearLayout.LayoutParams sacLp = new LinearLayout.LayoutParams(-1, -2);
         sacLp.bottomMargin = dp(10);
         selectAllCard.setLayoutParams(sacLp);
@@ -7964,8 +8575,8 @@ public final class FishbowlActivity extends AppCompatActivity
         selectAllLabel.setText("Select All (" + candidates.size() + " installed)");
         selectAllLabel.setTextSize(11.5f);
         selectAllLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        selectAllLabel.setTextColor(Color.WHITE);
-        selectAllLabel.setPadding(dp(8), 0, 0, 0);
+        selectAllLabel.setTextColor(AppTheme.text());
+        selectAllLabel.setPaddingRelative(dp(8), 0, 0, 0);
         selectAllCard.addView(selectAllLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         selectAllCard.setClickable(true);
@@ -7978,7 +8589,7 @@ public final class FishbowlActivity extends AppCompatActivity
         list.setOrientation(LinearLayout.VERTICAL);
 
         List<CheckBox> itemCbs = new ArrayList<>();
-        Button actionBtn = createPixelButton("UNINSTALL (" + selectedIds.size() + ")", Color.parseColor("#DC2626"), Color.WHITE);
+        Button actionBtn = createPixelButton("UNINSTALL (" + selectedIds.size() + ")", AppTheme.danger(), Color.WHITE);
 
         Runnable updateButtonText = () -> {
             actionBtn.setText("UNINSTALL (" + selectedIds.size() + ")");
@@ -7991,7 +8602,7 @@ public final class FishbowlActivity extends AppCompatActivity
             itemCard.setOrientation(LinearLayout.HORIZONTAL);
             itemCard.setGravity(Gravity.CENTER_VERTICAL);
             itemCard.setPadding(dp(12), dp(10), dp(12), dp(10));
-            itemCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#121215"), Color.parseColor("#27272A"), dp(1), dp(10)));
+            itemCard.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
             LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(-1, -2);
             icLp.bottomMargin = dp(6);
             itemCard.setLayoutParams(icLp);
@@ -7999,7 +8610,7 @@ public final class FishbowlActivity extends AppCompatActivity
             ImageView iconView = new ImageView(this);
             iconView.setImageResource(getServiceIconRes(s.getId()));
             iconView.setPadding(dp(4), dp(4), dp(4), dp(4));
-            iconView.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
+            iconView.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
             itemCard.addView(iconView, new LinearLayout.LayoutParams(dp(32), dp(32)));
 
             LinearLayout textCol = new LinearLayout(this);
@@ -8010,13 +8621,13 @@ public final class FishbowlActivity extends AppCompatActivity
             nameTv.setText(s.getDisplayName());
             nameTv.setTextSize(12f);
             nameTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            nameTv.setTextColor(Color.WHITE);
+            nameTv.setTextColor(AppTheme.text());
             textCol.addView(nameTv);
 
             TextView statusTv = new TextView(this);
             statusTv.setText(s.isRunning() ? "Running â€¢ Port " + s.getManifest().getDefaultPort() : "Stopped");
             statusTv.setTextSize(10f);
-            statusTv.setTextColor(s.isRunning() ? Color.parseColor("#34D399") : Color.parseColor("#71717A"));
+            statusTv.setTextColor(s.isRunning() ? AppTheme.success() : AppTheme.textMuted());
             textCol.addView(statusTv);
 
             itemCard.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -8053,7 +8664,7 @@ public final class FishbowlActivity extends AppCompatActivity
         purgeCard.setOrientation(LinearLayout.HORIZONTAL);
         purgeCard.setGravity(Gravity.CENTER_VERTICAL);
         purgeCard.setPadding(dp(10), dp(8), dp(10), dp(8));
-        purgeCard.setBackground(createBorderedRoundedDrawable(Color.argb(25, 239, 68, 68), Color.parseColor("#7F1D1D"), dp(1), dp(8)));
+        purgeCard.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.danger(), 25), AppTheme.danger(), dp(1), dp(8)));
         LinearLayout.LayoutParams pcLp = new LinearLayout.LayoutParams(-1, -2);
         pcLp.topMargin = dp(8);
         purgeCard.setLayoutParams(pcLp);
@@ -8065,8 +8676,8 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView purgeLabel = new TextView(this);
         purgeLabel.setText("Purge databases, configs & library indices");
         purgeLabel.setTextSize(10.5f);
-        purgeLabel.setTextColor(Color.parseColor("#FCA5A5"));
-        purgeLabel.setPadding(dp(6), 0, 0, 0);
+        purgeLabel.setTextColor(AppTheme.danger());
+        purgeLabel.setPaddingRelative(dp(6), 0, 0, 0);
         purgeCard.addView(purgeLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         purgeCard.setClickable(true);
@@ -8077,7 +8688,7 @@ public final class FishbowlActivity extends AppCompatActivity
         footer.setOrientation(LinearLayout.HORIZONTAL);
         footer.setPadding(0, dp(12), 0, 0);
 
-        Button cancelBtn = createOutlinePixelButton("CANCEL", Color.parseColor("#3F3F46"), Color.parseColor("#A1A1AA"));
+        Button cancelBtn = createOutlinePixelButton("CANCEL", AppTheme.outlineStrong(), AppTheme.textSecondary());
         cancelBtn.setTextSize(10f);
         cancelBtn.setOnClickListener(v -> d.dismiss());
         footer.addView(cancelBtn, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
@@ -8102,17 +8713,17 @@ public final class FishbowlActivity extends AppCompatActivity
         footer.addView(actionBtn, new LinearLayout.LayoutParams(0, dp(38), 1.2f));
 
         root.addView(footer);
-        d.setContentView(root);
+        d.setContentView(I18n.attach(root));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
             lp.copyFrom(d.getWindow().getAttributes());
             lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.92);
             lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(lp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void setupSelectAllListener(CheckBox selectAllCb, List<ManagedService> candidates, List<CheckBox> itemCbs, Set<String> selectedIds, Runnable updateButtonText) {
@@ -8144,19 +8755,67 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void syncAndAutoWireAllServices() {
-        Toast.makeText(this, "Synchronizing media stack...", Toast.LENGTH_SHORT).show();
-        MediaServiceManager.getInstance(this).autoWireStack((success, statusMessage) -> {
-            Toast.makeText(this, statusMessage, Toast.LENGTH_SHORT).show();
+        final MediaServiceManager mgr = MediaServiceManager.getInstance(this);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(4), dp(4), dp(4), dp(4));
+
+        TextView what = new TextView(this);
+        what.setText("What gets synchronized:\n"
+                + "• Download folders and media library folders (Movies / Series / Music)\n"
+                + "• Transmission as the download client in Radarr and Sonarr\n"
+                + "• Prowlarr indexers pushed to Radarr and Sonarr\n"
+                + "• Existing media imported into Radarr / Sonarr\n"
+                + "• API keys between the services\n\n"
+                + "Only services that are installed AND running are synchronized.");
+        what.setTextSize(12f);
+        what.setTextColor(AppTheme.textSecondary());
+        content.addView(what);
+
+        TextView status = new TextView(this);
+        status.setTextSize(12.5f);
+        status.setTextColor(AppTheme.text());
+        status.setTypeface(Typeface.MONOSPACE);
+        status.setPadding(0, dp(12), 0, 0);
+        status.setText("Starting synchronization...");
+        content.addView(status);
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(content);
+        final StringBuilder lines = new StringBuilder();
+        final Dialog[] dRef = new Dialog[1];
+        dRef[0] = showOledDialog("Sync Stack", "Live progress", sv, null, 0, null, "CLOSE", null);
+
+        String[][] known = {{"Transmission","transmission"},{"Radarr","radarr"},{"Sonarr","sonarr"},
+                {"Prowlarr","prowlarr"}};
+        for (String[] k : known) {
+            try {
+                ManagedService svc = mgr.getService(k[1]);
+                if (svc == null || !svc.isInstalled()) continue;
+                lines.append(svc.isRunning() ? "● " : "○ ").append(k[0])
+                        .append(svc.isRunning() ? " running" : " not running (will be skipped)").append("\n");
+            } catch (Throwable ignored) {}
+        }
+        if (lines.length() == 0) lines.append("No companion services are installed.\n");
+        lines.append("\n");
+        status.setText(lines.toString() + "… Working");
+
+        mgr.autoWireStack((success, statusMessage) -> {
+            lines.append("\n").append(success ? "✔ " : "✖ ").append(statusMessage);
+            status.setText(lines.toString());
             refreshServicesTabUI();
             refreshHomeServicesBadge();
+        }, line -> {
+            lines.append(line).append("\n");
+            status.setText(lines.toString());
         });
     }
 
     private void launchMoviesStack() {
-        Toast.makeText(this, "Starting Movies Stack (Radarr + Transmission + Prowlarr + Jackett)...", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, I18n.tr("Starting Movies Stack (Radarr + Transmission + Prowlarr)..."), Toast.LENGTH_SHORT).show();
         new Thread(() -> {
             MediaServiceManager mgr = MediaServiceManager.getInstance(this);
-            String[] servicesToStart = {"transmission", "prowlarr", "jackett", "radarr"};
+            String[] servicesToStart = {"transmission", "prowlarr", "radarr"};
             for (String id : servicesToStart) {
                 ManagedService svc = mgr.getService(id);
                 if (svc != null && svc.isEnabled() && !svc.isRunning() && svc.isInstalled()) {
@@ -8168,16 +8827,16 @@ public final class FishbowlActivity extends AppCompatActivity
             runOnUiThread(() -> {
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-                Toast.makeText(this, "Movies Stack started & wired.", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, I18n.tr("Movies Stack started & wired."), Toast.LENGTH_SHORT).show();
             });
         }).start();
     }
 
     private void launchSeriesStack() {
-        Toast.makeText(this, "Starting TV Shows / Series Stack (Sonarr + Transmission + Prowlarr + Jackett)...", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, I18n.tr("Starting TV Shows / Series Stack (Sonarr + Transmission + Prowlarr)..."), Toast.LENGTH_SHORT).show();
         new Thread(() -> {
             MediaServiceManager mgr = MediaServiceManager.getInstance(this);
-            String[] servicesToStart = {"transmission", "prowlarr", "jackett", "sonarr"};
+            String[] servicesToStart = {"transmission", "prowlarr", "sonarr"};
             for (String id : servicesToStart) {
                 ManagedService svc = mgr.getService(id);
                 if (svc != null && svc.isEnabled() && !svc.isRunning() && svc.isInstalled()) {
@@ -8189,7 +8848,7 @@ public final class FishbowlActivity extends AppCompatActivity
             runOnUiThread(() -> {
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-                Toast.makeText(this, "TV Shows / Series Stack started & wired.", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, I18n.tr("TV Shows / Series Stack started & wired."), Toast.LENGTH_SHORT).show();
             });
         }).start();
     }
@@ -8238,7 +8897,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void exportSanitizedDiagnostics() {
         StringBuilder sb = new StringBuilder();
-        sb.append("=== Fishbowl System Diagnostics ===\n");
+        sb.append("=== Jellyarr System Diagnostics ===\n");
         sb.append("App Version: ").append("1.4.8-beta.1 (101412)\n");
         sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
         sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
@@ -8269,7 +8928,7 @@ public final class FishbowlActivity extends AppCompatActivity
         ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         if (clipboard != null) {
             clipboard.setPrimaryClip(ClipData.newPlainText("fishbowl_diagnostics", sb.toString()));
-            Toast.makeText(this, "Sanitized diagnostics copied to clipboard", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, I18n.tr("Sanitized diagnostics copied to clipboard"), Toast.LENGTH_LONG).show();
         }
     }
 
@@ -8342,130 +9001,210 @@ public final class FishbowlActivity extends AppCompatActivity
 
     // -- Tab 3: Settings View (Professional Grouped Architecture & Storage Bar) ------------
 
+    private FrameLayout settingsRoot;
+    private LinearLayout settingsMenu;
+    private LinearLayout settingsDetail;
+    private LinearLayout settingsDetailBody;
+    private ScrollView settingsDetailScroll;
+    private TextView settingsDetailTitle;
+    private boolean settingsSectionOpen = false;
+
     private View buildSettingsTab() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setVerticalScrollBarEnabled(false);
-        scroll.setHorizontalScrollBarEnabled(false);
-        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        scroll.setSmoothScrollingEnabled(true);
-        scroll.setFillViewport(true);
-        scroll.setBackgroundColor(getBgColor());
+        settingsRoot = new FrameLayout(this);
+        settingsRoot.setBackgroundColor(getBgColor());
 
-        LinearLayout layout = new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(dp(20), dp(14), dp(20), dp(110));
+        // ---- Menu page: one row per section ----
+        ScrollView menuScroll = new ScrollView(this);
+        menuScroll.setVerticalScrollBarEnabled(false);
+        menuScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        settingsMenu = new LinearLayout(this);
+        settingsMenu.setOrientation(LinearLayout.VERTICAL);
+        settingsMenu.setPadding(dp(16), dp(12), dp(16), dp(110));
 
-        // -- Settings Page Header ---------------------------------
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(0, dp(4), 0, dp(14));
+        settingsMenu.addView(UiKit.header(this, "Settings", "Tap a section to open it.", null));
 
-        TextView title = new TextView(this);
-        title.setText("SETTINGS");
-        title.setTextSize(18);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#F4F4F5"));
-        header.addView(title);
+        addSettingsGroupHeader("PERSONALIZE");
+        addSettingsMenuRow("Appearance", appearanceSummary(), buildAppearanceSection());
 
-        TextView sub = new TextView(this);
-        sub.setText("System configuration, storage breakdown, and preferences.");
-        sub.setTextSize(11);
-        sub.setTextColor(Color.parseColor("#71717A"));
-        sub.setPadding(0, dp(2), 0, 0);
-        header.addView(sub);
+        addSettingsGroupHeader("SERVER");
+        addSettingsMenuRow("General & Startup", "Auto-start, keep screen on, media stack", buildGeneralSection());
+        addSettingsMenuRow("Automation", "Transmission cleanup, auto-recheck, Wi-Fi only", buildAutomationSection());
+        addSettingsMenuRow("Playback & Streaming", "Codecs and transcoding", buildStreamingSection());
+        addSettingsMenuRow("Movie Importer", "Downloads and folder organizer", buildMovieImporterSection());
 
-        layout.addView(header);
+        addSettingsGroupHeader("DEVICE & SECURITY");
+        addSettingsMenuRow("Storage", "Jellyarr footprint and disk usage", buildStorageSection());
+        addSettingsMenuRow("Permissions & Health", "Background survival and system permissions", buildPermissionsSection());
+        addSettingsMenuRow("Security & Identity", "Jellyfin users and service identity", buildSecuritySection());
+        addSettingsMenuRow("Diagnostics", "Health checks and crash reports", buildDiagnosticsSection());
 
-        // Section 1: GENERAL & STARTUP (At top as requested)
-        layout.addView(buildGeneralSection());
+        addSettingsGroupHeader("MAINTENANCE");
+        addSettingsMenuRow("Software Updates", "Check for new versions", buildUpdatesSection());
+        addSettingsMenuRow("Backup & Restore", "Save and restore your configuration", buildBackupRestoreSection());
+        addSettingsMenuRow("About Jellyarr", "Specs, architecture and licenses", buildAboutSection());
 
-        // Section 2: FISHBOWL STORAGE (Hardware runtime & app footprint)
-        layout.addView(buildStorageSection());
-
-        // Section 3: PERMISSIONS & SYSTEM HEALTH (Drawer)
-        layout.addView(buildPermissionsSection());
-
-        // Section: SECURITY & SERVICE IDENTITY (Drawer)
-        layout.addView(buildSecuritySection());
-
-        // Section: DIAGNOSTICS CENTRE
-        layout.addView(buildDiagnosticsSection());
-
-        // Section 4: PLAYBACK & STREAMING CODECS (Drawer)
-        layout.addView(buildStreamingSection());
-
-        // Section 5: SOFTWARE UPDATES (Drawer)
-        layout.addView(buildUpdatesSection());
-
-        // Section 6: BACKUP & RESTORE (Drawer)
-        layout.addView(buildBackupRestoreSection());
-
-        // Section 7: MOVIE IMPORTER (Drawer - Downloads & Folder Organizer)
-        layout.addView(buildMovieImporterSection());
-
-        // Section 8: ABOUT FISHBOWL (Drawer - Specs, Architecture & Licenses)
-        layout.addView(buildAboutSection());
-
-        // Community & GitHub Issue Actions (Directly outside any card/box)
+        // Community actions
         LinearLayout communityRow = new LinearLayout(this);
         communityRow.setOrientation(LinearLayout.HORIZONTAL);
         communityRow.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams cParams = new LinearLayout.LayoutParams(-1, -2);
-        cParams.topMargin = dp(4);
-        cParams.bottomMargin = dp(14);
+        cParams.topMargin = dp(8);
         communityRow.setLayoutParams(cParams);
 
-        Button btnGithub = createPixelButton("GITHUB", getSurfaceElevatedColor(), getPrimaryTextColor());
-        btnGithub.setTextSize(10f);
+        Button btnGithub = UiKit.outline(this, "GitHub", null);
         btnGithub.setOnClickListener(v -> {
             try {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Suz41/Fishbowl")));
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/MedRAM-RAM/Jellyarr")));
             } catch (Throwable t) {
-                Toast.makeText(this, "Could not open browser: https://github.com/Suz41/Fishbowl", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr("Could not open browser: https://github.com/MedRAM-RAM/Jellyarr"), Toast.LENGTH_LONG).show();
             }
         });
-        communityRow.addView(btnGithub, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
-
-        View comSp = new View(this);
-        communityRow.addView(comSp, new LinearLayout.LayoutParams(dp(10), 1));
-
-        Button btnReport = createPixelButton("REPORT A BUG", getSurfaceElevatedColor(), getAccentColor());
-        btnReport.setTextSize(10f);
+        communityRow.addView(btnGithub, new LinearLayout.LayoutParams(0, dp(42), 1.0f));
+        communityRow.addView(new View(this), new LinearLayout.LayoutParams(dp(12), 1));
+        Button btnReport = UiKit.tonal(this, buttonLabel("REPORT A BUG"), null);
         btnReport.setOnClickListener(v -> com.fishbowl.app.diagnostics.BugReportHelper.openBugReportFlow(this, null, null));
-        communityRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
+        communityRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(42), 1.0f));
+        settingsMenu.addView(communityRow);
 
-        layout.addView(communityRow);
+        menuScroll.addView(settingsMenu);
+        settingsRoot.addView(menuScroll, new FrameLayout.LayoutParams(-1, -1));
 
-        scroll.addView(layout);
+        // ---- Detail page: back bar + one section ----
+        settingsDetail = new LinearLayout(this);
+        settingsDetail.setOrientation(LinearLayout.VERTICAL);
+        settingsDetail.setBackgroundColor(getBgColor());
+        settingsDetail.setVisibility(View.GONE);
+
+        // Compact top bar: back-arrow icon button (mirrored in RTL) + section title
+        LinearLayout bar = UiKit.row(this);
+        bar.setPaddingRelative(dp(8), dp(6), dp(16), dp(6));
+        ImageView back = new ImageView(this);
+        back.setImageResource(R.drawable.ic_back);
+        back.setColorFilter(AppTheme.text());
+        back.setScaleType(ImageView.ScaleType.CENTER);
+        back.setContentDescription("Back");
+        back.setClickable(true);
+        back.setFocusable(true);
+        back.setBackground(UiKit.rowRipple(this));
+        if (isRtlLayout()) back.setScaleX(-1f);   // ic_back is not auto-mirrored
+        back.setOnClickListener(v -> closeSettingsSection());
+        bar.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        settingsDetailTitle = UiKit.singleLine(UiKit.title(this, ""));
+        settingsDetailTitle.setTextSize(18f);
+        settingsDetailTitle.setPaddingRelative(dp(8), 0, 0, 0);
+        bar.addView(settingsDetailTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        settingsDetail.addView(bar);
+
+        settingsDetailScroll = new ScrollView(this);
+        settingsDetailScroll.setVerticalScrollBarEnabled(false);
+        settingsDetailScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        settingsDetailBody = new LinearLayout(this);
+        settingsDetailBody.setOrientation(LinearLayout.VERTICAL);
+        settingsDetailBody.setPadding(dp(16), dp(8), dp(16), dp(110));
+        settingsDetailScroll.addView(settingsDetailBody);
+        settingsDetail.addView(settingsDetailScroll, new LinearLayout.LayoutParams(-1, 0, 1.0f));
+        settingsRoot.addView(settingsDetail, new FrameLayout.LayoutParams(-1, -1));
+
         refreshStorageBar();
-        return scroll;
+        return settingsRoot;
+    }
+
+    private final java.util.HashMap<String, View> settingsSectionViews = new java.util.HashMap<>();
+
+    private void openSettingsSectionByName(String name) {
+        View v = settingsSectionViews.get(name);
+        if (v == null) return;
+        activeTab = 3;
+        updateBottomNavSelection();
+        renderActiveTab();
+        openSettingsSection(name, v);
+    }
+
+    private String settingsOpenName = null;
+
+    private void addSettingsGroupHeader(String title) {
+        TextView tv = new TextView(this);
+        tv.setText(title);
+        styleSectionLabel(tv);
+        tv.setPadding(dp(4), dp(16), dp(4), dp(8));
+        settingsMenu.addView(tv);
+    }
+
+    private void addSettingsMenuRow(final String name, String subtitle, final View sectionView) {
+        settingsSectionViews.put(name, sectionView);
+        UiStyle.styleAllSwitches(this, sectionView);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPaddingRelative(dp(16), dp(14), dp(12), dp(14));
+        row.setBackground(UiKit.pressable(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+        row.setClickable(true);
+        row.setFocusable(true);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView t = UiKit.subtitle(this, name);
+        t.setTextSize(15f);
+        t.setTypeface(UiKit.BOLD);
+        col.addView(t);
+        TextView st = UiKit.caption(this, subtitle);
+        st.setPadding(0, dp(2), 0, 0);
+        col.addView(st);
+        row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        ImageView arrow = new ImageView(this);
+        arrow.setImageResource(R.drawable.ic_chevron_down);
+        arrow.setColorFilter(AppTheme.textMuted());
+        arrow.setRotation(isRtlLayout() ? 90f : -90f);   // points toward the reading end in LTR and RTL
+        row.addView(arrow, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        row.setOnClickListener(v -> openSettingsSection(name, sectionView));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.bottomMargin = dp(8);
+        settingsMenu.addView(row, lp);
+    }
+
+    private void openSettingsSection(String name, View sectionView) {
+        if (settingsDetailBody == null) return;
+        settingsDetailBody.removeAllViews();
+        if (sectionView.getParent() instanceof ViewGroup) ((ViewGroup) sectionView.getParent()).removeView(sectionView);
+        settingsDetailBody.addView(sectionView);
+        settingsDetailTitle.setText(name);
+        settingsOpenName = name;
+        settingsDetailScroll.scrollTo(0, 0);
+        try {
+            if ("Permissions & Health".equals(name)) refreshPermissionsUI();
+            else if ("Security & Identity".equals(name)) refreshSecurityUsersUI();
+            else if ("Backup & Restore".equals(name)) updateBackupStatusUI();
+        } catch (Throwable ignored) {}
+        settingsMenu.getParent();
+        ((View) settingsMenu.getParent()).setVisibility(View.GONE);
+        settingsDetail.setVisibility(View.VISIBLE);
+        settingsSectionOpen = true;
+    }
+
+    private boolean closeSettingsSection() {
+        if (!settingsSectionOpen || settingsDetail == null) return false;
+        settingsDetail.setVisibility(View.GONE);
+        ((View) settingsMenu.getParent()).setVisibility(View.VISIBLE);
+        settingsDetailBody.removeAllViews();
+        settingsOpenName = null;
+        settingsSectionOpen = false;
+        return true;
     }
 
     private LinearLayout createSettingsSectionCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(createRoundedDrawable(Color.parseColor("#0C0D10"), dp(12)));
-        card.setPadding(dp(16), dp(12), dp(16), dp(12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.bottomMargin = dp(14);
-        card.setLayoutParams(lp);
-        return card;
+        return UiKit.card(this);
     }
 
     private TextView createSettingsSectionHeader(String title) {
         TextView tv = new TextView(this);
         tv.setText(title);
-        tv.setTextSize(10.5f);
-        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        tv.setTextColor(Color.parseColor("#71717A"));
-        tv.setLetterSpacing(0.08f);
-        tv.setPadding(dp(4), dp(6), 0, dp(6));
+        styleSectionLabel(tv);
+        tv.setPaddingRelative(dp(4), dp(6), 0, dp(6));
         return tv;
     }
 
     private View createSettingsDivider() {
         View v = new View(this);
-        v.setBackgroundColor(Color.argb(12, 255, 255, 255));
+        v.setBackgroundColor(AppTheme.outline());
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(1));
         lp.topMargin = dp(10);
         lp.bottomMargin = dp(10);
@@ -8477,9 +9216,10 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(4), 0, dp(4));
+        row.setPadding(dp(4), dp(8), dp(4), dp(8));
         row.setClickable(true);
         row.setFocusable(true);
+        row.setBackground(UiKit.rowRipple(this));
         if (onClick != null) row.setOnClickListener(onClick);
 
         LinearLayout textCol = new LinearLayout(this);
@@ -8489,14 +9229,14 @@ public final class FishbowlActivity extends AppCompatActivity
         tView.setText(title);
         tView.setTextSize(13.5f);
         tView.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        tView.setTextColor(Color.parseColor("#F4F4F5"));
+        tView.setTextColor(AppTheme.text());
         textCol.addView(tView);
 
         if (subtitle != null && !subtitle.isEmpty()) {
             TextView sView = new TextView(this);
             sView.setText(subtitle);
             sView.setTextSize(11f);
-            sView.setTextColor(Color.parseColor("#71717A"));
+            sView.setTextColor(AppTheme.textMuted());
             sView.setPadding(0, dp(2), 0, 0);
             textCol.addView(sView);
         }
@@ -8504,11 +9244,11 @@ public final class FishbowlActivity extends AppCompatActivity
         row.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         TextView chevron = new TextView(this);
-        chevron.setText("›");
+        chevron.setText("›");   // bidi-mirrored glyph: renders as ‹ in RTL automatically
         chevron.setTextSize(18f);
         chevron.setTypeface(Typeface.DEFAULT_BOLD);
-        chevron.setTextColor(Color.parseColor("#71717A"));
-        chevron.setPadding(dp(8), 0, dp(4), 0);
+        chevron.setTextColor(AppTheme.textMuted());
+        chevron.setPaddingRelative(dp(8), 0, dp(4), 0);
         row.addView(chevron);
 
         return row;
@@ -8525,23 +9265,23 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout card = createSettingsSectionCard();
 
         storageHeaderTitle = new TextView(this);
-        storageHeaderTitle.setText("Fishbowl Storage");
+        storageHeaderTitle.setText("Jellyarr Storage");
         storageHeaderTitle.setTextSize(20f);
         storageHeaderTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        storageHeaderTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        storageHeaderTitle.setTextColor(AppTheme.text());
         card.addView(storageHeaderTitle);
 
         storageHeaderSubtitle = new TextView(this);
         storageHeaderSubtitle.setText("Calculating storage breakdown...");
         storageHeaderSubtitle.setTextSize(11f);
-        storageHeaderSubtitle.setTextColor(Color.parseColor("#71717A"));
+        storageHeaderSubtitle.setTextColor(AppTheme.textMuted());
         storageHeaderSubtitle.setPadding(0, dp(2), 0, dp(10));
         card.addView(storageHeaderSubtitle);
 
         // Segmented Storage Bar (100% of Fishbowl used)
         storageBarContainer = new LinearLayout(this);
         storageBarContainer.setOrientation(LinearLayout.HORIZONTAL);
-        storageBarContainer.setBackground(createRoundedDrawable(Color.parseColor("#18181B"), dp(5)));
+        storageBarContainer.setBackground(createRoundedDrawable(AppTheme.inner(), dp(5)));
         storageBarContainer.setPadding(dp(2), dp(2), dp(2), dp(2));
         LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(-1, dp(10));
         barLp.bottomMargin = dp(12);
@@ -8561,7 +9301,7 @@ public final class FishbowlActivity extends AppCompatActivity
         actionRow.setOrientation(LinearLayout.HORIZONTAL);
         actionRow.setPadding(0, dp(6), 0, dp(2));
 
-        Button btnManage = createPixelButton("MANAGE STORAGE", Color.parseColor("#18191E"), Color.parseColor("#F4F4F5"));
+        Button btnManage = createPixelButton("MANAGE STORAGE", AppTheme.inner(), AppTheme.text());
         btnManage.setTextSize(10f);
         btnManage.setOnClickListener(v -> startActivity(new Intent(this, JellyfinStorageActivity.class)));
         actionRow.addView(btnManage, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
@@ -8569,7 +9309,7 @@ public final class FishbowlActivity extends AppCompatActivity
         View aSpacer = new View(this);
         actionRow.addView(aSpacer, new LinearLayout.LayoutParams(dp(8), 1));
 
-        Button btnClear = createPixelButton("CLEAR CACHE", Color.parseColor("#1C1014"), Color.parseColor("#FDA4AF"));
+        Button btnClear = createPixelButton("CLEAR CACHE", AppTheme.dangerContainer(), AppTheme.danger());
         btnClear.setTextSize(10f);
         btnClear.setOnClickListener(v -> showClearCacheConfirmation());
         actionRow.addView(btnClear, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
@@ -8682,7 +9422,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
             ImageView driveIcon = new ImageView(this);
             driveIcon.setImageResource(R.drawable.ic_storage);
-            driveIcon.setColorFilter(Color.parseColor("#10B981"));
+            driveIcon.setColorFilter(AppTheme.success());
             headerRow.addView(driveIcon, new LinearLayout.LayoutParams(dp(26), dp(26)));
 
             View hSpacer = new View(this);
@@ -8694,13 +9434,13 @@ public final class FishbowlActivity extends AppCompatActivity
             dName.setText(drive.name != null ? drive.name : "External Drive");
             dName.setTextSize(14.5f);
             dName.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            dName.setTextColor(Color.parseColor("#F4F4F5"));
+            dName.setTextColor(AppTheme.text());
             titleCol.addView(dName);
 
             TextView dPath = new TextView(this);
             dPath.setText(drive.rootPath != null ? drive.rootPath : "/storage");
             dPath.setTextSize(11f);
-            dPath.setTextColor(Color.parseColor("#71717A"));
+            dPath.setTextColor(AppTheme.textMuted());
             titleCol.addView(dPath);
             headerRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
@@ -8711,8 +9451,8 @@ public final class FishbowlActivity extends AppCompatActivity
             statusBadge.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
             statusBadge.setPadding(dp(8), dp(3), dp(8), dp(3));
             statusBadge.setBackground(createRoundedDrawable(
-                    isReadOnly ? Color.parseColor("#332200") : Color.parseColor("#06331C"), dp(4)));
-            statusBadge.setTextColor(isReadOnly ? Color.parseColor("#F59E0B") : Color.parseColor("#10B981"));
+                    isReadOnly ? AppTheme.warningContainer() : AppTheme.successContainer(), dp(4)));
+            statusBadge.setTextColor(isReadOnly ? AppTheme.warning() : AppTheme.success());
             headerRow.addView(statusBadge);
 
             card.addView(headerRow);
@@ -8730,7 +9470,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 statsTv.setText("Storage capacity: Ready • Direct mount");
             }
             statsTv.setTextSize(11.5f);
-            statsTv.setTextColor(Color.parseColor("#A1A1AA"));
+            statsTv.setTextColor(AppTheme.textSecondary());
             statsTv.setPadding(0, dp(10), 0, dp(6));
             card.addView(statsTv);
 
@@ -8738,20 +9478,20 @@ public final class FishbowlActivity extends AppCompatActivity
             if (total > 0) {
                 LinearLayout barCont = new LinearLayout(this);
                 barCont.setOrientation(LinearLayout.HORIZONTAL);
-                barCont.setBackground(createRoundedDrawable(Color.parseColor("#18181B"), dp(5)));
+                barCont.setBackground(createRoundedDrawable(AppTheme.inner(), dp(5)));
                 barCont.setPadding(dp(2), dp(2), dp(2), dp(2));
                 LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(-1, dp(8));
                 bLp.bottomMargin = dp(10);
                 barCont.setLayoutParams(bLp);
 
-                addBarSegment(barCont, used, total, Color.parseColor("#10B981"));
+                addBarSegment(barCont, used, total, AppTheme.success());
                 card.addView(barCont);
             }
 
             // Row 4: Anti-Corruption Guard Shield Banner
             LinearLayout shieldBox = new LinearLayout(this);
             shieldBox.setOrientation(LinearLayout.VERTICAL);
-            shieldBox.setBackground(createBorderedRoundedDrawable(Color.parseColor("#071912"), Color.parseColor("#0F3D2A"), dp(1), dp(8)));
+            shieldBox.setBackground(createBorderedRoundedDrawable(AppTheme.successContainer(), AppTheme.successContainer(), dp(1), dp(8)));
             shieldBox.setPadding(dp(12), dp(8), dp(12), dp(8));
             LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(-1, -2);
             sLp.bottomMargin = dp(10);
@@ -8761,13 +9501,13 @@ public final class FishbowlActivity extends AppCompatActivity
             shieldTitle.setText("ANTI-CORRUPTION GUARD ACTIVE");
             shieldTitle.setTextSize(10f);
             shieldTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            shieldTitle.setTextColor(Color.parseColor("#34D399"));
+            shieldTitle.setTextColor(AppTheme.success());
             shieldBox.addView(shieldTitle);
 
             TextView shieldSub = new TextView(this);
             shieldSub.setText("Buffered atomic writes protect FAT/exFAT tables. Safe Sync commits all buffers to disk.");
             shieldSub.setTextSize(10.5f);
-            shieldSub.setTextColor(Color.parseColor("#94A3B8"));
+            shieldSub.setTextColor(AppTheme.textSecondary());
             shieldSub.setPadding(0, dp(2), 0, 0);
             shieldBox.addView(shieldSub);
 
@@ -8777,7 +9517,7 @@ public final class FishbowlActivity extends AppCompatActivity
             LinearLayout actRow = new LinearLayout(this);
             actRow.setOrientation(LinearLayout.HORIZONTAL);
 
-            Button btnSync = createPixelButton("SAFE FLUSH & SYNC", Color.parseColor("#132F23"), Color.parseColor("#34D399"));
+            Button btnSync = createPixelButton("SAFE FLUSH & SYNC", AppTheme.successContainer(), AppTheme.success());
             btnSync.setTextSize(10f);
             btnSync.setOnClickListener(v -> {
                 btnSync.setEnabled(false);
@@ -8787,7 +9527,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     runOnUiThread(() -> {
                         btnSync.setEnabled(true);
                         btnSync.setText("SAFE FLUSH & SYNC");
-                        Toast.makeText(this, ok ? "Storage buffers synced safely! Safe to unmount when idle." : "Storage sync completed.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, I18n.tr(ok ? "Storage buffers synced safely! Safe to unmount when idle." : "Storage sync completed."), Toast.LENGTH_SHORT).show();
                     });
                 }).start();
             });
@@ -8796,7 +9536,7 @@ public final class FishbowlActivity extends AppCompatActivity
             View aSp = new View(this);
             actRow.addView(aSp, new LinearLayout.LayoutParams(dp(8), 1));
 
-            Button btnOpenMgr = createPixelButton("MANAGE DRIVE", Color.parseColor("#18191E"), Color.parseColor("#F4F4F5"));
+            Button btnOpenMgr = createPixelButton("MANAGE DRIVE", AppTheme.inner(), AppTheme.text());
             btnOpenMgr.setTextSize(10f);
             btnOpenMgr.setOnClickListener(v -> startActivity(new Intent(this, JellyfinStorageActivity.class)));
             actRow.addView(btnOpenMgr, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
@@ -8824,20 +9564,20 @@ public final class FishbowlActivity extends AppCompatActivity
             // 1. Companion Runtimes (Amber)
             // 2. Jellyfin Server & DB (Violet)
             // 3. Cache & Logs (Rose)
-            addBarSegment(storageBarContainer, runtimeBytes, displayTotal, Color.parseColor("#F59E0B")); // Amber
+            addBarSegment(storageBarContainer, runtimeBytes, displayTotal, AppTheme.warning()); // Amber
             addBarSegment(storageBarContainer, dataBytes, displayTotal, Color.parseColor("#8B5CF6"));    // Violet
-            addBarSegment(storageBarContainer, cacheBytes, displayTotal, Color.parseColor("#F43F5E"));   // Rose
+            addBarSegment(storageBarContainer, cacheBytes, displayTotal, AppTheme.danger());   // Rose
         }
 
         if (storageLegendContainer != null) {
             storageLegendContainer.removeAllViews();
 
             View compItem = createStorageBreakdownItem(
-                    Color.parseColor("#F59E0B"), "Companion Runtimes & Binaries",
+                    AppTheme.warning(), "Companion Runtimes & Binaries",
                     "Core packages (.NET 10, Python, FFmpeg, Servarr) • Tap for details", runtimeBytes, totalHardwareUsed);
             compItem.setClickable(true);
             compItem.setFocusable(true);
-            compItem.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, Color.argb(18, 255, 255, 255), dp(1), dp(6)));
+            compItem.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, AppTheme.outline(), dp(1), dp(6)));
             compItem.setPadding(dp(6), dp(4), dp(6), dp(4));
             compItem.setOnClickListener(v -> showCompanionStorageBreakdownDialog());
             storageLegendContainer.addView(compItem);
@@ -8848,18 +9588,18 @@ public final class FishbowlActivity extends AppCompatActivity
                     "SQLite metadata, posters, and user watch history • Tap for details", dataBytes, totalHardwareUsed);
             jfItem.setClickable(true);
             jfItem.setFocusable(true);
-            jfItem.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, Color.argb(18, 255, 255, 255), dp(1), dp(6)));
+            jfItem.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, AppTheme.outline(), dp(1), dp(6)));
             jfItem.setPadding(dp(6), dp(4), dp(6), dp(4));
             jfItem.setOnClickListener(v -> showJellyfinDatabaseBreakdownDialog());
             storageLegendContainer.addView(jfItem);
             storageLegendContainer.addView(createSettingsDivider());
 
             View cacheItem = createStorageBreakdownItem(
-                    Color.parseColor("#F43F5E"), "Cache, Transcodes & Logs",
+                    AppTheme.danger(), "Cache, Transcodes & Logs",
                     "FFmpeg transcoding buffer, HTTP cache, and logs • Tap for details", cacheBytes, totalHardwareUsed);
             cacheItem.setClickable(true);
             cacheItem.setFocusable(true);
-            cacheItem.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, Color.argb(18, 255, 255, 255), dp(1), dp(6)));
+            cacheItem.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, AppTheme.outline(), dp(1), dp(6)));
             cacheItem.setPadding(dp(6), dp(4), dp(6), dp(4));
             cacheItem.setOnClickListener(v -> showCacheStorageBreakdownDialog());
             storageLegendContainer.addView(cacheItem);
@@ -8908,15 +9648,11 @@ public final class FishbowlActivity extends AppCompatActivity
                 long radarrBytes = calculateDirSize(new File(servicesDir, "radarr"));
                 long sonarrBytes = calculateDirSize(new File(servicesDir, "sonarr"));
                 long prowlarrBytes = calculateDirSize(new File(servicesDir, "prowlarr"));
-                long jackettBytes = calculateDirSize(new File(servicesDir, "jackett"));
-                long lidarrBytes = calculateDirSize(new File(servicesDir, "lidarr"));
-                long bazarrBytes = calculateDirSize(new File(servicesDir, "bazarr"));
-                long seerrBytes = calculateDirSize(new File(servicesDir, "seerr"));
 
                 File radarrBak = new File(servicesDir, "radarr.bak");
                 long radarrBakBytes = radarrBak.exists() ? calculateDirSize(radarrBak) : 0;
 
-                long totalBytes = usrBytes + radarrBytes + sonarrBytes + prowlarrBytes + jackettBytes + lidarrBytes + bazarrBytes + seerrBytes + radarrBakBytes;
+                long totalBytes = usrBytes + radarrBytes + sonarrBytes + prowlarrBytes + radarrBakBytes;
 
                 runOnUiThread(() -> {
                     progress.dismiss();
@@ -8929,7 +9665,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     sub.setText("Total Companion & Runtime Footprint: " + MediaStorageManager.formatBytes(totalBytes));
                     sub.setTextSize(11f);
                     sub.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    sub.setTextColor(Color.parseColor("#F59E0B"));
+                    sub.setTextColor(AppTheme.warning());
                     sub.setPadding(0, 0, 0, dp(12));
                     content.addView(sub);
 
@@ -8950,50 +9686,34 @@ public final class FishbowlActivity extends AppCompatActivity
                         content.addView(createSettingsDivider());
                     }
                     if (baseSysBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#71717A"), "Base Linux System & Packages", "Shell tools, shared libraries & utilities (/usr)", baseSysBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.textMuted(), "Base Linux System & Packages", "Shell tools, shared libraries & utilities (/usr)", baseSysBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
 
                     if (radarrBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#FF9E20"), "Radarr (Movies Manager)", "/services/radarr", radarrBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.warning(), "Radarr (Movies Manager)", "/services/radarr", radarrBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
                     if (sonarrBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#CCFBFA"), "Sonarr (TV Shows Manager)", "/services/sonarr", sonarrBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.success(), "Sonarr (TV Shows Manager)", "/services/sonarr", sonarrBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
                     if (prowlarrBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#FFFC8C"), "Prowlarr (Indexer Proxy)", "/services/prowlarr", prowlarrBytes, totalBytes));
-                        content.addView(createSettingsDivider());
-                    }
-                    if (jackettBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#F97316"), "Jackett (Indexer Proxy)", "/services/jackett", jackettBytes, totalBytes));
-                        content.addView(createSettingsDivider());
-                    }
-                    if (lidarrBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#769826"), "Lidarr (Music Manager)", "/services/lidarr", lidarrBytes, totalBytes));
-                        content.addView(createSettingsDivider());
-                    }
-                    if (bazarrBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#5D9253"), "Bazarr (Subtitles Engine)", "/services/bazarr", bazarrBytes, totalBytes));
-                        content.addView(createSettingsDivider());
-                    }
-                    if (seerrBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#55A9A0"), "Seerr (Media Requests)", "/services/seerr", seerrBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.warning(), "Prowlarr (Indexer Proxy)", "/services/prowlarr", prowlarrBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
 
                     if (radarrBakBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#EF4444"), "Radarr Backup (.bak)", "Old installation backup file/folder", radarrBakBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.danger(), "Radarr Backup (.bak)", "Old installation backup file/folder", radarrBakBytes, totalBytes));
                         content.addView(createSettingsDivider());
 
-                        Button btnCleanBak = createOutlinePixelButton("RECLAIM " + MediaStorageManager.formatBytes(radarrBakBytes) + " (DELETE .BAK)", Color.parseColor("#EF4444"), Color.parseColor("#EF4444"));
+                        Button btnCleanBak = createOutlinePixelButton("RECLAIM " + MediaStorageManager.formatBytes(radarrBakBytes) + " (DELETE .BAK)", AppTheme.danger(), AppTheme.danger());
                         btnCleanBak.setTextSize(10f);
                         btnCleanBak.setOnClickListener(v -> {
                             new Thread(() -> {
                                 MediaServiceManager.deleteRecursive(radarrBak);
                                 runOnUiThread(() -> {
-                                    Toast.makeText(this, "Cleaned backup files! " + MediaStorageManager.formatBytes(radarrBakBytes) + " reclaimed.", Toast.LENGTH_LONG).show();
+                                    Toast.makeText(this, I18n.tr("Cleaned backup files! " + MediaStorageManager.formatBytes(radarrBakBytes) + " reclaimed."), Toast.LENGTH_LONG).show();
                                     refreshStorageBar();
                                 });
                             }).start();
@@ -9008,7 +9728,7 @@ public final class FishbowlActivity extends AppCompatActivity
             } catch (Throwable t) {
                 runOnUiThread(() -> {
                     progress.dismiss();
-                    Toast.makeText(this, "Failed to analyze storage: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Failed to analyze storage: " + t.getMessage()), Toast.LENGTH_SHORT).show();
                 });
             }
         }).start();
@@ -9080,7 +9800,7 @@ public final class FishbowlActivity extends AppCompatActivity
                         content.addView(createSettingsDivider());
                     }
                     if (finalApkBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#71717A"), "App Package & Native Engines", "Base Android APK and bundled native architecture libraries", finalApkBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.textMuted(), "App Package & Native Engines", "Base Android APK and bundled native architecture libraries", finalApkBytes, totalBytes));
                     }
 
                     showOledDialog("Jellyfin Server & Databases", "Itemized breakdown of Jellyfin server core data and databases", content, null, 0, null, "CLOSE", null);
@@ -9088,7 +9808,7 @@ public final class FishbowlActivity extends AppCompatActivity
             } catch (Throwable t) {
                 runOnUiThread(() -> {
                     progress.dismiss();
-                    Toast.makeText(this, "Failed to analyze databases: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Failed to analyze databases: " + t.getMessage()), Toast.LENGTH_SHORT).show();
                 });
             }
         }).start();
@@ -9123,28 +9843,28 @@ public final class FishbowlActivity extends AppCompatActivity
                     sub.setText("Total Temporary & Cache Footprint: " + MediaStorageManager.formatBytes(totalBytes));
                     sub.setTextSize(11f);
                     sub.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    sub.setTextColor(Color.parseColor("#F43F5E"));
+                    sub.setTextColor(AppTheme.danger());
                     sub.setPadding(0, dp(2), 0, dp(12));
                     content.addView(sub);
 
                     if (transcodeBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#F43F5E"), "Active Transcoding Buffer", "Temporary HLS video fragments, transcoded audio & video chunks", transcodeBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.danger(), "Active Transcoding Buffer", "Temporary HLS video fragments, transcoded audio & video chunks", transcodeBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
                     if (webCacheBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#FB7185"), "Web & Metadata API Cache", "Cached TheMovieDB / Fanart.tv requests & Web UI assets", webCacheBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.danger(), "Web & Metadata API Cache", "Cached TheMovieDB / Fanart.tv requests & Web UI assets", webCacheBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
                     if (logBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#E11D48"), "Server Execution Logs", "Jellyfin runtime logs tracking playback sessions and system events", logBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.danger(), "Server Execution Logs", "Jellyfin runtime logs tracking playback sessions and system events", logBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
                     if (appCacheBytes > 0) {
-                        content.addView(createStorageBreakdownItem(Color.parseColor("#9F1239"), "Internal App WebView Cache", "Android WebView cache, temporary thumbnail rendering cache", appCacheBytes, totalBytes));
+                        content.addView(createStorageBreakdownItem(AppTheme.danger(), "Internal App WebView Cache", "Android WebView cache, temporary thumbnail rendering cache", appCacheBytes, totalBytes));
                         content.addView(createSettingsDivider());
                     }
 
-                    Button btnClear = createOutlinePixelButton("PURGE TEMPORARY CACHE (" + MediaStorageManager.formatBytes(totalBytes) + ")", Color.parseColor("#F43F5E"), Color.parseColor("#F43F5E"));
+                    Button btnClear = createOutlinePixelButton("PURGE TEMPORARY CACHE (" + MediaStorageManager.formatBytes(totalBytes) + ")", AppTheme.danger(), AppTheme.danger());
                     btnClear.setTextSize(10.5f);
                     btnClear.setOnClickListener(v -> showClearCacheConfirmation());
                     LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, dp(38));
@@ -9156,7 +9876,7 @@ public final class FishbowlActivity extends AppCompatActivity
             } catch (Throwable t) {
                 runOnUiThread(() -> {
                     progress.dismiss();
-                    Toast.makeText(this, "Failed to analyze cache: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Failed to analyze cache: " + t.getMessage()), Toast.LENGTH_SHORT).show();
                 });
             }
         }).start();
@@ -9170,7 +9890,7 @@ public final class FishbowlActivity extends AppCompatActivity
         View segment = new View(this);
         segment.setBackgroundColor(color);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -1, weight);
-        lp.rightMargin = dp(1);
+        lp.setMarginEnd(dp(1));
         segment.setLayoutParams(lp);
         parent.addView(segment);
     }
@@ -9184,7 +9904,7 @@ public final class FishbowlActivity extends AppCompatActivity
         View dot = new View(this);
         dot.setBackground(createRoundedDrawable(color, dp(4)));
         LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(8), dp(8));
-        dotLp.rightMargin = dp(10);
+        dotLp.setMarginEnd(dp(10));
         item.addView(dot, dotLp);
 
         LinearLayout textCol = new LinearLayout(this);
@@ -9194,14 +9914,14 @@ public final class FishbowlActivity extends AppCompatActivity
         titleTv.setText(title);
         titleTv.setTextSize(13f);
         titleTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        titleTv.setTextColor(Color.parseColor("#F4F4F5"));
+        titleTv.setTextColor(AppTheme.text());
         textCol.addView(titleTv);
 
         if (subtitle != null && !subtitle.isEmpty()) {
             TextView subTv = new TextView(this);
             subTv.setText(subtitle);
             subTv.setTextSize(10.5f);
-            subTv.setTextColor(Color.parseColor("#71717A"));
+            subTv.setTextColor(AppTheme.textMuted());
             subTv.setPadding(0, dp(1), 0, 0);
             textCol.addView(subTv);
         }
@@ -9215,14 +9935,14 @@ public final class FishbowlActivity extends AppCompatActivity
         valTv.setText(MediaStorageManager.formatBytes(bytes));
         valTv.setTextSize(12.5f);
         valTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        valTv.setTextColor(Color.parseColor("#E4E4E7"));
+        valTv.setTextColor(AppTheme.text());
         valCol.addView(valTv);
 
         int pct = totalBytes > 0 ? (int) Math.round((double) bytes * 100.0 / totalBytes) : 0;
         TextView pctTv = new TextView(this);
         pctTv.setText(pct + "%");
         pctTv.setTextSize(10f);
-        pctTv.setTextColor(Color.parseColor("#71717A"));
+        pctTv.setTextColor(AppTheme.textMuted());
         valCol.addView(pctTv);
 
         item.addView(valCol);
@@ -9250,13 +9970,13 @@ public final class FishbowlActivity extends AppCompatActivity
         asAppTitle.setText("Start on App Launch");
         asAppTitle.setTextSize(13.5f);
         asAppTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        asAppTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        asAppTitle.setTextColor(AppTheme.text());
         asAppTextCol.addView(asAppTitle);
 
         TextView asAppSub = new TextView(this);
-        asAppSub.setText("Automatically start Jellyfin server when opening Fishbowl (Jellyfin only)");
+        asAppSub.setText("Automatically start the full server (Jellyfin + Radarr, Sonarr, Prowlarr, Transmission and other installed services) when opening Jellyarr");
         asAppSub.setTextSize(11f);
-        asAppSub.setTextColor(Color.parseColor("#71717A"));
+        asAppSub.setTextColor(AppTheme.textMuted());
         asAppSub.setPadding(0, dp(2), 0, 0);
         asAppTextCol.addView(asAppSub);
         autoStartAppRow.addView(asAppTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -9287,13 +10007,13 @@ public final class FishbowlActivity extends AppCompatActivity
         asCompTitle.setText("Auto-Start Companion Services");
         asCompTitle.setTextSize(13.5f);
         asCompTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        asCompTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        asCompTitle.setTextColor(AppTheme.text());
         asCompTextCol.addView(asCompTitle);
 
         TextView asCompSub = new TextView(this);
-        asCompSub.setText("Automatically launch companion services (Radarr, Sonarr, etc.) when Fishbowl starts. Disabled by default to prevent port conflicts.");
+        asCompSub.setText("Automatically launch companion services (Radarr, Sonarr, etc.) when Jellyarr starts. Disabled by default to prevent port conflicts.");
         asCompSub.setTextSize(11f);
-        asCompSub.setTextColor(Color.parseColor("#71717A"));
+        asCompSub.setTextColor(AppTheme.textMuted());
         asCompSub.setPadding(0, dp(2), 0, 0);
         asCompTextCol.addView(asCompSub);
         autoStartCompRow.addView(asCompTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -9303,7 +10023,7 @@ public final class FishbowlActivity extends AppCompatActivity
         autoStartCompSwitch.setChecked(compAutoStart);
         autoStartCompSwitch.setOnCheckedChangeListener((v, checked) -> {
             MediaServiceManager.getInstance(this).setCompanionAutoStartEnabled(checked);
-            Toast.makeText(this, checked ? "Companion auto-start enabled." : "Companion auto-start disabled (on-demand only).", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr(checked ? "Companion auto-start enabled." : "Companion auto-start disabled (on-demand only)."), Toast.LENGTH_SHORT).show();
         });
         autoStartCompRow.addView(autoStartCompSwitch);
         card.addView(autoStartCompRow);
@@ -9321,13 +10041,13 @@ public final class FishbowlActivity extends AppCompatActivity
         msTitle.setText("Media Stack Subsystem");
         msTitle.setTextSize(13.5f);
         msTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        msTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        msTitle.setTextColor(AppTheme.text());
         msTextCol.addView(msTitle);
 
         TextView msSub = new TextView(this);
-        msSub.setText("Enable Radarr, Sonarr, Seerr, Prowlarr & companion services. Disable for Jellyfin-only mode to save storage.");
+        msSub.setText("Enable Radarr, Sonarr, Prowlarr & companion services. Disable for Jellyfin-only mode to save storage.");
         msSub.setTextSize(11f);
-        msSub.setTextColor(Color.parseColor("#71717A"));
+        msSub.setTextColor(AppTheme.textMuted());
         msSub.setPadding(0, dp(2), 0, 0);
         msTextCol.addView(msSub);
         mediaStackRow.addView(msTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -9336,7 +10056,7 @@ public final class FishbowlActivity extends AppCompatActivity
         mediaStackSwitch.setChecked(isMediaStackEnabled());
         mediaStackSwitch.setOnCheckedChangeListener((v, checked) -> {
             setMediaStackEnabled(checked);
-            Toast.makeText(this, checked ? "Media Stack enabled." : "Media Stack disabled (Jellyfin-only mode).", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr(checked ? "Media Stack enabled." : "Media Stack disabled (Jellyfin-only mode)."), Toast.LENGTH_SHORT).show();
         });
         mediaStackRow.addView(mediaStackSwitch);
         card.addView(mediaStackRow);
@@ -9354,28 +10074,28 @@ public final class FishbowlActivity extends AppCompatActivity
         qsTitle.setText("Quick Settings Tile");
         qsTitle.setTextSize(13.5f);
         qsTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        qsTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        qsTitle.setTextColor(AppTheme.text());
         qsTextCol.addView(qsTitle);
 
         TextView qsSub = new TextView(this);
         qsSub.setText("Toggle Jellyfin server and check live status from notification shade");
         qsSub.setTextSize(11f);
-        qsSub.setTextColor(Color.parseColor("#71717A"));
+        qsSub.setTextColor(AppTheme.textMuted());
         qsSub.setPadding(0, dp(2), 0, 0);
         qsTextCol.addView(qsSub);
         qsRow.addView(qsTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        Button btnAddTile = createPixelButton("ADD TILE", Color.argb(25, 56, 189, 248), Color.parseColor("#38BDF8"));
+        Button btnAddTile = createPixelButton("ADD TILE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
         btnAddTile.setTextSize(10f);
         btnAddTile.setPadding(dp(10), 0, dp(10), 0);
         btnAddTile.setOnClickListener(v -> {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 FishbowlQuickSettingsTileService.requestAddTile(this,
-                    () -> Toast.makeText(this, "Fishbowl Quick Settings tile added!", Toast.LENGTH_SHORT).show(),
-                    () -> Toast.makeText(this, "Quick Settings tile request cancelled or already present.", Toast.LENGTH_SHORT).show()
+                    () -> Toast.makeText(this, I18n.tr("Jellyarr Quick Settings tile added!"), Toast.LENGTH_SHORT).show(),
+                    () -> Toast.makeText(this, I18n.tr("Quick Settings tile request cancelled or already present."), Toast.LENGTH_SHORT).show()
                 );
             } else {
-                Toast.makeText(this, "To add the Fishbowl tile: swipe down twice from the top of your screen, tap Edit (pencil icon), and drag the Fishbowl tile into active tiles.", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr("To add the Jellyarr tile: swipe down twice from the top of your screen, tap Edit (pencil icon), and drag the Jellyarr tile into active tiles."), Toast.LENGTH_LONG).show();
             }
         });
         qsRow.addView(btnAddTile, new LinearLayout.LayoutParams(-2, dp(32)));
@@ -9383,6 +10103,434 @@ public final class FishbowlActivity extends AppCompatActivity
 
         section.addView(card);
         return section;
+    }
+
+
+    // -- Appearance: theme mode, accent colour, Material You -------------------------------
+
+    private static final String[] THEME_MODE_LABELS = {"System", "Light", "Dark", "AMOLED"};
+    private static final int[] THEME_MODE_VALUES = {
+            AppTheme.MODE_SYSTEM, AppTheme.MODE_LIGHT, AppTheme.MODE_DARK, AppTheme.MODE_AMOLED};
+
+    private String appearanceSummary() {
+        int m = AppTheme.getMode(this);
+        String mode = "AMOLED";
+        for (int i = 0; i < THEME_MODE_VALUES.length; i++) if (THEME_MODE_VALUES[i] == m) mode = THEME_MODE_LABELS[i];
+        int a = AppTheme.getAccentIndex();
+        String accent = a == AppTheme.ACCENT_DYNAMIC ? "Dynamic" : AppTheme.ACCENT_NAMES[a];
+        return I18n.tr(mode) + " \u00B7 " + I18n.tr(accent);
+    }
+
+    /** Colours are baked into the programmatic views, so a theme change rebuilds the activity. */
+    private void restartForTheme() {
+        AppTheme.applyNightMode();
+        recreate();
+    }
+
+    private TextView appearanceTitle(String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(13.5f);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        t.setTextColor(AppTheme.text());
+        return t;
+    }
+
+    private TextView appearanceHint(String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(11f);
+        t.setTextColor(AppTheme.textMuted());
+        t.setPadding(0, dp(2), 0, dp(10));
+        return t;
+    }
+
+    private View buildAppearanceSection() {
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+
+        // ---- Language ----
+        section.addView(createSettingsSectionHeader("LANGUAGE"));
+        LinearLayout langCard = createSettingsSectionCard();
+        langCard.addView(appearanceTitle("Language"));
+        langCard.addView(appearanceHint("Choose the app language. The app restarts its screens to apply it."));
+        final String[] langValues = {I18n.LANG_SYSTEM, I18n.LANG_EN, I18n.LANG_AR};
+        final String[] langLabels = {"System", "English", "\u0627\u0644\u0639\u0631\u0628\u064A\u0629"};
+        LinearLayout langSeg = new LinearLayout(this);
+        langSeg.setOrientation(LinearLayout.HORIZONTAL);
+        String currentLang = I18n.getChoice();
+        for (int i = 0; i < langValues.length; i++) {
+            final String value = langValues[i];
+            boolean sel = value.equals(currentLang);
+            Button chip = createPixelButton((sel ? "\u2713 " : "") + langLabels[i],
+                    sel ? AppTheme.accentContainer() : AppTheme.card(),
+                    sel ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
+            chip.setTextSize(12f);
+            chip.setPadding(dp(4), 0, dp(4), 0);
+            chip.setOnClickListener(v -> {
+                if (!value.equals(I18n.getChoice())) {
+                    I18n.setLanguage(this, value);
+                    recreate();
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+            if (i > 0) lp.setMarginStart(dp(6));
+            langSeg.addView(chip, lp);
+        }
+        langCard.addView(langSeg);
+        section.addView(langCard);
+
+        // ---- Mode ----
+        section.addView(createSettingsSectionHeader("THEME"));
+        LinearLayout modeCard = createSettingsSectionCard();
+        modeCard.addView(appearanceTitle("Mode"));
+        modeCard.addView(appearanceHint("System follows your phone. AMOLED uses pure black to save battery on OLED screens."));
+
+        LinearLayout seg = new LinearLayout(this);
+        seg.setOrientation(LinearLayout.HORIZONTAL);
+        int currentMode = AppTheme.getMode(this);
+        for (int i = 0; i < THEME_MODE_VALUES.length; i++) {
+            final int value = THEME_MODE_VALUES[i];
+            boolean sel = value == currentMode;
+            String label = (sel ? "\u2713 " : "") + THEME_MODE_LABELS[i];
+            Button chip = createPixelButton(label,
+                    sel ? AppTheme.accentContainer() : AppTheme.card(),
+                    sel ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
+            chip.setTextSize(11f);
+            chip.setPadding(dp(4), 0, dp(4), 0);
+            chip.setOnClickListener(v -> {
+                if (value != AppTheme.getMode(this)) {
+                    AppTheme.setMode(this, value);
+                    restartForTheme();
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+            if (i > 0) lp.setMarginStart(dp(6));
+            seg.addView(chip, lp);
+        }
+        modeCard.addView(seg);
+        section.addView(modeCard);
+
+        // ---- Accent colour ----
+        section.addView(createSettingsSectionHeader("COLORS"));
+        LinearLayout accentCard = createSettingsSectionCard();
+        accentCard.addView(appearanceTitle("Accent color"));
+        accentCard.addView(appearanceHint(AppTheme.isDynamicAvailable()
+                ? "Dynamic (Material You) takes its colors from your wallpaper."
+                : "Dynamic colors (Material You) need Android 12 or newer."));
+
+        java.util.ArrayList<Integer> ids = new java.util.ArrayList<>();
+        if (AppTheme.isDynamicAvailable()) ids.add(AppTheme.ACCENT_DYNAMIC);
+        for (int i = 0; i < AppTheme.ACCENT_NAMES.length; i++) ids.add(i);
+
+        final int perRow = 5;
+        int currentAccent = AppTheme.getAccentIndex();
+        LinearLayout row = null;
+        for (int n = 0; n < ids.size(); n++) {
+            if (n % perRow == 0) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+                rlp.bottomMargin = dp(10);
+                accentCard.addView(row, rlp);
+            }
+            int id = ids.get(n);
+            row.addView(buildAccentSwatch(id, id == currentAccent),
+                    new LinearLayout.LayoutParams(0, -2, 1.0f));
+        }
+        // Keep the last row's swatches the same width as the others.
+        if (row != null) {
+            for (int fill = row.getChildCount(); fill < perRow; fill++) {
+                row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1.0f));
+            }
+        }
+        section.addView(accentCard);
+
+        // ---- Live preview ----
+        section.addView(createSettingsSectionHeader("PREVIEW"));
+        LinearLayout previewCard = createSettingsSectionCard();
+        LinearLayout btns = new LinearLayout(this);
+        btns.setOrientation(LinearLayout.HORIZONTAL);
+        Button filled = createPixelButton("Filled", AppTheme.accent(), AppTheme.onAccent());
+        Button tonal = createPixelButton("Tonal", AppTheme.card(), AppTheme.accent());
+        Button outlined = createPixelButton("Outlined", AppTheme.card(), AppTheme.text());
+        Button[] three = {filled, tonal, outlined};
+        for (int i = 0; i < three.length; i++) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+            if (i > 0) lp.setMarginStart(dp(6));
+            btns.addView(three[i], lp);
+        }
+        previewCard.addView(btns);
+        previewCard.addView(createSettingsDivider());
+        LinearLayout swRow = new LinearLayout(this);
+        swRow.setOrientation(LinearLayout.HORIZONTAL);
+        swRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView swLabel = appearanceTitle("Switch");
+        swRow.addView(swLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Switch swOn = new Switch(this);
+        swOn.setChecked(true);
+        swRow.addView(swOn);
+        previewCard.addView(swRow);
+        section.addView(previewCard);
+
+        // ---- Reset ----
+        Button reset = createPixelButton("RESET TO DEFAULT", AppTheme.card(), AppTheme.textSecondary());
+        reset.setOnClickListener(v -> {
+            AppTheme.setAccent(this, 0);
+            AppTheme.setMode(this, AppTheme.MODE_AMOLED);
+            restartForTheme();
+        });
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-1, dp(40));
+        rp.topMargin = dp(4);
+        section.addView(reset, rp);
+        return section;
+    }
+
+    private View buildAccentSwatch(final int accentId, boolean selected) {
+        LinearLayout cell = new LinearLayout(this);
+        cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setGravity(Gravity.CENTER_HORIZONTAL);
+        cell.setClickable(true);
+        cell.setFocusable(true);
+
+        String name = accentId == AppTheme.ACCENT_DYNAMIC ? "Dynamic" : AppTheme.ACCENT_NAMES[accentId];
+        cell.setContentDescription(name + (selected ? ", selected" : ""));
+        int preview = AppTheme.accentPreview(this, accentId);
+
+        FrameLayout swatch = new FrameLayout(this);
+        GradientDrawable circle = new GradientDrawable();
+        circle.setShape(GradientDrawable.OVAL);
+        circle.setColor(preview);
+        if (selected) circle.setStroke(dp(3), AppTheme.text());
+        else circle.setStroke(dp(1), AppTheme.outline());
+        swatch.setBackground(circle);
+        if (selected) {
+            TextView check = new TextView(this);
+            check.setText("\u2713");
+            check.setTextSize(16f);
+            check.setTypeface(Typeface.DEFAULT_BOLD);
+            check.setTextColor(AppTheme.contrastOn(preview));
+            check.setGravity(Gravity.CENTER);
+            swatch.addView(check, new FrameLayout.LayoutParams(-1, -1));
+        }
+        cell.addView(swatch, new LinearLayout.LayoutParams(dp(44), dp(44)));
+
+        TextView label = new TextView(this);
+        label.setText(name);
+        label.setTextSize(10f);
+        label.setTextColor(selected ? AppTheme.text() : AppTheme.textMuted());
+        label.setGravity(Gravity.CENTER);
+        label.setSingleLine(true);
+        label.setPadding(0, dp(4), 0, 0);
+        cell.addView(label);
+
+        cell.setOnClickListener(v -> {
+            if (AppTheme.getAccentIndex() != accentId) {
+                AppTheme.setAccent(this, accentId);
+                restartForTheme();
+            }
+        });
+        return cell;
+    }
+
+    // -- AUTOMATION: Transmission auto-cleanup, auto-recheck & per-service Wi-Fi only ----------
+
+    private View buildAutomationSection() {
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+        section.addView(createSettingsSectionHeader("AUTOMATION"));
+
+        LinearLayout card = createSettingsSectionCard();
+
+        // --- Transmission auto-cleanup -------------------------------------------------
+        LinearLayout cleanRow = new LinearLayout(this);
+        cleanRow.setOrientation(LinearLayout.HORIZONTAL);
+        cleanRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout cleanText = new LinearLayout(this);
+        cleanText.setOrientation(LinearLayout.VERTICAL);
+        TextView cleanTitle = new TextView(this);
+        cleanTitle.setText("Transmission auto-cleanup");
+        cleanTitle.setTextSize(13.5f);
+        cleanTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        cleanTitle.setTextColor(AppTheme.text());
+        cleanText.addView(cleanTitle);
+        TextView cleanSub = new TextView(this);
+        cleanSub.setText("Remove finished torrents AND their downloaded files after the period below. Make sure Radarr/Sonarr have already imported them (or that they hard-link/copy), otherwise the files are lost.");
+        cleanSub.setTextSize(11f);
+        cleanSub.setTextColor(AppTheme.textMuted());
+        cleanSub.setPaddingRelative(0, dp(2), dp(8), 0);
+        cleanText.addView(cleanSub);
+        cleanRow.addView(cleanText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Switch cleanSwitch = new Switch(this);
+        cleanSwitch.setChecked(com.fishbowl.app.services.AutomationPrefs.isCleanupEnabled(this));
+        cleanSwitch.setOnCheckedChangeListener((v, checked) -> {
+            com.fishbowl.app.services.AutomationPrefs.setCleanupEnabled(this, checked);
+            Toast.makeText(this, I18n.tr(checked ? "Auto-cleanup enabled." : "Auto-cleanup disabled."), Toast.LENGTH_SHORT).show();
+        });
+        cleanRow.addView(cleanSwitch);
+        card.addView(cleanRow);
+
+        // Period (hours)
+        LinearLayout periodRow = new LinearLayout(this);
+        periodRow.setOrientation(LinearLayout.HORIZONTAL);
+        periodRow.setGravity(Gravity.CENTER_VERTICAL);
+        periodRow.setPadding(0, dp(10), 0, dp(4));
+        TextView periodLabel = new TextView(this);
+        periodLabel.setText("Delete after (hours)");
+        periodLabel.setTextSize(12.5f);
+        periodLabel.setTextColor(AppTheme.text());
+        periodRow.addView(periodLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        final android.widget.EditText hoursInput = new android.widget.EditText(this);
+        hoursInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        hoursInput.setText(String.valueOf(com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this)));
+        hoursInput.setTextColor(AppTheme.text());
+        hoursInput.setTextSize(13f);
+        hoursInput.setGravity(Gravity.CENTER);
+        hoursInput.setSingleLine(true);
+        periodRow.addView(hoursInput, new LinearLayout.LayoutParams(dp(80), -2));
+        Button btnSaveHours = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        btnSaveHours.setTextSize(10f);
+        btnSaveHours.setPadding(dp(10), 0, dp(10), 0);
+        btnSaveHours.setOnClickListener(v -> {
+            int h = com.fishbowl.app.services.AutomationPrefs.DEFAULT_CLEANUP_HOURS;
+            try { h = Integer.parseInt(hoursInput.getText().toString().trim()); } catch (Throwable ignored) {}
+            com.fishbowl.app.services.AutomationPrefs.setCleanupHours(this, h);
+            hoursInput.setText(String.valueOf(com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this)));
+            Toast.makeText(this, I18n.tr("Saved: " + com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this) + " h"), Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(-2, dp(32));
+        saveLp.setMarginStart(dp(8));
+        periodRow.addView(btnSaveHours, saveLp);
+        final Runnable hoursDirty = UiStyle.bindDirty(btnSaveHours, hoursInput,
+                () -> String.valueOf(com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this)));
+        btnSaveHours.setOnClickListener(v -> {
+            int h = com.fishbowl.app.services.AutomationPrefs.DEFAULT_CLEANUP_HOURS;
+            try { h = Integer.parseInt(hoursInput.getText().toString().trim()); } catch (Throwable ignored) {}
+            com.fishbowl.app.services.AutomationPrefs.setCleanupHours(this, h);
+            hoursInput.setText(String.valueOf(com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this)));
+            hoursDirty.run();
+            Toast.makeText(this, I18n.tr("Saved: " + com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this) + " h"), Toast.LENGTH_SHORT).show();
+        });
+        card.addView(periodRow);
+
+        // Preview + run now
+        final TextView statusText = new TextView(this);
+        statusText.setTextSize(11f);
+        statusText.setTextColor(AppTheme.textSecondary());
+        statusText.setPadding(0, dp(4), 0, dp(6));
+        long lastRun = com.fishbowl.app.services.AutomationPrefs.getCleanupLastRun(this);
+        statusText.setText(lastRun > 0
+                ? "Last run: " + new java.util.Date(lastRun) + "\n" + com.fishbowl.app.services.AutomationPrefs.getCleanupLastSummary(this)
+                : "Checks every 30 minutes while Transmission is running. Not run yet.");
+        card.addView(statusText);
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        Button btnPreview = createPixelButton("PREVIEW", AppTheme.inner(), AppTheme.accent());
+        btnPreview.setTextSize(10.5f);
+        btnPreview.setOnClickListener(v -> runCleanupAsync(true, statusText));
+        Button btnRunNow = createPixelButton("CLEAN NOW", AppTheme.inner(), AppTheme.danger());
+        btnRunNow.setTextSize(10.5f);
+        btnRunNow.setOnClickListener(v -> runCleanupAsync(false, statusText));
+        LinearLayout.LayoutParams b1 = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+        b1.setMarginEnd(dp(6));
+        LinearLayout.LayoutParams b2 = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+        btnRow.addView(btnPreview, b1);
+        btnRow.addView(btnRunNow, b2);
+        card.addView(btnRow);
+
+        card.addView(createSettingsDivider());
+
+        // --- Transmission auto-recheck on error ----------------------------------------
+        LinearLayout recheckRow = new LinearLayout(this);
+        recheckRow.setOrientation(LinearLayout.HORIZONTAL);
+        recheckRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout recheckText = new LinearLayout(this);
+        recheckText.setOrientation(LinearLayout.VERTICAL);
+        TextView recheckTitle = new TextView(this);
+        recheckTitle.setText("Auto-recheck on download error");
+        recheckTitle.setTextSize(13.5f);
+        recheckTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        recheckTitle.setTextColor(AppTheme.text());
+        recheckText.addView(recheckTitle);
+        TextView recheckSub = new TextView(this);
+        recheckSub.setText("When a torrent reports any error, Jellyarr re-verifies its data and resumes it. Retries back off (5, 10, 20, 40, 80 min) and stop after 5 attempts until the error clears.");
+        recheckSub.setTextSize(11f);
+        recheckSub.setTextColor(AppTheme.textMuted());
+        recheckSub.setPaddingRelative(0, dp(2), dp(8), 0);
+        recheckText.addView(recheckSub);
+        recheckRow.addView(recheckText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Switch recheckSwitch = new Switch(this);
+        recheckSwitch.setChecked(com.fishbowl.app.services.AutomationPrefs.isAutoRecheckEnabled(this));
+        recheckSwitch.setOnCheckedChangeListener((v, checked) -> {
+            com.fishbowl.app.services.AutomationPrefs.setAutoRecheckEnabled(this, checked);
+            Toast.makeText(this, I18n.tr(checked ? "Auto-recheck enabled." : "Auto-recheck disabled."), Toast.LENGTH_SHORT).show();
+        });
+        recheckRow.addView(recheckSwitch);
+        card.addView(recheckRow);
+
+        card.addView(createSettingsDivider());
+
+        // --- Per-service Wi-Fi only ----------------------------------------------------
+        TextView wifiTitle = new TextView(this);
+        wifiTitle.setText("Wi-Fi only (per service)");
+        wifiTitle.setTextSize(13.5f);
+        wifiTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        wifiTitle.setTextColor(AppTheme.text());
+        card.addView(wifiTitle);
+        TextView wifiSub = new TextView(this);
+        wifiSub.setText("A service switched on here is stopped while the phone uses mobile data and starts again automatically when Wi-Fi/Ethernet returns. Going offline does not stop it.");
+        wifiSub.setTextSize(11f);
+        wifiSub.setTextColor(AppTheme.textMuted());
+        wifiSub.setPadding(0, dp(2), 0, dp(8));
+        card.addView(wifiSub);
+
+        com.fishbowl.app.services.MediaServiceManager msm = com.fishbowl.app.services.MediaServiceManager.getInstance();
+        if (msm != null) {
+            for (com.fishbowl.app.model.ManagedService svc : msm.getAllServices()) {
+                final String svcId = svc.getId();
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(0, dp(4), 0, dp(4));
+                TextView name = new TextView(this);
+                name.setText(svc.getManifest().getDisplayName());
+                name.setTextSize(12.5f);
+                name.setTextColor(AppTheme.text());
+                row.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
+                Switch sw = new Switch(this);
+                sw.setChecked(com.fishbowl.app.services.AutomationPrefs.isWifiOnly(this, svcId));
+                sw.setOnCheckedChangeListener((v, checked) -> {
+                    com.fishbowl.app.services.AutomationPrefs.setWifiOnly(this, svcId, checked);
+                    com.fishbowl.app.services.NetworkPolicyEnforcer.reevaluate();
+                });
+                row.addView(sw);
+                card.addView(row);
+            }
+        } else {
+            TextView none = new TextView(this);
+            none.setText("Service manager not ready yet - reopen this tab in a moment.");
+            none.setTextSize(11f);
+            none.setTextColor(AppTheme.textMuted());
+            card.addView(none);
+        }
+
+        section.addView(card);
+        return section;
+    }
+
+    private void runCleanupAsync(final boolean dryRun, final TextView statusText) {
+        statusText.setText(dryRun ? "Checking..." : "Cleaning...");
+        new Thread(() -> {
+            String msg;
+            try {
+                msg = com.fishbowl.app.services.TransmissionAutoCleanup.run(this, dryRun).describe();
+            } catch (Throwable t) {
+                msg = "Failed: " + t.getMessage();
+            }
+            final String out = msg;
+            runOnUiThread(() -> statusText.setText(out));
+        }, "Fishbowl-CleanupNow").start();
     }
 
     // -- Section 3: Permissions & Background Survival (Drawer) -----------------
@@ -9398,17 +10546,17 @@ public final class FishbowlActivity extends AppCompatActivity
         diagTitle.setText("System & Port Diagnostics");
         diagTitle.setTextSize(15f);
         diagTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        diagTitle.setTextColor(Color.WHITE);
+        diagTitle.setTextColor(AppTheme.text());
         card.addView(diagTitle);
 
         TextView diagSub = new TextView(this);
         diagSub.setText("Audit companion service ports (collisions / zombies), device ABI compatibility, and disk headroom.");
         diagSub.setTextSize(11f);
-        diagSub.setTextColor(Color.parseColor("#71717A"));
+        diagSub.setTextColor(AppTheme.textMuted());
         diagSub.setPadding(0, dp(2), 0, dp(12));
         card.addView(diagSub);
 
-        Button btnRunDiag = createPixelButton("RUN DIAGNOSTICS", Color.parseColor("#18191E"), Color.parseColor("#38BDF8"));
+        Button btnRunDiag = createPixelButton("RUN DIAGNOSTICS", AppTheme.inner(), AppTheme.accent());
         btnRunDiag.setTextSize(10.5f);
         btnRunDiag.setOnClickListener(v -> showDiagnosticsModal());
         card.addView(btnRunDiag, new LinearLayout.LayoutParams(-1, dp(40)));
@@ -9430,143 +10578,114 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
 
+        // One username / password for every service
+        content.addView(buildUnifiedAccountCard());
+
         // Minimal Jellyfin User Accounts & Credentials Manager
         content.addView(buildSecurityJellyfinUsersCard());
 
         return buildCollapsibleCard(
                 "Security & Identity",
-                "Jellyfin user credentials & password management",
+                "One account for all services, Jellyfin users & passwords",
                 content,
                 false
         );
     }
 
     private View buildSecurityJellyfinUsersCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout card = UiKit.column(this);
 
-        LinearLayout hdr = new LinearLayout(this);
-        hdr.setOrientation(LinearLayout.HORIZONTAL);
-        hdr.setGravity(Gravity.CENTER_VERTICAL);
-        hdr.setPadding(0, dp(2), 0, dp(6));
+        LinearLayout hdr = UiKit.row(this);
+        hdr.setPadding(0, dp(2), 0, dp(8));
 
         TextView title = new TextView(this);
         title.setText("JELLYFIN ACCOUNTS");
-        title.setTextSize(11f);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.WHITE);
+        styleSectionLabel(title);
         hdr.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        TextView btnRefresh = new TextView(this);
-        btnRefresh.setText("REFRESH");
-        btnRefresh.setTextSize(10f);
-        btnRefresh.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnRefresh.setTextColor(getAccentColor());
-        btnRefresh.setPadding(dp(6), dp(2), dp(6), dp(2));
+        TextView btnRefresh = UiKit.text(this, buttonLabel("REFRESH"), 12.5f, getAccentColor(), UiKit.BOLD);
+        btnRefresh.setPadding(dp(10), dp(6), dp(10), dp(6));
+        btnRefresh.setClickable(true);
+        btnRefresh.setFocusable(true);
+        btnRefresh.setBackground(UiKit.rowRipple(this));
         btnRefresh.setOnClickListener(v -> refreshSecurityUsersUI());
         hdr.addView(btnRefresh);
 
         card.addView(hdr);
 
-        securityUsersContainer = new LinearLayout(this);
-        securityUsersContainer.setOrientation(LinearLayout.VERTICAL);
+        securityUsersContainer = UiKit.column(this);
         card.addView(securityUsersContainer);
 
         refreshSecurityUsersUI();
         return card;
     }
 
+    /** True when {@code username} is the account kept in sync by UnifiedAccount (case-insensitive). */
+    private boolean isUnifiedAccountUser(String username) {
+        if (username == null || !UnifiedAccount.isConfigured(this)) return false;
+        String u = UnifiedAccount.getUsername(this);
+        return u != null && u.trim().equalsIgnoreCase(username.trim());
+    }
+
     private void refreshSecurityUsersUI() {
         if (securityUsersContainer == null) return;
-        bgExecutor.execute(() -> {
-            List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> users =
-                    com.fishbowl.app.security.FishbowlSecurityManager.getRegisteredUsers(this);
+        runBg(() -> {
+            List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> loaded;
+            try {
+                loaded = com.fishbowl.app.security.FishbowlSecurityManager.getRegisteredUsers(this);
+            } catch (Throwable t) {
+                loaded = new ArrayList<>();
+            }
+            final List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> users =
+                    loaded != null ? loaded : new ArrayList<>();
 
             runOnUiThread(() -> {
-                if (securityUsersContainer == null) return;
+                if (securityUsersContainer == null || !isUiAlive()) return;
                 securityUsersContainer.removeAllViews();
 
                 if (users.isEmpty()) {
-                    TextView emptyTv = new TextView(this);
-                    emptyTv.setText("No Jellyfin users configured in jellyfin.db yet. Complete onboarding in Jellyfin Web client.");
-                    emptyTv.setTextSize(11f);
-                    emptyTv.setTextColor(Color.parseColor("#71717A"));
+                    TextView emptyTv = UiKit.caption(this, "No Jellyfin users configured in jellyfin.db yet. Complete onboarding in Jellyfin Web client.");
                     emptyTv.setPadding(0, dp(4), 0, dp(4));
                     securityUsersContainer.addView(emptyTv);
                     return;
                 }
 
                 for (com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord u : users) {
-                    LinearLayout uRow = new LinearLayout(this);
-                    uRow.setOrientation(LinearLayout.VERTICAL);
-                    uRow.setPadding(dp(12), dp(10), dp(12), dp(10));
-                    uRow.setBackground(createBorderedRoundedDrawable(
-                            Color.parseColor("#0E1015"), Color.parseColor("#27272A"), dp(1), dp(8)));
+                    LinearLayout uRow = UiKit.inset(this);
                     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
                     lp.bottomMargin = dp(8);
                     uRow.setLayoutParams(lp);
 
-                    // Top Row: Username + Admin Badge + Password Status
-                    LinearLayout topRow = new LinearLayout(this);
-                    topRow.setOrientation(LinearLayout.HORIZONTAL);
-                    topRow.setGravity(Gravity.CENTER_VERTICAL);
+                    // Name, then badges (admin / unified / password state) on their own line
+                    TextView nameTv = UiKit.singleLine(UiKit.subtitle(this, u.getUsername()));
+                    nameTv.setTypeface(UiKit.BOLD);
+                    uRow.addView(nameTv);
 
-                    TextView nameTv = new TextView(this);
-                    nameTv.setText(u.getUsername());
-                    nameTv.setTextSize(13f);
-                    nameTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    nameTv.setTextColor(Color.WHITE);
-                    topRow.addView(nameTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
+                    LinearLayout badges = UiKit.row(this);
+                    badges.setPadding(0, dp(6), 0, 0);
                     if (u.isAdmin()) {
-                        TextView bAdmin = new TextView(this);
-                        bAdmin.setText("ADMIN");
-                        bAdmin.setTextSize(8.5f);
-                        bAdmin.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                        bAdmin.setTextColor(Color.parseColor("#A78BFA"));
-                        bAdmin.setPadding(dp(5), dp(2), dp(5), dp(2));
-                        bAdmin.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#7C3AED"), dp(1), dp(4)));
+                        TextView bAdmin = UiKit.badge(this, I18n.tr("ADMIN"), AppTheme.accent());
                         LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(-2, -2);
-                        bLp.rightMargin = dp(6);
-                        topRow.addView(bAdmin, bLp);
+                        bLp.setMarginEnd(dp(6));
+                        badges.addView(bAdmin, bLp);
                     }
-
+                    if (isUnifiedAccountUser(u.getUsername())) {
+                        TextView bUni = UiKit.badge(this, I18n.tr("Unified account"), AppTheme.accent());
+                        LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(-2, -2);
+                        bLp.setMarginEnd(dp(6));
+                        badges.addView(bUni, bLp);
+                    }
                     boolean hasPass = u.getHasPassword();
-                    TextView bPass = new TextView(this);
-                    bPass.setText(hasPass ? "PASSWORD SET" : "NO PASSWORD");
-                    bPass.setTextSize(8.5f);
-                    bPass.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    bPass.setTextColor(hasPass ? Color.parseColor("#34D399") : Color.parseColor("#F59E0B"));
-                    bPass.setPadding(dp(5), dp(2), dp(5), dp(2));
-                    bPass.setBackground(createBorderedRoundedDrawable(
-                            Color.parseColor("#18181B"),
-                            hasPass ? Color.parseColor("#059669") : Color.parseColor("#D97706"),
-                            dp(1), dp(4)));
-                    topRow.addView(bPass);
+                    badges.addView(UiKit.badge(this, I18n.tr(hasPass ? "PASSWORD SET" : "NO PASSWORD"),
+                            hasPass ? AppTheme.success() : AppTheme.warning()));
+                    HorizontalScrollView badgeScroll = UiKit.chipScroller(this, badges);
+                    uRow.addView(badgeScroll);
 
-                    uRow.addView(topRow);
-
-                    // Minimal Actions: Clean compact button bar
-                    LinearLayout btnRow = new LinearLayout(this);
-                    btnRow.setOrientation(LinearLayout.HORIZONTAL);
-                    LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(-1, dp(30));
-                    btnLp.topMargin = dp(8);
-                    btnRow.setLayoutParams(btnLp);
-
-                    Button btnSetPass = createPixelButton("SET PASSWORD", Color.parseColor("#1C1E24"), Color.WHITE);
-                    btnSetPass.setTextSize(9f);
-                    btnSetPass.setOnClickListener(v -> showSetPasswordDialog(u.getUsername()));
-                    btnRow.addView(btnSetPass, new LinearLayout.LayoutParams(0, -1, 1.0f));
-
-                    View gap = new View(this);
-                    btnRow.addView(gap, new LinearLayout.LayoutParams(dp(8), 1));
-
-                    Button btnReset = createPixelButton("RESET TO BLANK", Color.parseColor("#18181B"), Color.parseColor("#EF4444"));
-                    btnReset.setTextSize(9f);
-                    btnReset.setOnClickListener(v -> showResetPasswordConfirmation(u.getUsername()));
-                    btnRow.addView(btnReset, new LinearLayout.LayoutParams(0, -1, 1.0f));
-
-                    uRow.addView(btnRow);
+                    Button btnSetPass = UiKit.outline(this, buttonLabel("SET PASSWORD"), v -> showSetPasswordDialog(u.getUsername()));
+                    Button btnReset = UiKit.danger(this, buttonLabel("RESET TO BLANK"), v -> showResetPasswordConfirmation(u.getUsername()));
+                    btnSetPass.setTextSize(12.5f);
+                    btnReset.setTextSize(12.5f);
+                    uRow.addView(UiKit.buttonRow(this, btnSetPass, btnReset));
 
                     securityUsersContainer.addView(uRow);
                 }
@@ -9575,25 +10694,25 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void showSetPasswordDialog(String username) {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
+        final boolean unifiedUser = isUnifiedAccountUser(username);
+        LinearLayout content = UiKit.column(this);
 
-        TextView desc = new TextView(this);
-        desc.setText("Enter the new password for '" + username + "'. It will be securely hashed with PBKDF2-SHA512 directly into jellyfin.db.");
-        desc.setTextSize(11.5f);
-        desc.setTextColor(Color.parseColor("#A1A1AA"));
+        TextView desc = UiKit.body(this, "Enter the new password for '" + username + "'. It will be securely hashed with PBKDF2-SHA512 directly into jellyfin.db.");
         desc.setPadding(0, 0, 0, dp(12));
         content.addView(desc);
 
-        final EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setHint("Enter new password");
-        input.setHintTextColor(Color.parseColor("#71717A"));
-        input.setTextColor(Color.WHITE);
-        input.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
-        input.setPadding(dp(14), dp(10), dp(14), dp(10));
-        input.setTextSize(13f);
+        if (unifiedUser) {
+            TextView syncNote = UiKit.caption(this, I18n.tr("This is the unified account: the new password is also applied to Sonarr, Radarr, Prowlarr and Transmission."));
+            syncNote.setTextColor(AppTheme.accent());
+            syncNote.setPadding(0, 0, 0, dp(12));
+            content.addView(syncNote);
+        }
+
+        final EditText input = UiKit.input(this, "Enter new password");
+        // visible while typing (no confirm field) but never learned by the keyboard
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setTypeface(Typeface.MONOSPACE);
         content.addView(input);
 
@@ -9604,19 +10723,46 @@ public final class FishbowlActivity extends AppCompatActivity
                 "SAVE PASSWORD",
                 getAccentColor(),
                 () -> {
-                    String newPass = input.getText() != null ? input.getText().toString().trim() : "";
+                    final String newPass = input.getText() != null ? input.getText().toString().trim() : "";
                     if (newPass.isEmpty()) {
-                        Toast.makeText(this, "Password cannot be empty. Use 'RESET TO BLANK' if you want no password.", Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, I18n.tr("Password cannot be empty. Use 'RESET TO BLANK' if you want no password."), Toast.LENGTH_LONG).show();
                         return;
                     }
-                    boolean ok = com.fishbowl.app.security.FishbowlSecurityManager.setPassword(this, username, newPass);
-                    if (ok) {
-                        Toast.makeText(this, "Password for '" + username + "' saved successfully.", Toast.LENGTH_LONG).show();
-                        refreshSecurityUsersUI();
-                        refreshHomeAccountsUI();
-                    } else {
-                        Toast.makeText(this, "Failed to save password. Is database locked?", Toast.LENGTH_LONG).show();
+                    final String unifiedName = unifiedUser ? UnifiedAccount.getUsername(this) : null;
+                    if (unifiedUser) {
+                        // the same password goes to every service, so it must pass their rules first
+                        String problem = UnifiedAccount.validate(unifiedName, newPass);
+                        if (problem != null) {
+                            Toast.makeText(this, I18n.tr(problem), Toast.LENGTH_LONG).show();
+                            return;
+                        }
                     }
+                    final Context app = getApplicationContext();
+                    runBg(() -> {
+                        boolean saved;
+                        try {
+                            saved = com.fishbowl.app.security.FishbowlSecurityManager.setPassword(app, username, newPass);
+                        } catch (Throwable t) {
+                            saved = false;
+                        }
+                        final boolean ok = saved;
+                        runOnUiThread(() -> {
+                            if (ok && unifiedUser) {
+                                // Full sync: keep the unified account and every service on the new password.
+                                UnifiedAccount.save(app, unifiedName, newPass);
+                                lastUnifiedAutoApply = System.currentTimeMillis();
+                                runUnifiedApply(true, true);
+                            }
+                            if (!isUiAlive()) return;
+                            if (ok) {
+                                Toast.makeText(this, I18n.tr("Password for '" + username + "' saved successfully."), Toast.LENGTH_LONG).show();
+                                refreshSecurityUsersUI();
+                                refreshHomeAccountsUI();
+                            } else {
+                                Toast.makeText(this, I18n.tr("Failed to save password. Is database locked?"), Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    });
                 },
                 "CANCEL",
                 null
@@ -9624,15 +10770,17 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void showResetPasswordConfirmation(String username) {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout content = UiKit.column(this);
 
-        TextView desc = new TextView(this);
-        desc.setText("Are you sure you want to clear the password for '" + username + "'?\n\nThis writes directly into jellyfin.db. You will immediately be able to log in by leaving the password field blank.");
-        desc.setTextSize(11.5f);
-        desc.setTextColor(Color.parseColor("#A1A1AA"));
-        desc.setLineSpacing(dp(2), 1.15f);
+        TextView desc = UiKit.body(this, "Are you sure you want to clear the password for '" + username + "'?\n\nThis writes directly into jellyfin.db. You will immediately be able to log in by leaving the password field blank.");
         content.addView(desc);
+
+        if (isUnifiedAccountUser(username)) {
+            TextView note = UiKit.caption(this, I18n.tr("This user is the unified account. Sonarr, Radarr, Prowlarr and Transmission keep the saved password; use Set Password to sync every service again."));
+            note.setTextColor(AppTheme.warning());
+            note.setPadding(0, dp(10), 0, 0);
+            content.addView(note);
+        }
 
         showOledDialog(
                 "Reset Password to Blank?",
@@ -9641,14 +10789,26 @@ public final class FishbowlActivity extends AppCompatActivity
                 "RESET TO BLANK",
                 getDangerColor(),
                 () -> {
-                    boolean ok = com.fishbowl.app.security.FishbowlSecurityManager.resetPasswordToBlank(this, username);
-                    if (ok) {
-                        Toast.makeText(this, "Password for '" + username + "' reset to blank.", Toast.LENGTH_LONG).show();
-                        refreshSecurityUsersUI();
-                        refreshHomeAccountsUI();
-                    } else {
-                        Toast.makeText(this, "Could not reset password. Is database locked?", Toast.LENGTH_LONG).show();
-                    }
+                    final Context app = getApplicationContext();
+                    runBg(() -> {
+                        boolean done;
+                        try {
+                            done = com.fishbowl.app.security.FishbowlSecurityManager.resetPasswordToBlank(app, username);
+                        } catch (Throwable t) {
+                            done = false;
+                        }
+                        final boolean ok = done;
+                        runOnUiThread(() -> {
+                            if (!isUiAlive()) return;
+                            if (ok) {
+                                Toast.makeText(this, I18n.tr("Password for '" + username + "' reset to blank."), Toast.LENGTH_LONG).show();
+                                refreshSecurityUsersUI();
+                                refreshHomeAccountsUI();
+                            } else {
+                                Toast.makeText(this, I18n.tr("Could not reset password. Is database locked?"), Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    });
                 },
                 "CANCEL",
                 null
@@ -9664,14 +10824,14 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("ZOMBIE PROCESS SAFEGUARD");
         title.setTextSize(10.5f);
         title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        title.setTextColor(Color.parseColor("#34D399"));
+        title.setTextColor(AppTheme.success());
         row.addView(title);
 
         TextView sub = new TextView(this);
         sub.setText("Auto-kill active: Service ports (8096, 7878, 8989, 9696, 9117, 9091, 5055, 6767, 8686) are automatically reclaimed to prevent conflicts and CPU drain.");
         sub.setTextSize(9.5f);
         sub.setTypeface(Typeface.MONOSPACE);
-        sub.setTextColor(Color.parseColor("#71717A"));
+        sub.setTextColor(AppTheme.textMuted());
         sub.setPadding(0, dp(2), 0, 0);
         row.addView(sub);
 
@@ -9707,13 +10867,13 @@ public final class FishbowlActivity extends AppCompatActivity
         dTitle.setText("Engine Diagnostics");
         dTitle.setTextSize(13f);
         dTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        dTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        dTitle.setTextColor(AppTheme.text());
         dTextCol.addView(dTitle);
 
         TextView dSub = new TextView(this);
         dSub.setText("Benchmark hardware codecs and audio transcoding");
         dSub.setTextSize(10.5f);
-        dSub.setTextColor(Color.parseColor("#71717A"));
+        dSub.setTextColor(AppTheme.textMuted());
         dSub.setPadding(0, dp(1), 0, 0);
         dTextCol.addView(dSub);
         diagRow.addView(dTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -9751,12 +10911,12 @@ public final class FishbowlActivity extends AppCompatActivity
         chTitle.setText("Update Channel");
         chTitle.setTextSize(13.5f);
         chTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        chTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        chTitle.setTextColor(AppTheme.text());
         chTextCol.addView(chTitle);
 
         updateChannelBadge = new TextView(this);
         updateChannelBadge.setTextSize(11f);
-        updateChannelBadge.setTextColor(Color.parseColor("#71717A"));
+        updateChannelBadge.setTextColor(AppTheme.textMuted());
         updateChannelBadge.setPadding(0, dp(2), 0, 0);
         chTextCol.addView(updateChannelBadge);
         channelRow.addView(chTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -9765,7 +10925,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout pillContainer = new LinearLayout(this);
         pillContainer.setOrientation(LinearLayout.HORIZONTAL);
         pillContainer.setGravity(Gravity.CENTER_VERTICAL);
-        pillContainer.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#27272A"), dp(1), dp(8)));
+        pillContainer.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(8)));
         pillContainer.setPadding(dp(2), dp(2), dp(2), dp(2));
 
         btnChannelStable = new Button(this);
@@ -9817,29 +10977,93 @@ public final class FishbowlActivity extends AppCompatActivity
         uTitle.setText("Software Version");
         uTitle.setTextSize(13.5f);
         uTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        uTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        uTitle.setTextColor(AppTheme.text());
         uTextCol.addView(uTitle);
 
         updateStatusText = new TextView(this);
         updateStatusText.setText("v" + com.termux.BuildConfig.VERSION_NAME + " (Installed)");
         updateStatusText.setTextSize(11f);
-        updateStatusText.setTextColor(Color.parseColor("#71717A"));
+        updateStatusText.setTextColor(AppTheme.textMuted());
         updateStatusText.setPadding(0, dp(2), 0, 0);
         uTextCol.addView(updateStatusText);
         updateRow.addView(uTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        updateActionBtn = createPixelButton("CHECK FOR UPDATES", getAccentColor(), Color.WHITE);
+        updateActionBtn = createPixelButton("CHECK FOR UPDATES", getAccentColor(), AppTheme.onAccent());
         updateActionBtn.setTextSize(10f);
         updateRow.addView(updateActionBtn, new LinearLayout.LayoutParams(-2, dp(34)));
 
         content.addView(updateRow);
 
-        updateForceDownloadBtn = createPixelButton("Force Re-download / Test OTA", getSurfaceElevatedColor(), Color.parseColor("#81C784"));
+        updateForceDownloadBtn = createPixelButton("Force Re-download / Test OTA", getSurfaceElevatedColor(), AppTheme.success());
         updateForceDownloadBtn.setVisibility(View.GONE);
         LinearLayout.LayoutParams pF = new LinearLayout.LayoutParams(-1, dp(36));
         pF.topMargin = dp(6);
         content.addView(updateForceDownloadBtn, pF);
 
+        content.addView(createSettingsDivider());
+
+        // ---- Update notifications (separate Stable / Beta) ----
+        content.addView(buildUpdateNotifyBlock(UpdateManager.CHANNEL_STABLE, "STABLE RELEASES", "Official full releases"));
+        content.addView(createSettingsDivider());
+        content.addView(buildUpdateNotifyBlock(UpdateManager.CHANNEL_BETA, "BETA RELEASES", "Pre-release / preview builds"));
+        content.addView(createSettingsDivider());
+
+        TextView intervalTitle = new TextView(this);
+        intervalTitle.setText("Background check interval");
+        intervalTitle.setTextSize(13.5f);
+        intervalTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        intervalTitle.setTextColor(AppTheme.text());
+        content.addView(intervalTitle);
+        LinearLayout intervalRow = new LinearLayout(this);
+        intervalRow.setOrientation(LinearLayout.HORIZONTAL);
+        intervalRow.setPadding(0, dp(8), 0, dp(4));
+        final int[] hoursOpts = {6, 12, 24};
+        final Button[] intervalBtns = new Button[hoursOpts.length];
+        for (int i = 0; i < hoursOpts.length; i++) {
+            final int h = hoursOpts[i];
+            intervalBtns[i] = createPixelButton(h + " H", AppTheme.inner(), AppTheme.textSecondary());
+            intervalBtns[i].setTextSize(10.5f);
+            intervalBtns[i].setOnClickListener(v -> {
+                UpdateNotifier.setIntervalHours(this, h);
+                for (int k = 0; k < hoursOpts.length; k++) {
+                    boolean sel = hoursOpts[k] == h;
+                    intervalBtns[k].setTextColor(sel ? AppTheme.onAccent() : AppTheme.textSecondary());
+                    intervalBtns[k].setBackground(createRoundedDrawable(sel ? getAccentColor() : AppTheme.inner(), dp(10)));
+                }
+            });
+            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(0, dp(36), 1.0f);
+            if (i < hoursOpts.length - 1) ilp.setMarginEnd(dp(8));
+            intervalRow.addView(intervalBtns[i], ilp);
+            boolean sel = hoursOpts[i] == UpdateNotifier.intervalHours(this);
+            if (sel) {
+                intervalBtns[i].setTextColor(AppTheme.onAccent());
+                intervalBtns[i].setBackground(createRoundedDrawable(getAccentColor(), dp(10)));
+            }
+        }
+        content.addView(intervalRow);
+
+        content.addView(createSettingsDivider());
+        final UpdateManager umSettings = UpdateManager.getInstance(this);
+        content.addView(updateToggleRow("Download updates automatically",
+                "Downloads new versions in the background (of the selected channel) and keeps the file until you install it. Interrupted downloads resume automatically.",
+                umSettings.isAutoDownloadEnabled(), checked -> {
+                    umSettings.setAutoDownloadEnabled(checked);
+                    UpdateNotifier.schedule(this);
+                    if (checked && Build.VERSION.SDK_INT >= 33
+                            && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
+                    }
+                }));
+        content.addView(updateToggleRow("Automatic download on Wi-Fi only",
+                "Do not use mobile data for automatic update downloads.",
+                umSettings.isAutoDownloadWifiOnly(), checked -> umSettings.setAutoDownloadWifiOnly(checked)));
+
+        Button btnWhatsNew = createPixelButton("WHAT'S NEW IN THIS VERSION", getSurfaceElevatedColor(), getAccentColor());
+        btnWhatsNew.setTextSize(10.5f);
+        btnWhatsNew.setOnClickListener(v -> showWhatsNewDialog());
+        LinearLayout.LayoutParams wnLp = new LinearLayout.LayoutParams(-1, dp(38));
+        wnLp.topMargin = dp(8);
+        content.addView(btnWhatsNew, wnLp);
         content.addView(createSettingsDivider());
 
         // Integrated Services Matrix Header
@@ -9851,6 +11075,7 @@ public final class FishbowlActivity extends AppCompatActivity
         servicesHeading.setLetterSpacing(0.06f);
         servicesHeading.setPadding(0, dp(10), 0, dp(4));
         content.addView(servicesHeading);
+        styleSectionLabel(servicesHeading);
 
         for (UpdateManager.ServiceVersionInfo svc : UpdateManager.getInstance(this).getUniversalServiceVersionMatrix()) {
             content.addView(buildServiceUpdateRow(svc));
@@ -9862,7 +11087,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 "Software Updates",
                 "Channel: " + (isBeta ? "Beta" : "Stable") + " • OTA updates",
                 content,
-                false
+                true
         );
     }
 
@@ -9879,13 +11104,13 @@ public final class FishbowlActivity extends AppCompatActivity
         tvName.setText(svc.displayName);
         tvName.setTextSize(13f);
         tvName.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        tvName.setTextColor(Color.parseColor("#F4F4F5"));
+        tvName.setTextColor(AppTheme.text());
         textCol.addView(tvName);
 
         TextView tvDesc = new TextView(this);
         tvDesc.setText("v" + svc.installedVersion + " • " + svc.notes);
         tvDesc.setTextSize(11f);
-        tvDesc.setTextColor(Color.parseColor("#71717A"));
+        tvDesc.setTextColor(AppTheme.textMuted());
         tvDesc.setPadding(0, dp(2), 0, 0);
         textCol.addView(tvDesc);
 
@@ -9894,16 +11119,16 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView badge = new TextView(this);
         if ("jellyfin".equalsIgnoreCase(svc.serviceId)) {
             badge.setText("[v12.4 COMPATIBLE]");
-            badge.setTextColor(Color.parseColor("#38BDF8"));
-            badge.setBackground(createBorderedRoundedDrawable(Color.parseColor("#0C2333"), Color.parseColor("#0369A1"), dp(1), dp(6)));
+            badge.setTextColor(AppTheme.accent());
+            badge.setBackground(createBorderedRoundedDrawable(AppTheme.accentContainer(), AppTheme.accent(), dp(1), dp(6)));
         } else if (svc.updateAvailable) {
             badge.setText("[UPDATE]");
-            badge.setTextColor(Color.parseColor("#F59E0B"));
-            badge.setBackground(createBorderedRoundedDrawable(Color.parseColor("#271C0C"), Color.parseColor("#78350F"), dp(1), dp(6)));
+            badge.setTextColor(AppTheme.warning());
+            badge.setBackground(createBorderedRoundedDrawable(AppTheme.warningContainer(), AppTheme.warningContainer(), dp(1), dp(6)));
         } else {
             badge.setText("[UP TO DATE]");
-            badge.setTextColor(Color.parseColor("#81C784"));
-            badge.setBackground(createBorderedRoundedDrawable(Color.parseColor("#14291E"), Color.parseColor("#1B4D2E"), dp(1), dp(6)));
+            badge.setTextColor(AppTheme.success());
+            badge.setBackground(createBorderedRoundedDrawable(AppTheme.successContainer(), AppTheme.successContainer(), dp(1), dp(6)));
         }
         badge.setTextSize(10f);
         badge.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
@@ -9919,7 +11144,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 tv.setText(report.summary);
                 tv.setTextSize(11.5f);
                 tv.setTypeface(Typeface.MONOSPACE);
-                tv.setTextColor(Color.parseColor("#E4E4E7"));
+                tv.setTextColor(AppTheme.text());
                 tv.setLineSpacing(dp(3), 1.2f);
                 tv.setPadding(0, dp(4), 0, dp(8));
                 showOledDialog("JELLYFIN v12.4 COMPATIBILITY",
@@ -9939,9 +11164,9 @@ public final class FishbowlActivity extends AppCompatActivity
         content.setOrientation(LinearLayout.VERTICAL);
 
         TextView descTv = new TextView(this);
-        descTv.setText("Create a portable compressed backup of your FishBowl settings, credentials, and service configurations, or restore from an existing backup archive.");
+        descTv.setText("Create a portable compressed backup of your Jellyarr settings, credentials, and service configurations, or restore from an existing backup archive.");
         descTv.setTextSize(12f);
-        descTv.setTextColor(Color.parseColor("#A1A1AA"));
+        descTv.setTextColor(AppTheme.textSecondary());
         descTv.setLineSpacing(dp(3), 1.15f);
         descTv.setPadding(0, dp(2), 0, dp(10));
         content.addView(descTv);
@@ -9949,26 +11174,26 @@ public final class FishbowlActivity extends AppCompatActivity
         // Status Snapshot Card
         LinearLayout statusCard = new LinearLayout(this);
         statusCard.setOrientation(LinearLayout.VERTICAL);
-        statusCard.setBackground(createBorderedRoundedDrawable(Color.parseColor("#14151A"), Color.parseColor("#27272A"), dp(1), dp(8)));
+        statusCard.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(8)));
         statusCard.setPadding(dp(14), dp(12), dp(14), dp(12));
 
         TextView statusTitle = new TextView(this);
         statusTitle.setText("BACKUP SNAPSHOT");
         statusTitle.setTextSize(10.5f);
         statusTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        statusTitle.setTextColor(Color.parseColor("#71717A"));
+        statusTitle.setTextColor(AppTheme.textMuted());
         statusCard.addView(statusTitle);
 
         backupStatusTv = new TextView(this);
         backupStatusTv.setTextSize(12.5f);
-        backupStatusTv.setTextColor(Color.parseColor("#F4F4F5"));
+        backupStatusTv.setTextColor(AppTheme.text());
         backupStatusTv.setPadding(0, dp(4), 0, dp(2));
         statusCard.addView(backupStatusTv);
 
         TextView locTv = new TextView(this);
         locTv.setText("Directory: /Download/" + BackupRestoreManager.BACKUP_DIR_NAME);
         locTv.setTextSize(11f);
-        locTv.setTextColor(Color.parseColor("#A1A1AA"));
+        locTv.setTextColor(AppTheme.textSecondary());
         statusCard.addView(locTv);
 
         content.addView(statusCard);
@@ -9986,22 +11211,22 @@ public final class FishbowlActivity extends AppCompatActivity
         btnExport.setText("EXPORT BACKUP");
         btnExport.setTextSize(11f);
         btnExport.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnExport.setTextColor(Color.parseColor("#090A0F"));
+        btnExport.setTextColor(AppTheme.card());
         btnExport.setBackground(createBorderedRoundedDrawable(Color.parseColor("#55A9A0"), Color.parseColor("#55A9A0"), 0, dp(8)));
         btnExport.setOnClickListener(v -> triggerExportBackup());
         LinearLayout.LayoutParams b1P = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
-        b1P.rightMargin = dp(6);
+        b1P.setMarginEnd(dp(6));
         actionsRow.addView(btnExport, b1P);
 
         Button btnRestore = new Button(this);
         btnRestore.setText("RESTORE...");
         btnRestore.setTextSize(11f);
         btnRestore.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnRestore.setTextColor(Color.parseColor("#F4F4F5"));
-        btnRestore.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
+        btnRestore.setTextColor(AppTheme.text());
+        btnRestore.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
         btnRestore.setOnClickListener(v -> showRestoreOptionsDialog());
         LinearLayout.LayoutParams b2P = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
-        b2P.leftMargin = dp(6);
+        b2P.setMarginStart(dp(6));
         actionsRow.addView(btnRestore, b2P);
 
         content.addView(actionsRow);
@@ -10041,7 +11266,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(12)));
+        box.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(12)));
         box.setPadding(dp(20), dp(18), dp(20), dp(18));
         box.setGravity(Gravity.CENTER_HORIZONTAL);
 
@@ -10049,7 +11274,7 @@ public final class FishbowlActivity extends AppCompatActivity
         t.setText(titleText);
         t.setTextSize(14f);
         t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        t.setTextColor(Color.WHITE);
+        t.setTextColor(AppTheme.text());
         t.setGravity(Gravity.CENTER_HORIZONTAL);
         box.addView(t);
 
@@ -10063,17 +11288,17 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView msgTv = new TextView(this);
         msgTv.setText(initialMsg);
         msgTv.setTextSize(11.5f);
-        msgTv.setTextColor(Color.parseColor("#A1A1AA"));
+        msgTv.setTextColor(AppTheme.textSecondary());
         msgTv.setGravity(Gravity.CENTER_HORIZONTAL);
         box.addView(msgTv);
         if (msgHolder != null && msgHolder.length > 0) {
             msgHolder[0] = msgTv;
         }
 
-        d.setContentView(box);
+        d.setContentView(I18n.attach(box));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
             wlp.copyFrom(d.getWindow().getAttributes());
             wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.88);
@@ -10086,7 +11311,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private void triggerExportBackup() {
         TextView[] msgHolder = new TextView[1];
         Dialog progressDialog = createBackupProgressDialog("EXPORTING BACKUP", "Staging preferences and service configs...", msgHolder);
-        progressDialog.show();
+        safeShow(progressDialog);
 
         BackupRestoreManager.exportBackup(this, new BackupRestoreManager.BackupCallback() {
             @Override
@@ -10106,7 +11331,12 @@ public final class FishbowlActivity extends AppCompatActivity
             @Override
             public void onError(String error) {
                 progressDialog.dismiss();
-                Toast.makeText(FishbowlActivity.this, error, Toast.LENGTH_LONG).show();
+                TextView ev = new TextView(FishbowlActivity.this);
+                ev.setText(error);
+                ev.setTextSize(11.5f);
+                ev.setTextColor(AppTheme.danger());
+                ev.setTextIsSelectable(true);
+                showOledDialog("BACKUP FAILED", "Details (select to copy)", ev, "OK", getAccentColor(), null, null, null);
             }
         });
     }
@@ -10117,7 +11347,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(12)));
+        box.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(12)));
         box.setPadding(dp(18), dp(18), dp(18), dp(18));
 
         TextView title = new TextView(this);
@@ -10128,13 +11358,13 @@ public final class FishbowlActivity extends AppCompatActivity
         box.addView(title);
 
         TextView info = new TextView(this);
-        info.setText("FishBowl configuration archive created successfully:\n\n"
+        info.setText("Jellyarr configuration archive created successfully:\n\n"
                 + "File: " + backupFile.getName() + "\n"
                 + "Size: " + MediaStorageManager.formatBytes(sizeBytes) + "\n"
                 + "Items: " + itemsCount + " files\n"
                 + "Path: " + backupFile.getAbsolutePath());
         info.setTextSize(11.5f);
-        info.setTextColor(Color.parseColor("#D4D4D8"));
+        info.setTextColor(AppTheme.text());
         info.setLineSpacing(dp(2), 1.15f);
         info.setPadding(0, dp(10), 0, dp(14));
         box.addView(info);
@@ -10147,39 +11377,39 @@ public final class FishbowlActivity extends AppCompatActivity
         btnShare.setText("SHARE / SEND");
         btnShare.setTextSize(11f);
         btnShare.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnShare.setTextColor(Color.parseColor("#090A0F"));
+        btnShare.setTextColor(AppTheme.card());
         btnShare.setBackground(createBorderedRoundedDrawable(Color.parseColor("#55A9A0"), Color.parseColor("#55A9A0"), 0, dp(8)));
         btnShare.setOnClickListener(v -> {
             BackupRestoreManager.shareBackupFile(this, backupFile);
         });
         LinearLayout.LayoutParams b1P = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
-        b1P.rightMargin = dp(6);
+        b1P.setMarginEnd(dp(6));
         btnRow.addView(btnShare, b1P);
 
         Button btnDone = new Button(this);
         btnDone.setText("DONE");
         btnDone.setTextSize(11f);
         btnDone.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnDone.setTextColor(Color.parseColor("#F4F4F5"));
-        btnDone.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
+        btnDone.setTextColor(AppTheme.text());
+        btnDone.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
         btnDone.setOnClickListener(v -> d.dismiss());
         LinearLayout.LayoutParams b2P = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
-        b2P.leftMargin = dp(6);
+        b2P.setMarginStart(dp(6));
         btnRow.addView(btnDone, b2P);
 
         box.addView(btnRow);
 
-        d.setContentView(box);
+        d.setContentView(I18n.attach(box));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
             wlp.copyFrom(d.getWindow().getAttributes());
             wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
             wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void showRestoreOptionsDialog() {
@@ -10188,7 +11418,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
-        scroll.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(12)));
+        scroll.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(12)));
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -10199,13 +11429,13 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("RESTORE CONFIGURATION");
         title.setTextSize(14f);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.WHITE);
+        title.setTextColor(AppTheme.text());
         box.addView(title);
 
         TextView sub = new TextView(this);
         sub.setText("Select a backup to restore preferences and service configs:");
         sub.setTextSize(11.5f);
-        sub.setTextColor(Color.parseColor("#71717A"));
+        sub.setTextColor(AppTheme.textMuted());
         sub.setPadding(0, dp(4), 0, dp(12));
         box.addView(sub);
 
@@ -10214,14 +11444,14 @@ public final class FishbowlActivity extends AppCompatActivity
             TextView emptyTv = new TextView(this);
             emptyTv.setText("No backups found in /Download/" + BackupRestoreManager.BACKUP_DIR_NAME);
             emptyTv.setTextSize(11f);
-            emptyTv.setTextColor(Color.parseColor("#A1A1AA"));
+            emptyTv.setTextColor(AppTheme.textSecondary());
             emptyTv.setPadding(0, dp(6), 0, dp(12));
             box.addView(emptyTv);
         } else {
             for (File bf : backups) {
                 LinearLayout item = new LinearLayout(this);
                 item.setOrientation(LinearLayout.VERTICAL);
-                item.setBackground(createBorderedRoundedDrawable(Color.parseColor("#14151A"), Color.parseColor("#27272A"), dp(1), dp(8)));
+                item.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(8)));
                 item.setPadding(dp(12), dp(10), dp(12), dp(10));
                 LinearLayout.LayoutParams iP = new LinearLayout.LayoutParams(-1, -2);
                 iP.bottomMargin = dp(8);
@@ -10231,14 +11461,14 @@ public final class FishbowlActivity extends AppCompatActivity
                 nameTv.setText(bf.getName());
                 nameTv.setTextSize(12f);
                 nameTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                nameTv.setTextColor(Color.parseColor("#F4F4F5"));
+                nameTv.setTextColor(AppTheme.text());
                 item.addView(nameTv);
 
                 String dateStr = new SimpleDateFormat("MMM dd, yyyy • HH:mm", Locale.getDefault()).format(new Date(bf.lastModified()));
                 TextView metaTv = new TextView(this);
                 metaTv.setText(dateStr + " • " + MediaStorageManager.formatBytes(bf.length()));
                 metaTv.setTextSize(10.5f);
-                metaTv.setTextColor(Color.parseColor("#71717A"));
+                metaTv.setTextColor(AppTheme.textMuted());
                 metaTv.setPadding(0, dp(2), 0, 0);
                 item.addView(metaTv);
 
@@ -10257,7 +11487,7 @@ public final class FishbowlActivity extends AppCompatActivity
         btnPickFile.setTextSize(11f);
         btnPickFile.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         btnPickFile.setTextColor(Color.parseColor("#55A9A0"));
-        btnPickFile.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#55A9A0"), dp(1), dp(8)));
+        btnPickFile.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), Color.parseColor("#55A9A0"), dp(1), dp(8)));
         btnPickFile.setOnClickListener(v -> {
             d.dismiss();
             launchFilePickerForRestore();
@@ -10272,22 +11502,22 @@ public final class FishbowlActivity extends AppCompatActivity
         btnCancel.setText("CANCEL");
         btnCancel.setTextSize(11f);
         btnCancel.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        btnCancel.setTextColor(Color.parseColor("#A1A1AA"));
-        btnCancel.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, Color.parseColor("#27272A"), dp(1), dp(8)));
+        btnCancel.setTextColor(AppTheme.textSecondary());
+        btnCancel.setBackground(createBorderedRoundedDrawable(Color.TRANSPARENT, AppTheme.outline(), dp(1), dp(8)));
         btnCancel.setOnClickListener(v -> d.dismiss());
         box.addView(btnCancel, new LinearLayout.LayoutParams(-1, dp(36)));
 
-        d.setContentView(scroll);
+        d.setContentView(I18n.attach(scroll));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
             wlp.copyFrom(d.getWindow().getAttributes());
             wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.92);
             wlp.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.65);
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void launchFilePickerForRestore() {
@@ -10295,9 +11525,9 @@ public final class FishbowlActivity extends AppCompatActivity
             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
             intent.setType("*/*");
             intent.addCategory(Intent.CATEGORY_OPENABLE);
-            restoreFilePickerLauncher.launch(Intent.createChooser(intent, "Select FishBowl Backup (.zip)"));
+            restoreFilePickerLauncher.launch(Intent.createChooser(intent, "Select Jellyarr Backup (.zip)"));
         } catch (Throwable t) {
-            Toast.makeText(this, "Cannot open file picker: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Cannot open file picker: " + t.getMessage()), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -10305,7 +11535,7 @@ public final class FishbowlActivity extends AppCompatActivity
         showConfirmRestoreDialog(file.getName(), () -> {
             TextView[] msgHolder = new TextView[1];
             Dialog progressDialog = createBackupProgressDialog("RESTORING CONFIGURATION", "Extracting and applying configuration files...", msgHolder);
-            progressDialog.show();
+            safeShow(progressDialog);
 
             BackupRestoreManager.restoreBackup(this, file, new BackupRestoreManager.RestoreCallback() {
                 @Override
@@ -10334,7 +11564,7 @@ public final class FishbowlActivity extends AppCompatActivity
         showConfirmRestoreDialog("Selected File Archive", () -> {
             TextView[] msgHolder = new TextView[1];
             Dialog progressDialog = createBackupProgressDialog("RESTORING CONFIGURATION", "Extracting and applying configuration files...", msgHolder);
-            progressDialog.show();
+            safeShow(progressDialog);
 
             BackupRestoreManager.restoreBackup(this, uri, new BackupRestoreManager.RestoreCallback() {
                 @Override
@@ -10365,22 +11595,22 @@ public final class FishbowlActivity extends AppCompatActivity
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(12)));
+        box.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(12)));
         box.setPadding(dp(18), dp(18), dp(18), dp(18));
 
         TextView title = new TextView(this);
         title.setText("CONFIRM RESTORE");
         title.setTextSize(14f);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#FFD51E"));
+        title.setTextColor(AppTheme.warning());
         box.addView(title);
 
         TextView msg = new TextView(this);
         msg.setText("Restoring from:\n" + sourceName + "\n\n"
-                + "This will overwrite your current FishBowl preferences, API keys, and media service configurations with the backup archive.\n\n"
+                + "This will overwrite your current Jellyarr preferences, API keys, and media service configurations with the backup archive.\n\n"
                 + "Are you sure you want to proceed?");
         msg.setTextSize(11.5f);
-        msg.setTextColor(Color.parseColor("#D4D4D8"));
+        msg.setTextColor(AppTheme.text());
         msg.setLineSpacing(dp(2), 1.15f);
         msg.setPadding(0, dp(10), 0, dp(14));
         box.addView(msg);
@@ -10393,40 +11623,40 @@ public final class FishbowlActivity extends AppCompatActivity
         btnProceed.setText("RESTORE NOW");
         btnProceed.setTextSize(11f);
         btnProceed.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnProceed.setTextColor(Color.BLACK);
-        btnProceed.setBackground(createBorderedRoundedDrawable(Color.parseColor("#FFD51E"), Color.parseColor("#FFD51E"), 0, dp(8)));
+        btnProceed.setTextColor(AppTheme.contrastOn(AppTheme.warning()));
+        btnProceed.setBackground(createBorderedRoundedDrawable(AppTheme.warning(), AppTheme.warning(), 0, dp(8)));
         btnProceed.setOnClickListener(v -> {
             d.dismiss();
             if (onConfirmed != null) onConfirmed.run();
         });
         LinearLayout.LayoutParams b1P = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
-        b1P.rightMargin = dp(6);
+        b1P.setMarginEnd(dp(6));
         btnRow.addView(btnProceed, b1P);
 
         Button btnCancel = new Button(this);
         btnCancel.setText("CANCEL");
         btnCancel.setTextSize(11f);
         btnCancel.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnCancel.setTextColor(Color.parseColor("#F4F4F5"));
-        btnCancel.setBackground(createBorderedRoundedDrawable(Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
+        btnCancel.setTextColor(AppTheme.text());
+        btnCancel.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
         btnCancel.setOnClickListener(v -> d.dismiss());
         LinearLayout.LayoutParams b2P = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
-        b2P.leftMargin = dp(6);
+        b2P.setMarginStart(dp(6));
         btnRow.addView(btnCancel, b2P);
 
         box.addView(btnRow);
 
-        d.setContentView(box);
+        d.setContentView(I18n.attach(box));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
             wlp.copyFrom(d.getWindow().getAttributes());
             wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
             wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void showRestoreSuccessModal(int prefsCount, int configsCount) {
@@ -10435,7 +11665,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(createBorderedRoundedDrawable(Color.BLACK, Color.parseColor("#27272A"), dp(1), dp(12)));
+        box.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(12)));
         box.setPadding(dp(18), dp(18), dp(18), dp(18));
 
         TextView title = new TextView(this);
@@ -10451,7 +11681,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 + "• Service Configs: " + configsCount + " files\n\n"
                 + "To ensure all running daemons reload their restored configuration and credentials, please restart services.");
         info.setTextSize(11.5f);
-        info.setTextColor(Color.parseColor("#D4D4D8"));
+        info.setTextColor(AppTheme.text());
         info.setLineSpacing(dp(2), 1.15f);
         info.setPadding(0, dp(10), 0, dp(14));
         box.addView(info);
@@ -10460,13 +11690,13 @@ public final class FishbowlActivity extends AppCompatActivity
         btnRestart.setText("RESTART SERVICES NOW");
         btnRestart.setTextSize(11f);
         btnRestart.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnRestart.setTextColor(Color.parseColor("#090A0F"));
+        btnRestart.setTextColor(AppTheme.card());
         btnRestart.setBackground(createBorderedRoundedDrawable(Color.parseColor("#55A9A0"), Color.parseColor("#55A9A0"), 0, dp(8)));
         btnRestart.setOnClickListener(v -> {
             d.dismiss();
             triggerServerAction(JellyfinServerService.ACTION_STOP_ALL);
             mainHandler.postDelayed(() -> triggerServerAction(JellyfinServerService.ACTION_START_ALL), 1000);
-            Toast.makeText(this, "Restarting all services...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Restarting all services..."), Toast.LENGTH_SHORT).show();
             mainHandler.postDelayed(() -> {
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
@@ -10475,17 +11705,17 @@ public final class FishbowlActivity extends AppCompatActivity
         });
         box.addView(btnRestart, new LinearLayout.LayoutParams(-1, dp(40)));
 
-        d.setContentView(box);
+        d.setContentView(I18n.attach(box));
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(0.85f);
+            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
             WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
             wlp.copyFrom(d.getWindow().getAttributes());
             wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
             wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     // -- Tools Quick-Access Actions (Home Tab) ---------------------------------
@@ -10502,14 +11732,14 @@ public final class FishbowlActivity extends AppCompatActivity
         btnImporter.setTextSize(10f);
         btnImporter.setOnClickListener(v -> startActivity(new Intent(this, com.fishbowl.app.importer.MovieImportActivity.class)));
         LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(0, dp(36), 1.0f);
-        p1.rightMargin = dp(5);
+        p1.setMarginEnd(dp(5));
         row.addView(btnImporter, p1);
 
         Button btnStorage = createPixelButton("MEDIA STORAGE", getSurfaceElevatedColor(), getPrimaryTextColor());
         btnStorage.setTextSize(10f);
         btnStorage.setOnClickListener(v -> startActivity(new Intent(this, JellyfinStorageActivity.class)));
         LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, dp(36), 1.0f);
-        p2.leftMargin = dp(5);
+        p2.setMarginStart(dp(5));
         row.addView(btnStorage, p2);
 
         return row;
@@ -10524,13 +11754,13 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView descTv = new TextView(this);
         descTv.setText("Organize browser-downloaded video files into standard Jellyfin movie folder structures (e.g. Movie Title (Year)/Movie Title (Year).ext) with automatic metadata matching.");
         descTv.setTextSize(12f);
-        descTv.setTextColor(Color.parseColor("#A1A1AA"));
+        descTv.setTextColor(AppTheme.textSecondary());
         descTv.setLineSpacing(dp(3), 1.15f);
         descTv.setPadding(0, dp(2), 0, dp(10));
         content.addView(descTv);
 
         // Open Movie Importer Button (High-visibility action)
-        Button btnOpenImporter = createPixelButton("OPEN MOVIE IMPORTER", Color.WHITE, Color.BLACK);
+        Button btnOpenImporter = createPixelButton("OPEN MOVIE IMPORTER", AppTheme.accent(), AppTheme.onAccent());
         btnOpenImporter.setOnClickListener(v -> startActivity(new Intent(this, com.fishbowl.app.importer.MovieImportActivity.class)));
         LinearLayout.LayoutParams pBtn = new LinearLayout.LayoutParams(-1, dp(42));
         pBtn.bottomMargin = dp(12);
@@ -10550,13 +11780,13 @@ public final class FishbowlActivity extends AppCompatActivity
         adTitle.setText("Detect New Downloads");
         adTitle.setTextSize(13.5f);
         adTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        adTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        adTitle.setTextColor(AppTheme.text());
         adTextCol.addView(adTitle);
 
         TextView adSub = new TextView(this);
         adSub.setText("Alerts when browser downloads complete. Never auto-moves files.");
         adSub.setTextSize(11f);
-        adSub.setTextColor(Color.parseColor("#71717A"));
+        adSub.setTextColor(AppTheme.textMuted());
         adSub.setPadding(0, dp(2), 0, 0);
         adTextCol.addView(adSub);
 
@@ -10566,7 +11796,7 @@ public final class FishbowlActivity extends AppCompatActivity
         detectSwitch.setChecked(dm.isDetectionEnabled());
         detectSwitch.setOnCheckedChangeListener((b, isChecked) -> {
             dm.setDetectionEnabled(isChecked);
-            Toast.makeText(this, isChecked ? "Download detection enabled" : "Download detection disabled", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr(isChecked ? "Download detection enabled" : "Download detection disabled"), Toast.LENGTH_SHORT).show();
         });
         autoDetectRow.addView(detectSwitch);
         content.addView(autoDetectRow);
@@ -10586,13 +11816,13 @@ public final class FishbowlActivity extends AppCompatActivity
         ksTitle.setText("Keep Screen Awake While Importing");
         ksTitle.setTextSize(13.5f);
         ksTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        ksTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        ksTitle.setTextColor(AppTheme.text());
         ksTextCol.addView(ksTitle);
 
         TextView ksSub = new TextView(this);
         ksSub.setText("Prevents screen timeout and OS sleep while moving or copying media.");
         ksSub.setTextSize(11f);
-        ksSub.setTextColor(Color.parseColor("#71717A"));
+        ksSub.setTextColor(AppTheme.textMuted());
         ksSub.setPadding(0, dp(2), 0, 0);
         ksTextCol.addView(ksSub);
 
@@ -10602,7 +11832,7 @@ public final class FishbowlActivity extends AppCompatActivity
         keepScreenSwitch.setChecked(dm.isKeepScreenOnEnabled());
         keepScreenSwitch.setOnCheckedChangeListener((b, isChecked) -> {
             dm.setKeepScreenOnEnabled(isChecked);
-            Toast.makeText(this, isChecked ? "Screen will stay awake during imports" : "Screen wake lock disabled", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr(isChecked ? "Screen will stay awake during imports" : "Screen wake lock disabled"), Toast.LENGTH_SHORT).show();
         });
         keepScreenRow.addView(keepScreenSwitch);
         content.addView(keepScreenRow);
@@ -10622,13 +11852,13 @@ public final class FishbowlActivity extends AppCompatActivity
         tmdbTitle.setText("Metadata Provider (TMDB)");
         tmdbTitle.setTextSize(13.5f);
         tmdbTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        tmdbTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        tmdbTitle.setTextColor(AppTheme.text());
         tmdbTextCol.addView(tmdbTitle);
 
         TextView tmdbSub = new TextView(this);
         tmdbSub.setText("Optional TMDB API key for automatic posters and overviews.");
         tmdbSub.setTextSize(11f);
-        tmdbSub.setTextColor(Color.parseColor("#71717A"));
+        tmdbSub.setTextColor(AppTheme.textMuted());
         tmdbSub.setPadding(0, dp(2), 0, 0);
         tmdbTextCol.addView(tmdbSub);
 
@@ -10646,7 +11876,7 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView namingFormatTv = new TextView(this);
         namingFormatTv.setText("Default Naming: Movie Title (Year)/Movie Title (Year).ext\nConflict Policy: Keep Both (safe versioning) • Retain Original: Enabled");
         namingFormatTv.setTextSize(11f);
-        namingFormatTv.setTextColor(Color.parseColor("#71717A"));
+        namingFormatTv.setTextColor(AppTheme.textMuted());
         namingFormatTv.setPadding(0, dp(4), 0, dp(4));
         content.addView(namingFormatTv);
 
@@ -10665,7 +11895,7 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView desc = new TextView(this);
         desc.setText("Enter your personal TMDB API key to fetch movie posters and overviews during import.\n\nLeave blank to use filename heuristics.");
         desc.setTextSize(11.5f);
-        desc.setTextColor(Color.parseColor("#A1A1AA"));
+        desc.setTextColor(AppTheme.textSecondary());
         desc.setPadding(0, 0, 0, dp(12));
         content.addView(desc);
 
@@ -10674,10 +11904,10 @@ public final class FishbowlActivity extends AppCompatActivity
         if (currentKey != null) input.setText(currentKey);
         input.setSingleLine(true);
         input.setHint("Enter TMDB v3 API Key (optional)");
-        input.setHintTextColor(Color.parseColor("#71717A"));
-        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(AppTheme.textMuted());
+        input.setTextColor(AppTheme.text());
         input.setBackground(createBorderedRoundedDrawable(
-                Color.parseColor("#18181B"), Color.parseColor("#3F3F46"), dp(1), dp(8)));
+                AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
         input.setPadding(dp(14), dp(10), dp(14), dp(10));
         input.setTextSize(13f);
         input.setTypeface(Typeface.MONOSPACE);
@@ -10692,7 +11922,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 () -> {
                     String key = input.getText().toString().trim();
                     com.fishbowl.app.importer.TmdbMetadataProvider.setApiKey(this, key);
-                    Toast.makeText(this, key.isEmpty() ? "TMDB API key cleared" : "TMDB API key saved", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr(key.isEmpty() ? "TMDB API key cleared" : "TMDB API key saved"), Toast.LENGTH_SHORT).show();
                 },
                 "CANCEL",
                 null
@@ -10706,9 +11936,9 @@ public final class FishbowlActivity extends AppCompatActivity
         content.setOrientation(LinearLayout.VERTICAL);
 
         TextView descTv = new TextView(this);
-        descTv.setText("Fishbowl is an all-in-one local media streaming server for Android, bundling Jellyfin Server, .NET runtime, and native hardware transcoding with zero trackers.");
+        descTv.setText("Jellyarr is an all-in-one local media streaming server for Android, bundling Jellyfin Server, .NET runtime, and native hardware transcoding with zero trackers.");
         descTv.setTextSize(12f);
-        descTv.setTextColor(Color.parseColor("#A1A1AA"));
+        descTv.setTextColor(AppTheme.textSecondary());
         descTv.setLineSpacing(dp(3), 1.15f);
         descTv.setPadding(0, dp(2), 0, dp(10));
         content.addView(descTv);
@@ -10724,6 +11954,7 @@ public final class FishbowlActivity extends AppCompatActivity
         archHeading.setLetterSpacing(0.06f);
         archHeading.setPadding(0, dp(6), 0, dp(6));
         content.addView(archHeading);
+        styleSectionLabel(archHeading);
 
         content.addView(buildSpecRow("Jellyfin Server Core", "v12.4.0 (.NET 10 ARM64)"));
         content.addView(createSettingsDivider());
@@ -10770,7 +12001,7 @@ public final class FishbowlActivity extends AppCompatActivity
         licHeading.setPadding(0, dp(8), 0, dp(6));
         content.addView(licHeading);
 
-        content.addView(buildSpecRow("Fishbowl", "GNU GPL v3.0"));
+        content.addView(buildSpecRow("Jellyarr", "GNU GPL v3.0"));
         content.addView(createSettingsDivider());
         content.addView(buildSpecRow("Jellyfin Server Core", "GNU GPL v2.0"));
         content.addView(createSettingsDivider());
@@ -10780,15 +12011,9 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(createSettingsDivider());
         content.addView(buildSpecRow("Transmission Daemon", "GNU GPL v2.0 / v3.0"));
         content.addView(createSettingsDivider());
-        content.addView(buildSpecRow("Jackett Indexer Proxy", "GNU GPL v2.0"));
-        content.addView(createSettingsDivider());
         content.addView(buildSpecRow("Termux Android Environment", "Apache License 2.0"));
         content.addView(createSettingsDivider());
-        content.addView(buildSpecRow("Servarr Stack (Radarr/Sonarr/Lidarr/Prowlarr)", "GNU GPL v3.0"));
-        content.addView(createSettingsDivider());
-        content.addView(buildSpecRow("Bazarr Subtitle Manager", "GNU GPL v3.0"));
-        content.addView(createSettingsDivider());
-        content.addView(buildSpecRow("Jellyseerr Media Requests", "MIT License"));
+        content.addView(buildSpecRow("Servarr Stack (Radarr/Sonarr/Prowlarr)", "GNU GPL v3.0"));
         content.addView(createSettingsDivider());
         content.addView(buildSpecRow("FlareSolverr Cloudflare Proxy", "MIT License"));
         content.addView(createSettingsDivider());
@@ -10805,13 +12030,13 @@ public final class FishbowlActivity extends AppCompatActivity
         licTitle.setText("License Text & Notices");
         licTitle.setTextSize(13f);
         licTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        licTitle.setTextColor(Color.parseColor("#F4F4F5"));
+        licTitle.setTextColor(AppTheme.text());
         licTextCol.addView(licTitle);
 
         TextView licSub = new TextView(this);
         licSub.setText("View third-party notices and legal disclaimers");
         licSub.setTextSize(10.5f);
-        licSub.setTextColor(Color.parseColor("#71717A"));
+        licSub.setTextColor(AppTheme.textMuted());
         licSub.setPadding(0, dp(1), 0, 0);
         licTextCol.addView(licSub);
         licActionRow.addView(licTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
@@ -10823,7 +12048,7 @@ public final class FishbowlActivity extends AppCompatActivity
         content.addView(licActionRow);
 
         return buildCollapsibleCard(
-                "About Fishbowl",
+                "About Jellyarr",
                 "v" + com.termux.BuildConfig.VERSION_NAME + " • Architecture, Specs & Licenses",
                 content,
                 false
@@ -10834,11 +12059,11 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView tv = new TextView(this);
         tv.setTextSize(10.5f);
         tv.setTypeface(Typeface.MONOSPACE);
-        tv.setTextColor(Color.parseColor("#D4D4D8"));
+        tv.setTextColor(AppTheme.text());
         tv.setLineSpacing(dp(2), 1.15f);
         String licText = "FISHBOWL OPEN SOURCE LICENSES & NOTICES\n\n"
-                + "1. Fishbowl (GPL-3.0)\n"
-                + "Copyright (c) 2026 Fishbowl Contributors\n"
+                + "1. Jellyarr (GPL-3.0)\n"
+                + "Copyright (c) 2026 Jellyarr Contributors\n"
                 + "Licensed under the GNU General Public License v3.0.\n\n"
                 + "2. Jellyfin Server (GPL-2.0)\n"
                 + "Copyright (c) Jellyfin Contributors\n"
@@ -10849,26 +12074,17 @@ public final class FishbowlActivity extends AppCompatActivity
                 + "Copyright (c) .NET Foundation and Contributors\n\n"
                 + "5. Transmission Daemon (GPL-2.0 / GPL-3.0)\n"
                 + "Copyright (c) Transmission Project\n\n"
-                + "6. Jackett Torrent Indexer Proxy (GPL-2.0)\n"
-                + "Copyright (c) Jackett Contributors\n"
-                + "Licensed under the GNU General Public License v2.0.\n\n"
                 + "7. Termux Android Environment (Apache-2.0)\n"
                 + "Copyright (c) Termux Open Source Project\n\n"
-                + "8. Servarr Stack (Radarr, Sonarr, Lidarr, Prowlarr) (GPL-3.0)\n"
+                + "8. Servarr Stack (Radarr, Sonarr, Prowlarr) (GPL-3.0)\n"
                 + "Copyright (c) Servarr Development Team\n\n"
-                + "9. Bazarr Subtitles (GPL-3.0)\n"
-                + "Copyright (c) Bazarr Contributors\n"
-                + "Licensed under the GNU General Public License v3.0.\n\n"
-                + "10. Jellyseerr / Overseerr (MIT)\n"
-                + "Copyright (c) Overseerr & Jellyseerr Contributors\n"
-                + "Licensed under the MIT License.\n\n"
                 + "11. FlareSolverr Proxy (MIT)\n"
                 + "Copyright (c) FlareSolverr Contributors\n"
                 + "Licensed under the MIT License.\n\n"
                 + "12. Legal & Anti-Piracy Policy\n"
-                + "Fishbowl is a personal homelab management utility and does not host, index, or distribute copyrighted media. End users are solely responsible for ensuring compliance with all applicable copyright and intellectual property laws.\n\n"
+                + "Jellyarr is a personal homelab management utility and does not host, index, or distribute copyrighted media. End users are solely responsible for ensuring compliance with all applicable copyright and intellectual property laws.\n\n"
                 + "13. AI-Assisted Development Disclosure\n"
-                + "Fishbowl is developed and maintained with the assistance of artificial intelligence systems (Google DeepMind Antigravity and Gemini CLI) and empirically verified on physical hardware.\n";
+                + "Jellyarr is developed and maintained with the assistance of artificial intelligence systems (Google DeepMind Antigravity and Gemini CLI) and empirically verified on physical hardware.\n";
         tv.setText(licText);
 
         ScrollView sc = new ScrollView(this);
@@ -10897,11 +12113,11 @@ public final class FishbowlActivity extends AppCompatActivity
 
         TextView tvDiag = new TextView(this);
         tvDiag.setTextSize(12);
-        tvDiag.setTextColor(Color.parseColor("#81C784"));
+        tvDiag.setTextColor(AppTheme.success());
         tvDiag.setPadding(0, dp(4), 0, dp(10));
         tvDiag.setText("Tap any benchmark to test hardware and software transcoding capabilities.");
 
-        Button btnTestTranscode = createPixelButton("BENCHMARK SOFTWARE NEON", getAccentColor(), Color.WHITE);
+        Button btnTestTranscode = createPixelButton("BENCHMARK SOFTWARE NEON", getAccentColor(), AppTheme.onAccent());
         btnTestTranscode.setOnClickListener(v -> {
             btnTestTranscode.setEnabled(false);
             btnTestTranscode.setText("BENCHMARKING...");
@@ -10914,7 +12130,7 @@ public final class FishbowlActivity extends AppCompatActivity
                             " | " + tr.speed + " (" + tr.fps + " fps) | " + tr.inputCodec + " -> " + tr.outputCodec +
                             " (" + tr.durationMs + " ms)";
                     tvDiag.setText(res);
-                    tvDiag.setTextColor(tr.success ? Color.parseColor("#81C784") : Color.parseColor("#E57373"));
+                    tvDiag.setTextColor(tr.success ? AppTheme.success() : AppTheme.danger());
                 });
             }).start();
         });
@@ -10935,7 +12151,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     String res = "Hardware Probe: " + (tr.success ? "SUCCESS" : "DIAGNOSTIC REPORT") +
                             "\n" + (tr.details != null && !tr.details.isEmpty() ? tr.details : tr.error);
                     tvDiag.setText(res);
-                    tvDiag.setTextColor(tr.success ? Color.parseColor("#81C784") : Color.parseColor("#FFB74D"));
+                    tvDiag.setTextColor(tr.success ? AppTheme.success() : AppTheme.warning());
                 });
             }).start();
         });
@@ -10956,7 +12172,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     String res = "Audio Benchmark: " + (tr.success ? "SUCCESS" : "FAILED") +
                             " | " + tr.speed + " | AC3 5.1 -> AAC 2.0 (" + tr.durationMs + " ms)";
                     tvDiag.setText(res);
-                    tvDiag.setTextColor(tr.success ? Color.parseColor("#81C784") : Color.parseColor("#E57373"));
+                    tvDiag.setTextColor(tr.success ? AppTheme.success() : AppTheme.danger());
                 });
             }).start();
         });
@@ -10975,7 +12191,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     btnCheckSubtitles.setEnabled(true);
                     btnCheckSubtitles.setText("CHECK SUBTITLES ENGINE");
                     tvDiag.setText(tr.details);
-                    tvDiag.setTextColor(tr.success ? Color.parseColor("#81C784") : Color.parseColor("#FFB74D"));
+                    tvDiag.setTextColor(tr.success ? AppTheme.success() : AppTheme.warning());
                 });
             }).start();
         });
@@ -11023,93 +12239,17 @@ public final class FishbowlActivity extends AppCompatActivity
         aboutContent.addView(buildTransparencyItem("OpenSSL Security & TLS Stack", "OpenSSL 3.x cryptographic SSL/TLS engine managing local HTTPS encryption and secure outbound metadata sockets."));
         aboutContent.addView(buildTransparencyItem("Fontconfig & FreeType Engines", "libfontconfig.so / libfreetype.so native C libraries used by FFmpeg for video subtitle burn-in and text rendering."));
         aboutContent.addView(buildTransparencyItem("SQLite3 Database Driver", "libe_sqlite3.so embedded lightweight relational database engine storing user library indexes and watch progress locally."));
-        aboutContent.addView(buildTransparencyItem("Application Package & Scope", getPackageName() + " (Fishbowl v" + com.termux.BuildConfig.VERSION_NAME + ") isolated Android package namespace."));
+        aboutContent.addView(buildTransparencyItem("Application Package & Scope", getPackageName() + " (Jellyarr v" + com.termux.BuildConfig.VERSION_NAME + ") isolated Android package namespace."));
         aboutContent.addView(buildTransparencyItem("Privacy & Telemetry Verification", "No background metrics are collected or transmitted to external servers. All media data stays strictly on your device."));
         return aboutContent;
     }
 
+    /** Settings sections now live on their own page: a single always-open card (no folded list inside). */
     private LinearLayout buildCollapsibleCard(String titleText, String subtitleText, View contentContainer, boolean initiallyExpanded) {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(createRoundedDrawable(Color.parseColor("#0C0D10"), dp(12)));
-        card.setPadding(dp(16), dp(14), dp(16), dp(14));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.bottomMargin = dp(14);
-        card.setLayoutParams(params);
-
-        // Header layout (clickable)
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setClickable(true);
-        header.setFocusable(true);
-
-        LinearLayout titleCol = new LinearLayout(this);
-        titleCol.setOrientation(LinearLayout.VERTICAL);
-
-        TextView title = new TextView(this);
-        title.setText(titleText);
-        title.setTextSize(13.5f);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(getPrimaryTextColor());
-        titleCol.addView(title);
-
-        TextView sub = new TextView(this);
-        sub.setText(subtitleText);
-        sub.setTextSize(10.5f);
-        sub.setTextColor(getSecondaryTextColor());
-        sub.setPadding(0, dp(2), 0, 0);
-        titleCol.addView(sub);
-
-        header.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        FrameLayout arrowSlot = new FrameLayout(this);
-        arrowSlot.setBackground(createRoundedDrawable(Color.parseColor("#15161A"), dp(6)));
-        ImageView arrow = new ImageView(this);
-        arrow.setImageResource(R.drawable.ic_chevron_down);
-        arrow.setColorFilter(getSecondaryTextColor());
-        arrow.setRotation(initiallyExpanded ? 180f : 0f);
-        FrameLayout.LayoutParams ivLp = new FrameLayout.LayoutParams(dp(18), dp(18));
-        ivLp.gravity = Gravity.CENTER;
-        arrowSlot.addView(arrow, ivLp);
-        header.addView(arrowSlot, new LinearLayout.LayoutParams(dp(28), dp(28)));
-
-        card.addView(header);
-
-        // Subtle divider separating header and content
-        View divider = new View(this);
-        divider.setBackgroundColor(Color.argb(12, 255, 255, 255));
-        LinearLayout.LayoutParams pDiv = new LinearLayout.LayoutParams(-1, dp(1));
-        pDiv.topMargin = dp(12);
-        pDiv.bottomMargin = dp(12);
-        divider.setLayoutParams(pDiv);
-        divider.setVisibility(initiallyExpanded ? View.VISIBLE : View.GONE);
-        card.addView(divider);
-
-        // Content
-        contentContainer.setVisibility(initiallyExpanded ? View.VISIBLE : View.GONE);
+        LinearLayout card = UiKit.card(this);
+        card.setPadding(dp(16), dp(16), dp(16), dp(16));
+        contentContainer.setVisibility(View.VISIBLE);
         card.addView(contentContainer);
-
-        header.setOnClickListener(v -> {
-            boolean isExpanded = (contentContainer.getVisibility() == View.VISIBLE);
-            if (isExpanded) {
-                contentContainer.setVisibility(View.GONE);
-                divider.setVisibility(View.GONE);
-                arrow.animate().rotation(0f).setDuration(220).start();
-            } else {
-                contentContainer.setVisibility(View.VISIBLE);
-                divider.setVisibility(View.VISIBLE);
-                arrow.animate().rotation(180f).setDuration(220).start();
-                if ("Permissions & Background Survival".equals(titleText)) {
-                    refreshPermissionsUI();
-                } else if ("Security & Identity".equals(titleText)) {
-                    refreshSecurityUsersUI();
-                } else if ("Backup & Restore".equals(titleText)) {
-                    updateBackupStatusUI();
-                }
-            }
-        });
-
         return card;
     }
 
@@ -11176,7 +12316,7 @@ public final class FishbowlActivity extends AppCompatActivity
         card.addView(subtitle);
 
         // One-Click Grant All Permissions Button
-        btnGrantAllPermissions = createPixelButton("GRANT ALL PERMISSIONS", getAccentColor(), Color.WHITE);
+        btnGrantAllPermissions = createPixelButton("GRANT ALL PERMISSIONS", getAccentColor(), AppTheme.onAccent());
         btnGrantAllPermissions.setTextSize(10.5f);
         btnGrantAllPermissions.setOnClickListener(v -> com.fishbowl.app.permissions.AppPermissionManager.grantNextUngrantedPermission(this));
         LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(-1, dp(36));
@@ -11189,7 +12329,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 "Grants Jellyfin read access to movies, music, and shows on internal and external drives.",
                 v -> {
                     if (com.fishbowl.app.permissions.AppPermissionManager.isStorageGranted(this)) {
-                        Toast.makeText(this, "Storage access is already granted.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, I18n.tr("Storage access is already granted."), Toast.LENGTH_SHORT).show();
                     } else {
                         com.fishbowl.app.permissions.AppPermissionManager.requestStorage(this);
                     }
@@ -11222,7 +12362,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 "Prevents Android OS from pausing or terminating background playback services.",
                 v -> {
                     if (com.fishbowl.app.permissions.AppPermissionManager.isBatteryOptimizationExempted(this)) {
-                        Toast.makeText(this, "Battery optimization exemption is already active.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, I18n.tr("Battery optimization exemption is already active."), Toast.LENGTH_SHORT).show();
                     } else {
                         requestIgnoreBatteryOptimizationsIfNeeded();
                     }
@@ -11246,7 +12386,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 "Maintains persistent media server notification to protect background execution.",
                 v -> {
                     if (com.fishbowl.app.permissions.AppPermissionManager.isNotificationGranted(this)) {
-                        Toast.makeText(this, "Notification permission is already granted.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, I18n.tr("Notification permission is already granted."), Toast.LENGTH_SHORT).show();
                     } else {
                         com.fishbowl.app.permissions.AppPermissionManager.requestNotification(this);
                     }
@@ -11276,13 +12416,13 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView badgeOem = rowOem.findViewWithTag("badge");
         if (badgeOem != null) {
             badgeOem.setText("CONFIGURE");
-            badgeOem.setTextColor(Color.parseColor("#FFB74D"));
-            badgeOem.setBackground(createRoundedDrawable(Color.parseColor("#3A2E1A"), dp(8)));
+            badgeOem.setTextColor(AppTheme.warning());
+            badgeOem.setBackground(createRoundedDrawable(AppTheme.warningContainer(), dp(8)));
         }
         TextView actionOem = rowOem.findViewWithTag("action_text");
         if (actionOem != null) {
             actionOem.setText("Tap to open system power & autostart manager");
-            actionOem.setTextColor(Color.parseColor("#FFB74D"));
+            actionOem.setTextColor(AppTheme.warning());
         }
         card.addView(rowOem);
 
@@ -11366,7 +12506,7 @@ public final class FishbowlActivity extends AppCompatActivity
         col.addView(tvAction);
 
         LinearLayout.LayoutParams colLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        colLp.rightMargin = dp(12);
+        colLp.setMarginEnd(dp(12));
         row.addView(col, colLp);
 
         TextView badge = new TextView(this);
@@ -11475,14 +12615,14 @@ public final class FishbowlActivity extends AppCompatActivity
                 btnGrantAllPermissions.setVisibility(View.VISIBLE);
                 btnGrantAllPermissions.setEnabled(false);
                 btnGrantAllPermissions.setText("ALL PERMISSIONS GRANTED ✓");
-                btnGrantAllPermissions.setBackground(createBorderedRoundedDrawable(Color.parseColor("#142A1E"), Color.parseColor("#10B981"), dp(1), dp(10)));
-                btnGrantAllPermissions.setTextColor(Color.parseColor("#10B981"));
+                btnGrantAllPermissions.setBackground(createBorderedRoundedDrawable(AppTheme.successContainer(), AppTheme.success(), dp(1), dp(10)));
+                btnGrantAllPermissions.setTextColor(AppTheme.success());
             } else {
                 btnGrantAllPermissions.setVisibility(View.VISIBLE);
                 btnGrantAllPermissions.setEnabled(true);
                 btnGrantAllPermissions.setText(nextMissingLabel);
-                btnGrantAllPermissions.setBackground(createBorderedRoundedDrawable(getAccentColor(), colorWithAlpha(Color.WHITE, 45), dp(1), dp(10)));
-                btnGrantAllPermissions.setTextColor(Color.WHITE);
+                btnGrantAllPermissions.setBackground(createBorderedRoundedDrawable(getAccentColor(), colorWithAlpha(AppTheme.onAccent(), 45), dp(1), dp(10)));
+                btnGrantAllPermissions.setTextColor(AppTheme.onAccent());
             }
         }
 
@@ -11491,14 +12631,14 @@ public final class FishbowlActivity extends AppCompatActivity
                 setupBtnGrantAll.setVisibility(View.VISIBLE);
                 setupBtnGrantAll.setEnabled(false);
                 setupBtnGrantAll.setText("ALL PERMISSIONS GRANTED ✓");
-                setupBtnGrantAll.setBackground(createBorderedRoundedDrawable(Color.parseColor("#142A1E"), Color.parseColor("#10B981"), dp(1), dp(10)));
-                setupBtnGrantAll.setTextColor(Color.parseColor("#10B981"));
+                setupBtnGrantAll.setBackground(createBorderedRoundedDrawable(AppTheme.successContainer(), AppTheme.success(), dp(1), dp(10)));
+                setupBtnGrantAll.setTextColor(AppTheme.success());
             } else {
                 setupBtnGrantAll.setVisibility(View.VISIBLE);
                 setupBtnGrantAll.setEnabled(true);
                 setupBtnGrantAll.setText(nextMissingLabel);
-                setupBtnGrantAll.setBackground(createBorderedRoundedDrawable(getAccentColor(), colorWithAlpha(Color.WHITE, 45), dp(1), dp(10)));
-                setupBtnGrantAll.setTextColor(Color.WHITE);
+                setupBtnGrantAll.setBackground(createBorderedRoundedDrawable(getAccentColor(), colorWithAlpha(AppTheme.onAccent(), 45), dp(1), dp(10)));
+                setupBtnGrantAll.setTextColor(AppTheme.onAccent());
             }
         }
     }
@@ -11521,7 +12661,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(16), dp(14), dp(16), dp(14));
-        card.setBackground(createBorderedRoundedDrawable(Color.parseColor("#1B1214"), Color.parseColor("#3C1B1F"), dp(1), dp(14)));
+        card.setBackground(createBorderedRoundedDrawable(AppTheme.dangerContainer(), AppTheme.dangerContainer(), dp(1), dp(14)));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.topMargin = dp(12);
         card.setLayoutParams(params);
@@ -11535,18 +12675,18 @@ public final class FishbowlActivity extends AppCompatActivity
         title.setText("ERROR DIAGNOSIS");
         title.setTextSize(11);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(Color.parseColor("#EF5350"));
+        title.setTextColor(AppTheme.danger());
         headerRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         errorCardCategoryText = new TextView(this);
         errorCardCategoryText.setText("DETECTED");
         errorCardCategoryText.setTextSize(10);
         errorCardCategoryText.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        errorCardCategoryText.setTextColor(Color.parseColor("#EF5350"));
-        errorCardCategoryText.setBackground(createRoundedDrawable(Color.parseColor("#3C1B1F"), dp(6)));
+        errorCardCategoryText.setTextColor(AppTheme.danger());
+        errorCardCategoryText.setBackground(createRoundedDrawable(AppTheme.dangerContainer(), dp(6)));
         errorCardCategoryText.setPadding(dp(8), dp(3), dp(8), dp(3));
         LinearLayout.LayoutParams catParams = new LinearLayout.LayoutParams(-2, -2);
-        catParams.rightMargin = dp(8);
+        catParams.setMarginEnd(dp(8));
         headerRow.addView(errorCardCategoryText, catParams);
 
         Button btnDismiss = createPillCopyButton();
@@ -11587,7 +12727,7 @@ public final class FishbowlActivity extends AppCompatActivity
         errorCardWhyText = new TextView(this);
         errorCardWhyText.setText("An unhandled exception occurred during runtime launch.");
         errorCardWhyText.setTextSize(12);
-        errorCardWhyText.setTextColor(Color.parseColor("#FFCDD2"));
+        errorCardWhyText.setTextColor(AppTheme.danger());
         card.addView(errorCardWhyText);
 
         // Section 3: Recommended Action
@@ -11602,14 +12742,14 @@ public final class FishbowlActivity extends AppCompatActivity
         errorCardFixText = new TextView(this);
         errorCardFixText.setText("1. Tap RESTART SERVER to relaunch the process.\n2. Review terminal logs for stack trace details.");
         errorCardFixText.setTextSize(12);
-        errorCardFixText.setTextColor(Color.parseColor("#C8E6C9"));
+        errorCardFixText.setTextColor(AppTheme.success());
         card.addView(errorCardFixText);
 
         // Section 4: Raw Diagnostics Box
         errorCardRawContainer = new LinearLayout(this);
         ((LinearLayout) errorCardRawContainer).setOrientation(LinearLayout.VERTICAL);
         errorCardRawContainer.setPadding(dp(10), dp(8), dp(10), dp(8));
-        errorCardRawContainer.setBackground(createRoundedDrawable(Color.parseColor("#140D0F"), dp(8)));
+        errorCardRawContainer.setBackground(createRoundedDrawable(AppTheme.dangerContainer(), dp(8)));
         LinearLayout.LayoutParams rawParams = new LinearLayout.LayoutParams(-1, -2);
         rawParams.topMargin = dp(8);
         errorCardRawContainer.setLayoutParams(rawParams);
@@ -11617,7 +12757,7 @@ public final class FishbowlActivity extends AppCompatActivity
         errorCardRawText = new TextView(this);
         errorCardRawText.setTextSize(11);
         errorCardRawText.setTypeface(Typeface.MONOSPACE);
-        errorCardRawText.setTextColor(Color.parseColor("#EF9A9A"));
+        errorCardRawText.setTextColor(AppTheme.danger());
         errorCardRawText.setMaxLines(6);
         errorCardRawText.setEllipsize(android.text.TextUtils.TruncateAt.END);
         ((LinearLayout) errorCardRawContainer).addView(errorCardRawText);
@@ -11631,14 +12771,14 @@ public final class FishbowlActivity extends AppCompatActivity
         sRowParams.topMargin = dp(8);
         storageBtnRow.setLayoutParams(sRowParams);
 
-        btnErrorClearCache = createPixelButton("CLEAR CACHE & FREE SPACE", Color.parseColor("#D32F2F"), Color.WHITE);
+        btnErrorClearCache = createPixelButton("CLEAR CACHE & FREE SPACE", AppTheme.danger(), Color.WHITE);
         btnErrorClearCache.setOnClickListener(v -> showClearCacheConfirmation());
         storageBtnRow.addView(btnErrorClearCache, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
 
         View sSpacer = new View(this);
         storageBtnRow.addView(sSpacer, new LinearLayout.LayoutParams(dp(8), 1));
 
-        btnErrorOpenStorage = createPixelButton("OPEN STORAGE SETTINGS", getSurfaceElevatedColor(), Color.parseColor("#FFB74D"));
+        btnErrorOpenStorage = createPixelButton("OPEN STORAGE SETTINGS", getSurfaceElevatedColor(), AppTheme.warning());
         btnErrorOpenStorage.setOnClickListener(v -> openStorageSettings());
         storageBtnRow.addView(btnErrorOpenStorage, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
 
@@ -11653,10 +12793,10 @@ public final class FishbowlActivity extends AppCompatActivity
         btnRowParams.topMargin = dp(10);
         btnRow.setLayoutParams(btnRowParams);
 
-        Button btnCopyDiag = createPixelButton("COPY DIAGNOSTICS", Color.parseColor("#3C1B1F"), Color.parseColor("#EF5350"));
+        Button btnCopyDiag = createPixelButton("COPY DIAGNOSTICS", AppTheme.dangerContainer(), AppTheme.danger());
         btnCopyDiag.setOnClickListener(v -> copyDiagnosticsToClipboard());
         LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(0, -2, 1.0f);
-        pCopy.rightMargin = dp(6);
+        pCopy.setMarginEnd(dp(6));
         btnRow.addView(btnCopyDiag, pCopy);
 
         Button btnLogs = createPixelButton("VIEW LOGS", getSurfaceElevatedColor(), getPrimaryTextColor());
@@ -11777,7 +12917,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void copyDiagnosticsToClipboard() {
         StringBuilder diag = new StringBuilder();
-        diag.append("Fishbowl Jellyfin Diagnostic Report\n");
+        diag.append("Jellyarr Jellyfin Diagnostic Report\n");
         diag.append("App Version: ").append(com.termux.BuildConfig.VERSION_NAME).append(" (Build ").append(com.termux.BuildConfig.VERSION_CODE).append(")\n");
         diag.append("Jellyfin Core: 12.4.0 ARM64\n");
         diag.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
@@ -11797,8 +12937,8 @@ public final class FishbowlActivity extends AppCompatActivity
         }
         ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (cm != null) {
-            cm.setPrimaryClip(ClipData.newPlainText("Fishbowl Error Diagnostics", diag.toString()));
-            Toast.makeText(this, "Diagnostic report copied to clipboard", Toast.LENGTH_SHORT).show();
+            cm.setPrimaryClip(ClipData.newPlainText("Jellyarr Error Diagnostics", diag.toString()));
+            Toast.makeText(this, I18n.tr("Diagnostic report copied to clipboard"), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -11831,13 +12971,13 @@ public final class FishbowlActivity extends AppCompatActivity
 
         TextView tv = new TextView(this);
         tv.setTextSize(11.5f);
-        tv.setTextColor(Color.parseColor("#A1A1AA"));
+        tv.setTextColor(AppTheme.textSecondary());
         tv.setLineSpacing(dp(2), 1.15f);
 
         if (isStorageFull) {
             tv.setText("Device internal storage has less than 50 MB remaining. The server cannot safely write to SQLite or log files and auto-restart has been halted to prevent a crash loop.\n\nPlease free up internal storage space.");
             showOledDialog("Critical: Storage Full", "Device storage space exhausted", tv,
-                    "CLEAR CACHE", Color.parseColor("#EF4444"), this::showClearCacheConfirmation, "DISMISS", null);
+                    "CLEAR CACHE", AppTheme.danger(), this::showClearCacheConfirmation, "DISMISS", null);
         } else {
             String msg = (lastError != null && !lastError.isEmpty()) ? lastError : "The server process exited unexpectedly.";
             tv.setText(msg + "\n\nA diagnostic report can be copied or submitted to GitHub.");
@@ -11861,7 +13001,13 @@ public final class FishbowlActivity extends AppCompatActivity
         }
     }
 
+    private long lastStorageScanMs = 0;
+
     private void updateStorageInfoText() {
+        // Scanning the whole data dir is expensive: do it at most every 30s when merely opening the tab.
+        long now = SystemClock.elapsedRealtime();
+        if (lastStorageScanMs != 0 && now - lastStorageScanMs < 30000) return;
+        lastStorageScanMs = now;
         refreshStorageBar();
     }
 
@@ -11870,7 +13016,7 @@ public final class FishbowlActivity extends AppCompatActivity
         reportTv.setText(TranscodingDiagnostics.generateDetailedAuditReport());
         reportTv.setTypeface(Typeface.MONOSPACE);
         reportTv.setTextSize(10.5f);
-        reportTv.setTextColor(Color.parseColor("#D4D4D8"));
+        reportTv.setTextColor(AppTheme.text());
         reportTv.setPadding(0, dp(4), 0, dp(4));
 
         ScrollView scroll = new ScrollView(this);
@@ -11884,7 +13030,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     ClipboardManager cb = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                     if (cb != null) {
                         cb.setPrimaryClip(ClipData.newPlainText("Codec Report", reportTv.getText()));
-                        Toast.makeText(this, "Copied SoC codec report to clipboard", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, I18n.tr("Copied SoC codec report to clipboard"), Toast.LENGTH_SHORT).show();
                     }
                 }, "CLOSE", null);
     }
@@ -11893,11 +13039,11 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView tv = new TextView(this);
         tv.setText("This removes temporary cache and FFmpeg transcode files only.\n\nYour Jellyfin server, libraries, accounts, media, and configurations will not be deleted.");
         tv.setTextSize(11.5f);
-        tv.setTextColor(Color.parseColor("#A1A1AA"));
+        tv.setTextColor(AppTheme.textSecondary());
         tv.setLineSpacing(dp(2), 1.15f);
 
         showOledDialog("Clear Temporary Cache?", "Safely reclaim storage space", tv,
-                "CLEAR CACHE", Color.parseColor("#EF4444"), this::executeSafeClearCache, "CANCEL", null);
+                "CLEAR CACHE", AppTheme.danger(), this::executeSafeClearCache, "CANCEL", null);
     }
 
     private void executeSafeClearCache() {
@@ -11954,9 +13100,9 @@ public final class FishbowlActivity extends AppCompatActivity
                 updateStorageInfoText();
                 refreshStorageBar();
                 if (finalSuccess) {
-                    Toast.makeText(FishbowlActivity.this, "Cache cleared successfully.", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(FishbowlActivity.this, I18n.tr("Cache cleared successfully."), Toast.LENGTH_SHORT).show();
                 } else {
-                    Toast.makeText(FishbowlActivity.this, "Cache partially cleared. Some temporary files could not be removed.", Toast.LENGTH_LONG).show();
+                    Toast.makeText(FishbowlActivity.this, I18n.tr("Cache partially cleared. Some temporary files could not be removed."), Toast.LENGTH_LONG).show();
                 }
             });
         }).start();
@@ -12041,35 +13187,35 @@ public final class FishbowlActivity extends AppCompatActivity
         runtimeStatusText.setPadding(0, dp(4), 0, dp(8));
         item.addView(runtimeStatusText);
 
-        btnSettingsRetry = createPixelButton("RETRY SETUP", getAccentColor(), Color.WHITE);
+        btnSettingsRetry = createPixelButton("RETRY SETUP", getAccentColor(), AppTheme.onAccent());
         btnSettingsRetry.setOnClickListener(v -> {
-            Toast.makeText(this, "Retrying FishBowl setup...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, I18n.tr("Retrying Jellyarr setup..."), Toast.LENGTH_SHORT).show();
             controller.reinstallRuntime(this);
         });
         btnSettingsRetry.setVisibility(View.GONE);
         item.addView(btnSettingsRetry);
 
-        Button btnViewSetup = createPixelButton("VIEW SETUP OVERVIEW & LOGS", Color.parseColor("#18191E"), Color.parseColor("#F4F4F5"));
+        Button btnViewSetup = createPixelButton("VIEW SETUP OVERVIEW & LOGS", AppTheme.inner(), AppTheme.text());
         btnViewSetup.setTextSize(10f);
         btnViewSetup.setOnClickListener(v -> showSetupOverlay(true));
         LinearLayout.LayoutParams pViewSetup = new LinearLayout.LayoutParams(-1, dp(36));
         pViewSetup.bottomMargin = dp(6);
         item.addView(btnViewSetup, pViewSetup);
 
-        btnSettingsReinstall = createPixelButton("REINSTALL RUNTIME", Color.parseColor("#455A64"), Color.WHITE);
+        btnSettingsReinstall = createPixelButton("REINSTALL RUNTIME", AppTheme.inner(), Color.WHITE);
         btnSettingsReinstall.setOnClickListener(v -> showReinstallConfirmation());
         item.addView(btnSettingsReinstall);
 
-        Button btnAddQsTile = createPixelButton("ADD QUICK SETTINGS TILE", Color.parseColor("#18191E"), Color.parseColor("#F4F4F5"));
+        Button btnAddQsTile = createPixelButton("ADD QUICK SETTINGS TILE", AppTheme.inner(), AppTheme.text());
         btnAddQsTile.setTextSize(10f);
         btnAddQsTile.setOnClickListener(v -> {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 FishbowlQuickSettingsTileService.requestAddTile(this,
-                    () -> Toast.makeText(this, "Fishbowl Quick Settings tile added!", Toast.LENGTH_SHORT).show(),
-                    () -> Toast.makeText(this, "Quick Settings tile request cancelled or already present.", Toast.LENGTH_SHORT).show()
+                    () -> Toast.makeText(this, I18n.tr("Jellyarr Quick Settings tile added!"), Toast.LENGTH_SHORT).show(),
+                    () -> Toast.makeText(this, I18n.tr("Quick Settings tile request cancelled or already present."), Toast.LENGTH_SHORT).show()
                 );
             } else {
-                Toast.makeText(this, "To add the Fishbowl tile: swipe down twice from the top of your screen, tap Edit (pencil icon), and drag the Fishbowl tile into active tiles.", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr("To add the Jellyarr tile: swipe down twice from the top of your screen, tap Edit (pencil icon), and drag the Jellyarr tile into active tiles."), Toast.LENGTH_LONG).show();
             }
         });
         LinearLayout.LayoutParams pAddTile = new LinearLayout.LayoutParams(-1, dp(36));
@@ -12095,15 +13241,15 @@ public final class FishbowlActivity extends AppCompatActivity
                 sb.append(bMsg).append(" (").append(bPct).append("%)\n");
             }
             sb.append("Please keep the application open until installation finishes.");
-            runtimeStatusText.setTextColor(Color.parseColor("#FFD54F"));
+            runtimeStatusText.setTextColor(AppTheme.warning());
         } else if (initialized) {
             sb.append("STATUS: INSTALLED & VERIFIED\n");
-            sb.append("- FishBowl & Jellyfin Core 12.4.0\n");
+            sb.append("- Jellyarr & Jellyfin Core 12.4.0\n");
             sb.append("- Microsoft .NET 10.0.12 Runtime Engine\n");
             sb.append("- FFmpeg 7.1.4-Jellyfin Transcoder\n");
             sb.append("- OpenSSL & SQLite3 System Libraries\n");
             sb.append("Runtime binaries are fully verified in application storage.");
-            runtimeStatusText.setTextColor(Color.parseColor("#81C784"));
+            runtimeStatusText.setTextColor(AppTheme.success());
         } else {
             sb.append("STATUS: INSTALLATION FAILED / INCOMPLETE\n");
             if (lastErr != null && !lastErr.isEmpty()) {
@@ -12112,7 +13258,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 sb.append("One or more runtime components are missing from storage.\n");
             }
             sb.append("Tap RETRY SETUP or REINSTALL RUNTIME to unpack fresh runtime binaries.");
-            runtimeStatusText.setTextColor(Color.parseColor("#E57373"));
+            runtimeStatusText.setTextColor(AppTheme.danger());
         }
 
         runtimeStatusText.setText(sb.toString());
@@ -12131,14 +13277,14 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void showReinstallConfirmation() {
         TextView tv = new TextView(this);
-        tv.setText("This will extract a fresh copy of FishBowl and FFmpeg runtime files.\n\nYour existing media libraries, user accounts, database, and configurations will NOT be deleted.");
+        tv.setText("This will extract a fresh copy of Jellyarr and FFmpeg runtime files.\n\nYour existing media libraries, user accounts, database, and configurations will NOT be deleted.");
         tv.setTextSize(11.5f);
-        tv.setTextColor(Color.parseColor("#A1A1AA"));
+        tv.setTextColor(AppTheme.textSecondary());
         tv.setLineSpacing(dp(2), 1.15f);
 
-        showOledDialog("Reinstall FishBowl Runtime?", "Clean runtime re-extraction", tv,
+        showOledDialog("Reinstall Jellyarr Runtime?", "Clean runtime re-extraction", tv,
                 "REINSTALL", getAccentColor(), () -> {
-                    Toast.makeText(this, "Beginning clean runtime extraction...", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, I18n.tr("Beginning clean runtime extraction..."), Toast.LENGTH_SHORT).show();
                     controller.reinstallRuntime(this);
                 }, "CANCEL", null);
     }
@@ -12183,7 +13329,7 @@ public final class FishbowlActivity extends AppCompatActivity
         }
 
         updateSetupStageItem("setup_step_1", "1. Recombining split package archives (asset chunks)", percent >= 35, percent > 0 && percent < 35);
-        updateSetupStageItem("setup_step_2", "2. Extracting FishBowl & Jellyfin Core 12.4.0 ARM64 runtime", percent >= 65, percent >= 35 && percent < 65);
+        updateSetupStageItem("setup_step_2", "2. Extracting Jellyarr & Jellyfin Core 12.4.0 ARM64 runtime", percent >= 65, percent >= 35 && percent < 65);
         updateSetupStageItem("setup_step_3", "3. Unpacking Microsoft .NET 10 & FFmpeg 7.1.4 transcoder", percent >= 88, percent >= 65 && percent < 88);
         updateSetupStageItem("setup_step_4", "4. Configuring POSIX permissions & system libraries", percent >= 95, percent >= 88 && percent < 95);
         updateSetupStageItem("setup_step_5", "5. Verifying server binaries & service readiness", percent >= 100, percent >= 95 && percent < 100);
@@ -12227,12 +13373,12 @@ public final class FishbowlActivity extends AppCompatActivity
                     statusText = "INITIALIZING RUNTIME";
                     break;
                 case STOPPING:
-                    color = Color.parseColor("#F97316");
+                    color = AppTheme.warning();
                     statusText = "STOPPING SERVER";
                     break;
                 case UNINITIALIZED:
                 case STOPPED:
-                    color = Color.parseColor("#A1A1AA");
+                    color = AppTheme.textSecondary();
                     statusText = "SERVER STOPPED";
                     break;
                 case CRASHED:
@@ -12251,8 +13397,8 @@ public final class FishbowlActivity extends AppCompatActivity
             }
             statusBadge.setText("● " + statusText);
             statusBadge.setTextColor(color);
-            statusBadge.setBackground(null);
-            statusBadge.setPadding(0, 0, 0, 0);
+            statusBadge.setBackground(UiKit.shape(this, AppTheme.withAlpha(color, 0x22), 0, UiKit.R_PILL));
+            statusBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
         }
 
         // Render Slim Header Progress Bar & Notification Banner (Small progress bar not full screen)
@@ -12338,7 +13484,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
             if (showStartupProgress && txtStage1 != null) {
                 if (startupProgressHeader != null) {
-                    startupProgressHeader.setText(isJustReady ? "FishBowl Server Ready" : "Starting FishBowl Server...");
+                    startupProgressHeader.setText(isJustReady ? "Jellyarr Server Ready" : "Starting Jellyarr Server...");
                 }
                 if (startupProgressBar != null) {
                     if (isJustReady) {
@@ -12358,7 +13504,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
                 boolean isLaunchDone = stage.ordinal() > JellyfinController.StartupStage.LAUNCHING_SERVER.ordinal() || state == JellyfinController.State.RUNNING;
                 boolean isLaunchActive = stage == JellyfinController.StartupStage.LAUNCHING_SERVER && state != JellyfinController.State.RUNNING;
-                updateStageRow(txtStage2, "2. Launching FishBowl core server process", isLaunchDone, isLaunchActive);
+                updateStageRow(txtStage2, "2. Launching Jellyarr core server process", isLaunchDone, isLaunchActive);
 
                 boolean isWaitDone = stage.ordinal() > JellyfinController.StartupStage.WAITING_FOR_SERVER.ordinal() || state == JellyfinController.State.RUNNING;
                 boolean isWaitActive = stage == JellyfinController.StartupStage.WAITING_FOR_SERVER && state != JellyfinController.State.RUNNING;
@@ -12398,7 +13544,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 if (isReady) {
                     applyButtonStyle(btnOpenJellyfin, "OPEN JELLYFIN", Color.WHITE, Color.BLACK, true);
                 } else {
-                    applyButtonStyle(btnOpenJellyfin, "STARTING WEB UI...", Color.parseColor("#27272A"), Color.WHITE, false);
+                    applyButtonStyle(btnOpenJellyfin, "STARTING WEB UI...", AppTheme.outline(), Color.WHITE, false);
                 }
             } else {
                 btnOpenJellyfin.setVisibility(View.GONE);
@@ -12411,11 +13557,11 @@ public final class FishbowlActivity extends AppCompatActivity
             } else {
                 btnStartServer.setVisibility(View.VISIBLE);
                 if (state == JellyfinController.State.STARTING || state == JellyfinController.State.INITIALIZING) {
-                    applyButtonStyle(btnStartServer, "STARTING SERVER...", Color.parseColor("#27272A"), getWarningColor(), false);
+                    applyButtonStyle(btnStartServer, "STARTING SERVER...", AppTheme.outline(), getWarningColor(), false);
                 } else if (state == JellyfinController.State.STOPPING) {
-                    applyButtonStyle(btnStartServer, "STOPPING SERVER...", Color.parseColor("#27272A"), Color.parseColor("#F43F5E"), false);
+                    applyButtonStyle(btnStartServer, "STOPPING SERVER...", AppTheme.outline(), AppTheme.danger(), false);
                 } else if (crashLoop) {
-                    applyButtonStyle(btnStartServer, "SERVER CRASHED", Color.parseColor("#3F1D24"), getDangerColor(), false);
+                    applyButtonStyle(btnStartServer, "SERVER CRASHED", AppTheme.dangerContainer(), getDangerColor(), false);
                 } else if (failed) {
                     applyButtonStyle(btnStartServer, "RETRY START SERVER", getDangerColor(), Color.WHITE, true);
                 } else if (!JellyfinBootstrapper.isInitialized(this)) {
@@ -12428,27 +13574,27 @@ public final class FishbowlActivity extends AppCompatActivity
 
         if (btnStopServer != null) {
             if (state == JellyfinController.State.RUNNING) {
-                applyDockButtonStyle(btnStopServer, "Stop", Color.parseColor("#E11D48"), Color.WHITE, R.drawable.ic_stop, true);
+                applyDockButtonStyle(btnStopServer, "Stop", AppTheme.danger(), Color.WHITE, R.drawable.ic_stop, true);
             } else {
-                applyDockButtonStyle(btnStopServer, "Stop", Color.parseColor("#18181B"), Color.parseColor("#52525B"), R.drawable.ic_stop, false);
+                applyDockButtonStyle(btnStopServer, "Stop", AppTheme.inner(), AppTheme.textMuted(), R.drawable.ic_stop, false);
             }
         }
 
         if (btnRestartServer != null) {
             boolean canRestart = !busy && !crashLoop && (state == JellyfinController.State.RUNNING);
             if (canRestart) {
-                applyDockButtonStyle(btnRestartServer, "Restart", Color.parseColor("#27272A"), Color.WHITE, R.drawable.ic_restart, true);
+                applyDockButtonStyle(btnRestartServer, "Restart", AppTheme.outline(), Color.WHITE, R.drawable.ic_restart, true);
             } else {
-                applyDockButtonStyle(btnRestartServer, "Restart", Color.parseColor("#18181B"), Color.parseColor("#52525B"), R.drawable.ic_restart, false);
+                applyDockButtonStyle(btnRestartServer, "Restart", AppTheme.inner(), AppTheme.textMuted(), R.drawable.ic_restart, false);
             }
         }
 
         if (btnResetCrash != null) {
             if (crashLoop) {
                 btnResetCrash.setVisibility(View.VISIBLE);
-                boolean dbCorrupt = !BackupRestoreManager.isDatabaseHealthy(
-                        new File(com.termux.shared.termux.TermuxConstants.TERMUX_HOME_DIR, ".local/share/jellyfin/data/jellyfin.db"));
-                btnResetCrash.setText(dbCorrupt ? "AUTO-HEAL DATABASE & RESTART" : "RESET CRASH LOOP & RESTART");
+                // PRAGMA quick_check on a large jellyfin.db must not run on the UI thread.
+                refreshCrashLoopDbHealthAsync();
+                btnResetCrash.setText(crashLoopLabel());
             } else {
                 btnResetCrash.setVisibility(View.GONE);
             }
@@ -12467,16 +13613,52 @@ public final class FishbowlActivity extends AppCompatActivity
         // Refresh live server health & resources
         refreshServerHealthUI();
 
-        // Broadcast state change to Home Screen Widgets and Quick Settings Tile
-        com.fishbowl.app.widget.FishbowlWidgetProvider.updateAllWidgets(this);
-        FishbowlQuickSettingsTileService.requestTileUpdate(this);
+        // Broadcast state changes to Home Screen Widgets and the Quick Settings tile (not every 500 ms poll)
+        String widgetKey = state.name() + "/" + stage;
+        if (!widgetKey.equals(lastWidgetBroadcastKey)) {
+            lastWidgetBroadcastKey = widgetKey;
+            com.fishbowl.app.widget.FishbowlWidgetProvider.updateAllWidgets(this);
+            FishbowlQuickSettingsTileService.requestTileUpdate(this);
+        }
+    }
+
+    private String lastWidgetBroadcastKey = null;
+
+    private volatile boolean crashLoopDbCorrupt = false;
+    private volatile boolean crashLoopDbCheckRunning = false;
+    private long crashLoopDbCheckedAt = 0;
+
+    private String crashLoopLabel() {
+        return buttonLabel(crashLoopDbCorrupt ? "AUTO-HEAL DATABASE & RESTART" : "RESET CRASH LOOP & RESTART");
+    }
+
+    private void refreshCrashLoopDbHealthAsync() {
+        if (crashLoopDbCheckRunning
+                || (crashLoopDbCheckedAt > 0 && SystemClock.elapsedRealtime() - crashLoopDbCheckedAt < 30000L)) return;
+        crashLoopDbCheckRunning = true;
+        runBg(() -> {
+            boolean corrupt;
+            try {
+                corrupt = !BackupRestoreManager.isDatabaseHealthy(
+                        new File(com.termux.shared.termux.TermuxConstants.TERMUX_HOME_DIR, ".local/share/jellyfin/data/jellyfin.db"));
+            } catch (Throwable t) {
+                corrupt = false;
+            }
+            final boolean result = corrupt;
+            runOnUiThread(() -> {
+                crashLoopDbCheckRunning = false;
+                crashLoopDbCheckedAt = SystemClock.elapsedRealtime();
+                crashLoopDbCorrupt = result;
+                if (btnResetCrash != null && btnResetCrash.getVisibility() == View.VISIBLE) btnResetCrash.setText(crashLoopLabel());
+            });
+        });
     }
 
     private void updateStageRow(TextView tv, String label, boolean completed, boolean active) {
         if (tv == null) return;
         if (completed) {
             tv.setText("[READY]  " + label);
-            tv.setTextColor(Color.parseColor("#81C784"));
+            tv.setTextColor(AppTheme.success());
         } else if (active) {
             tv.setText("[IN PROGRESS]  " + label);
             tv.setTextColor(getWarningColor());
@@ -12501,48 +13683,69 @@ public final class FishbowlActivity extends AppCompatActivity
             View dotLan = (rowLanView != null) ? rowLanView.findViewWithTag("dot_lan") : null;
             if (rawLan == null) {
                 lanIpValueText.setText("Wi-Fi not connected");
-                lanIpValueText.setTextColor(Color.parseColor("#71717A"));
+                lanIpValueText.setTextColor(AppTheme.textMuted());
                 setEndpointCopyState(btnCopyLanIp, rowLanView, dotLan, false);
             } else {
                 lanIpValueText.setText(rawLan + ":8096");
-                lanIpValueText.setTextColor(Color.parseColor("#E4E4E7"));
+                lanIpValueText.setTextColor(AppTheme.text());
                 setEndpointCopyState(btnCopyLanIp, rowLanView, dotLan, true);
             }
         }
         if (localIpValueText != null) {
             View dotLocal = (rowLocalView != null) ? rowLocalView.findViewWithTag("dot_local") : null;
             localIpValueText.setText("127.0.0.1:8096");
-            localIpValueText.setTextColor(Color.parseColor("#E4E4E7"));
+            localIpValueText.setTextColor(AppTheme.text());
             setEndpointCopyState(btnCopyLocalIp, rowLocalView, dotLocal, true);
         }
         if (tailscaleIpValueText != null) {
             View dotTailscale = (rowTailscaleView != null) ? rowTailscaleView.findViewWithTag("dot_tailscale") : null;
             if (rawTailscale == null) {
                 tailscaleIpValueText.setText("Tailscale not active");
-                tailscaleIpValueText.setTextColor(Color.parseColor("#71717A"));
+                tailscaleIpValueText.setTextColor(AppTheme.textMuted());
                 setEndpointCopyState(btnCopyTailscaleIp, rowTailscaleView, dotTailscale, false);
             } else {
                 tailscaleIpValueText.setText(rawTailscale + ":8096");
-                tailscaleIpValueText.setTextColor(Color.parseColor("#E4E4E7"));
+                tailscaleIpValueText.setTextColor(AppTheme.text());
                 setEndpointCopyState(btnCopyTailscaleIp, rowTailscaleView, dotTailscale, true);
             }
         }
     }
 
-    private void refreshLanAddress() {
-        // Fast path: instant render from in-memory cache with zero UI thread block
-        updateLanAddressViews(cachedRawLanIp, cachedRawTailscaleIp);
+    private volatile String cachedDefaultIp = null;
+    private volatile NetworkUtils.LanEndpoint cachedActiveLan = null;
+    private String lastRenderedNetworkSignature = null;
 
-        // Background asynchronous interface traversal
+    private String networkSignature(String rawLan, String rawTailscale) {
+        NetworkUtils.LanEndpoint a = cachedActiveLan;
+        return cachedDefaultIp + "|" + rawLan + "|" + rawTailscale + "|" + (a != null ? a.label + "/" + a.ip : "-");
+    }
+
+    private void refreshLanAddress() {
+        // Fast path: render from the in-memory cache (skipped when nothing changed since the last render)
+        if (clientEndpointsContainer == null || clientEndpointsContainer.getChildCount() == 0
+                || !networkSignature(cachedRawLanIp, cachedRawTailscaleIp).equals(lastRenderedNetworkSignature)) {
+            updateLanAddressViews(cachedRawLanIp, cachedRawTailscaleIp);
+        }
+
+        // Background interface traversal (network callbacks fire often; one scan at a time)
         if (!isScanningNetwork) {
             isScanningNetwork = true;
-            bgExecutor.execute(() -> {
+            runBg(() -> {
                 try {
                     String rawLan = getRawLanIp();
                     String rawTailscale = getRawTailscaleIp();
+                    cachedDefaultIp = NetworkUtils.getDefaultIp();
+                    cachedActiveLan = NetworkUtils.getActiveLanEndpoint();
                     cachedRawLanIp = rawLan;
                     cachedRawTailscaleIp = rawTailscale;
-                    runOnUiThread(() -> updateLanAddressViews(rawLan, rawTailscale));
+                    runOnUiThread(() -> {
+                        if (!isUiAlive()) return;
+                        if (networkSignature(rawLan, rawTailscale).equals(lastRenderedNetworkSignature)
+                                && clientEndpointsContainer != null && clientEndpointsContainer.getChildCount() > 0) {
+                            return;   // unchanged: avoid rebuilding the rows (and re-reading the user list)
+                        }
+                        updateLanAddressViews(rawLan, rawTailscale);
+                    });
                 } finally {
                     isScanningNetwork = false;
                 }
@@ -12642,234 +13845,198 @@ public final class FishbowlActivity extends AppCompatActivity
 
     // -- Design Utilities -------------------------------------------------------
 
-    private Button createPillCopyButton() {
-        Button btn = new Button(this);
-        btn.setText("COPY");
-        btn.setTextSize(10f);
-        btn.setLetterSpacing(0.04f);
-        btn.setAllCaps(true);
-        btn.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btn.setTextColor(getPrimaryTextColor());
-        btn.setMinHeight(0);
-        btn.setMinimumHeight(0);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            btn.setStateListAnimator(null);
-        }
+    // -- Material 3 buttons -----------------------------------------------------
+    // Every button in the app goes through resolveButtonStyle(): filled (accent / danger),
+    // tonal (accent container), outlined (neutral) or tinted. Shape: UiKit 12dp button radius.
 
-        GradientDrawable shape = createBorderedRoundedDrawable(getSurfaceElevatedColor(), getBorderColor(), dp(1), dp(6));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(colorWithAlpha(getAccentColor(), 80)),
-                    shape,
-                    null);
-            btn.setBackground(ripple);
-        } else {
-            btn.setBackground(shape);
-        }
+    /** Returns {fill, textColor, strokeColor, strokeWidthPx} for the requested look. */
+    private int[] resolveButtonStyle(int bg, int fg) {
+        if (bg == Color.WHITE) bg = AppTheme.accent();          // legacy "primary" white button
+        if (bg == Color.BLACK) bg = AppTheme.card();
+        if (fg == Color.WHITE) fg = AppTheme.text();
+        if (fg == Color.BLACK) fg = AppTheme.onAccent();
 
-        btn.setPadding(dp(10), 0, dp(10), 0);
-        btn.setMinWidth(dp(56));
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30));
-        btn.setLayoutParams(p);
-        return btn;
+        int card = AppTheme.card(), inner = AppTheme.inner(), page = AppTheme.bg();
+        boolean neutral = bg == card || bg == inner || bg == page || bg == AppTheme.outline() || bg == Color.TRANSPARENT;
+        boolean container = bg == AppTheme.accentContainer() || bg == AppTheme.dangerContainer()
+                || bg == AppTheme.successContainer() || bg == AppTheme.warningContainer();
+
+        if (neutral) {
+            if (fg == AppTheme.accent()) {
+                // Tonal button: accent container with on-container text.
+                return new int[]{AppTheme.accentContainer(), AppTheme.onAccentContainer(), 0, 0};
+            }
+            // Outlined button: transparent fill, 1dp outline.
+            return new int[]{Color.TRANSPARENT, fg, AppTheme.outlineStrong(), Math.max(1, dp(1))};
+        }
+        if (container || Color.alpha(bg) < 255) {
+            // Tonal / tinted: keep the caller's semantic text colour.
+            return new int[]{bg, fg, 0, 0};
+        }
+        // Filled: guarantee a readable label whatever the fill is (accent, danger, brand colour).
+        return new int[]{bg, AppTheme.contrastOn(bg), 0, 0};
     }
 
-    private Button createPixelButton(String text, int bgColor, int textColor) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setTextSize(11f);
-        b.setLetterSpacing(0.03f);
-        b.setAllCaps(false);
-        b.setTextColor(textColor);
-        b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+    /** Button shape shared with UiKit: 12dp radius, ripple masked to the full shape (outlined buttons included). */
+    private Drawable buttonBackground(int fill, int stroke, int strokeWidthPx, int rippleColor) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(fill);
+        shape.setCornerRadius(dp(UiKit.R_INNER));
+        if (strokeWidthPx > 0) shape.setStroke(strokeWidthPx, stroke);
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(AppTheme.text());
+        mask.setCornerRadius(dp(UiKit.R_INNER));
+        return new android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(rippleColor), shape, mask);
+    }
+
+    /** Applies colours + pill background to a button according to {@link #resolveButtonStyle}. */
+    private void applyM3Colors(Button b, int bg, int fg) {
+        int[] st = resolveButtonStyle(bg, fg);
+        b.setTextColor(st[1]);
+        // M3 state layer: 12% of the content colour on press.
+        b.setBackground(buttonBackground(st[0], st[2], st[3], colorWithAlpha(st[1], 40)));
+    }
+
+    private void attachPressMotion(Button b) {
+        b.setOnTouchListener((v, event) -> {
+            if (!v.isEnabled()) return false;
+            int action = event.getAction();
+            if (action == android.view.MotionEvent.ACTION_DOWN) {
+                v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(70)
+                        .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+            } else if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
+                v.animate().scaleX(1.0f).scaleY(1.0f).setDuration(140)
+                        .setInterpolator(new android.view.animation.OvershootInterpolator(1.6f)).start();
+            }
+            return false; // never swallow the click
+        });
+    }
+
+    private void baseButtonMetrics(Button b, float sizeSp, float letterSpacing) {
+        b.setTextSize(sizeSp);
+        b.setLetterSpacing(letterSpacing);
+        b.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         b.setMinHeight(0);
         b.setMinimumHeight(0);
         b.setMinWidth(0);
         b.setMinimumWidth(0);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            b.setStateListAnimator(null);
-        }
+        b.setGravity(Gravity.CENTER);
+        b.setIncludeFontPadding(false);
+        b.setStateListAnimator(null);
+    }
 
-        int strokeColor;
-        if (bgColor == getSurfaceElevatedColor() || bgColor == getSurfaceColor() || bgColor == Color.TRANSPARENT) {
-            strokeColor = getBorderColor();
-        } else if (bgColor == Color.WHITE) {
-            strokeColor = Color.argb(40, 255, 255, 255);
-        } else {
-            strokeColor = colorWithAlpha(textColor, 45);
-        }
-        GradientDrawable defaultShape = createBorderedRoundedDrawable(bgColor, strokeColor, dp(1), dp(10));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = (textColor == Color.WHITE || textColor == Color.parseColor("#090D12"))
-                    ? Color.argb(80, 255, 255, 255)
-                    : colorWithAlpha(getAccentColor(), 80);
-            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(rippleColor),
-                    defaultShape,
-                    null);
-            b.setBackground(ripple);
-        } else {
-            b.setBackground(defaultShape);
-        }
+    private Button createPillCopyButton() {
+        Button btn = new Button(this);
+        btn.setText("COPY");
+        btn.setAllCaps(true);
+        baseButtonMetrics(btn, 10f, 0.06f);
+        applyM3Colors(btn, AppTheme.inner(), AppTheme.text());
+        // Tonal-neutral: filled with the inner surface, no outline.
+        btn.setBackground(buttonBackground(AppTheme.inner(), 0, 0, colorWithAlpha(AppTheme.accent(), 60)));
+        btn.setPadding(dp(12), 0, dp(12), 0);
+        btn.setMinWidth(dp(56));
+        btn.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)));
+        attachPressMotion(btn);
+        return btn;
+    }
 
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(36));
+    private static final Set<String> LABEL_ACRONYMS = new HashSet<>(java.util.Arrays.asList(
+            "OK", "API", "URL", "URLS", "LAN", "IP", "UI", "PIN", "DB", "TV", "USB", "OTG", "OTA", "SHA", "HTTP",
+            "CPU", "GPU", "RAM", "ID", "AAC", "NEON", "TXT", "VPN", "TMDB", "JF", "SAF", "POSIX",
+            "KB", "MB", "GB", "TB", "SQL", "DNS", "SMB", "NFS", "SSL", "TLS"));
+    private static final Set<String> LABEL_SMALL_WORDS = new HashSet<>(java.util.Arrays.asList(
+            "a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to", "vs"));
+
+    /**
+     * Text for a button: the translation when one exists (Arabic UI), otherwise an ALL-CAPS English label is
+     * shown in Title Case ("COPY REPORT" -> "Copy Report"); acronyms and mixed-case labels are kept as they are.
+     */
+    private static String buttonLabel(String label) {
+        if (label == null) return null;
+        String tr = I18n.tr(label);
+        if (tr != null && !tr.equals(label)) return tr;
+        if (!label.equals(label.toUpperCase(Locale.ROOT)) || !label.matches("(?s).*[A-Z].*")) return label;
+        String[] words = label.split(" ", -1);
+        StringBuilder sb = new StringBuilder(label.length());
+        for (int i = 0; i < words.length; i++) {
+            if (i > 0) sb.append(' ');
+            String w = words[i];
+            String core = w.replaceAll("[^A-Za-z0-9]", "");
+            if (core.isEmpty() || LABEL_ACRONYMS.contains(core) || core.matches(".*[0-9].*") || w.startsWith(".")) {
+                sb.append(w);
+                continue;
+            }
+            String lower = w.toLowerCase(Locale.ROOT);
+            if (i > 0 && LABEL_SMALL_WORDS.contains(lower)) {
+                sb.append(lower);
+                continue;
+            }
+            int k = 0;
+            while (k < lower.length() && !Character.isLetter(lower.charAt(k))) k++;
+            sb.append(lower, 0, k);
+            if (k < lower.length()) sb.append(Character.toUpperCase(lower.charAt(k))).append(lower.substring(k + 1));
+        }
+        return sb.toString();
+    }
+
+    private Button createPixelButton(String text, int bgColor, int textColor) {
+        Button b = new Button(this);
+        b.setText(buttonLabel(text));
+        b.setAllCaps(false);
+        baseButtonMetrics(b, 12f, 0.02f);
+        b.setPadding(dp(14), 0, dp(14), 0);
+        applyM3Colors(b, bgColor, textColor);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(40));
         params.topMargin = dp(6);
         b.setLayoutParams(params);
-
-        // Tactile press animation without swallowing click events
-        b.setOnTouchListener((v, event) -> {
-            if (!v.isEnabled()) return false;
-            if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
-                v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(60).start();
-            } else if (event.getAction() == android.view.MotionEvent.ACTION_UP || event.getAction() == android.view.MotionEvent.ACTION_CANCEL) {
-                v.animate().scaleX(1.0f).scaleY(1.0f).setDuration(80).start();
-            }
-            return false; // Crucial: allow click listener to receive event!
-        });
-
+        attachPressMotion(b);
         return b;
     }
 
     private Button createOutlinePixelButton(String text, int outlineColor, int textColor) {
         Button b = new Button(this);
-        b.setText(text);
-        b.setTextSize(10.5f);
-        b.setLetterSpacing(0.04f);
+        b.setText(buttonLabel(text));
         b.setAllCaps(false);
-        b.setTextColor(textColor);
-        b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        b.setMinHeight(0);
-        b.setMinimumHeight(0);
-        b.setMinWidth(0);
-        b.setMinimumWidth(0);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            b.setStateListAnimator(null);
-        }
-
-        GradientDrawable defaultShape = createBorderedRoundedDrawable(Color.BLACK, outlineColor, dp(1), dp(8));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = colorWithAlpha(outlineColor, 60);
-            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(rippleColor),
-                    defaultShape,
-                    null);
-            b.setBackground(ripple);
-        } else {
-            b.setBackground(defaultShape);
-        }
-
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(34));
-        b.setLayoutParams(params);
-
-        b.setOnTouchListener((v, event) -> {
-            if (!v.isEnabled()) return false;
-            if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
-                v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(60).start();
-            } else if (event.getAction() == android.view.MotionEvent.ACTION_UP || event.getAction() == android.view.MotionEvent.ACTION_CANCEL) {
-                v.animate().scaleX(1.0f).scaleY(1.0f).setDuration(80).start();
-            }
-            return false;
-        });
-
+        baseButtonMetrics(b, 11.5f, 0.02f);
+        b.setPadding(dp(14), 0, dp(14), 0);
+        applyOutlineButtonStyle(b, outlineColor, textColor);
+        b.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(36)));
+        attachPressMotion(b);
         return b;
     }
 
     private void applyOutlineButtonStyle(Button b, int outlineColor, int textColor) {
         if (b == null) return;
+        if (outlineColor == Color.WHITE) outlineColor = AppTheme.outlineStrong();
+        if (textColor == Color.WHITE) textColor = AppTheme.text();
         b.setTextColor(textColor);
-        GradientDrawable defaultShape = createBorderedRoundedDrawable(Color.BLACK, outlineColor, dp(1), dp(8));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = colorWithAlpha(outlineColor, 60);
-            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(rippleColor),
-                    defaultShape,
-                    null);
-            b.setBackground(ripple);
-        } else {
-            b.setBackground(defaultShape);
-        }
+        b.setBackground(buttonBackground(Color.TRANSPARENT, outlineColor, Math.max(1, dp(1)),
+                colorWithAlpha(outlineColor, 60)));
     }
 
     private void applyButtonStyle(Button btn, String text, int bgColor, int textColor, boolean enabled) {
         if (btn == null) return;
-        btn.setText(text);
-        btn.setTextColor(textColor);
+        btn.setText(buttonLabel(text));
         btn.setEnabled(enabled);
         btn.setAlpha(1.0f);
-        btn.setTextSize(12);
-        btn.setLetterSpacing(0.06f);
-        btn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btn.setAllCaps(true);
-        btn.setMinHeight(0);
-        btn.setMinimumHeight(0);
-        btn.setMinWidth(0);
-        btn.setMinimumWidth(0);
+        btn.setAllCaps(false);
+        baseButtonMetrics(btn, 13.5f, 0.01f);
+        btn.setTypeface(UiKit.BOLD);
         btn.setPadding(0, 0, 0, 0);
-        btn.setGravity(Gravity.CENTER);
-        btn.setIncludeFontPadding(false);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            btn.setStateListAnimator(null);
-        }
-
-        int strokeColor = (bgColor == Color.WHITE) ? Color.WHITE : Color.TRANSPARENT;
-        GradientDrawable defaultShape = createBorderedRoundedDrawable(bgColor, strokeColor, 0, dp(10));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = (bgColor == Color.WHITE)
-                    ? Color.argb(40, 0, 0, 0)
-                    : Color.argb(40, 255, 255, 255);
-            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(rippleColor),
-                    defaultShape,
-                    null);
-            btn.setBackground(ripple);
-        } else {
-            btn.setBackground(defaultShape);
-        }
+        applyM3Colors(btn, bgColor, textColor);
     }
 
     private void applyDockButtonStyle(Button btn, String text, int bgColor, int textColor, int iconRes, boolean enabled) {
         if (btn == null) return;
-        btn.setTextColor(textColor);
         btn.setEnabled(enabled);
-        btn.setAlpha(enabled ? 1.0f : 0.65f);
-        btn.setTextSize(12);
-        btn.setLetterSpacing(0.06f);
-        btn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btn.setMinHeight(0);
-        btn.setMinimumHeight(0);
-        btn.setMinWidth(0);
-        btn.setMinimumWidth(0);
-        btn.setPadding(0, 0, 0, 0);
-        btn.setGravity(Gravity.CENTER);
-        btn.setIncludeFontPadding(false);
+        btn.setAlpha(enabled ? 1.0f : 0.5f); // M3 disabled content ~38-50%
         btn.setAllCaps(false);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            btn.setStateListAnimator(null);
-        }
-
-        btn.setText(text.toUpperCase(Locale.US));
+        baseButtonMetrics(btn, 13f, 0.01f);
+        btn.setTypeface(UiKit.BOLD);
+        btn.setPadding(0, 0, 0, 0);
+        btn.setText(text);
         btn.setCompoundDrawables(null, null, null, null);
-
-        int strokeColor = (bgColor == Color.WHITE) ? Color.WHITE : Color.TRANSPARENT;
-        GradientDrawable bgShape = createBorderedRoundedDrawable(
-                bgColor,
-                strokeColor,
-                0,
-                dp(10)
-        );
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            int rippleColor = (bgColor == Color.WHITE)
-                    ? Color.argb(40, 0, 0, 0)
-                    : Color.argb(40, 255, 255, 255);
-            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(rippleColor),
-                    bgShape,
-                    null);
-            btn.setBackground(ripple);
-        } else {
-            btn.setBackground(bgShape);
-        }
+        applyM3Colors(btn, bgColor, textColor);
     }
 
     private static class CenteredImageSpan extends ImageSpan {
@@ -12892,17 +14059,25 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private GradientDrawable createRoundedDrawable(int color, int radiusDp) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(color);
-        gd.setCornerRadius(radiusDp);
+        gd.setColor(UiTheme.normalizeFill(color));
+        gd.setCornerRadius(UiTheme.normalizeRadius(radiusDp, getResources().getDisplayMetrics().density));
         return gd;
     }
 
     private GradientDrawable createBorderedRoundedDrawable(int bgColor, int borderColor, int strokeWidthPx, int radiusDp) {
         GradientDrawable gd = new GradientDrawable();
-        gd.setColor(bgColor);
-        gd.setStroke(strokeWidthPx, borderColor);
-        gd.setCornerRadius(radiusDp);
+        gd.setColor(UiTheme.normalizeFill(bgColor));
+        gd.setStroke(strokeWidthPx, UiTheme.normalizeBorder(borderColor));
+        gd.setCornerRadius(UiTheme.normalizeRadius(radiusDp, getResources().getDisplayMetrics().density));
         return gd;
+    }
+
+    /** One look for every section label in every tab. */
+    private void styleSectionLabel(TextView tv) {
+        tv.setTextSize(11f);
+        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        tv.setLetterSpacing(0.08f);
+        tv.setTextColor(AppTheme.textMuted());
     }
 
     private int colorWithAlpha(int color, int alpha) {
@@ -12913,15 +14088,317 @@ public final class FishbowlActivity extends AppCompatActivity
         return (int) (value * getResources().getDisplayMetrics().density);
     }
 
+    // -- Update notifications -----------------------------------------------------
+
+    private View buildUpdateNotifyBlock(final String ch, String heading, String desc) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+
+        TextView h = new TextView(this);
+        h.setText(heading);
+        h.setTextSize(10.5f);
+        h.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        h.setTextColor(UpdateManager.CHANNEL_STABLE.equals(ch) ? getAccentColor() : AppTheme.warning());
+        h.setLetterSpacing(0.06f);
+        box.addView(h);
+        TextView d = new TextView(this);
+        d.setText(desc);
+        d.setTextSize(11f);
+        d.setTextColor(AppTheme.textMuted());
+        d.setPadding(0, dp(2), 0, dp(4));
+        box.addView(d);
+
+        box.addView(updateToggleRow("Notification outside the app", "System notification when a new version is found (checked in the background).",
+                UpdateNotifier.systemNotify(this, ch), checked -> {
+                    UpdateNotifier.setSystemNotify(this, ch, checked);
+                    if (checked && Build.VERSION.SDK_INT >= 33
+                            && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
+                    }
+                }));
+        box.addView(updateToggleRow("Notice inside the app", "Pop-up with what's new when you open Jellyarr.",
+                UpdateNotifier.inAppNotify(this, ch), checked -> UpdateNotifier.setInAppNotify(this, ch, checked)));
+
+        final TextView status = new TextView(this);
+        status.setTextSize(11f);
+        status.setTextColor(AppTheme.textSecondary());
+        status.setPadding(0, dp(4), 0, dp(2));
+        status.setText("Latest: not checked yet");
+        box.addView(status);
+        updateNotifyStatusViews.put(ch, status);
+        return box;
+    }
+
+    private final java.util.HashMap<String, TextView> updateNotifyStatusViews = new java.util.HashMap<>();
+
+    private interface BoolSink { void set(boolean v); }
+
+    private View updateToggleRow(String title, String sub, boolean on, final BoolSink sink) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(4), 0, dp(4));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(13f);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        t.setTextColor(AppTheme.text());
+        col.addView(t);
+        TextView st = new TextView(this);
+        st.setText(sub);
+        st.setTextSize(11f);
+        st.setTextColor(AppTheme.textMuted());
+        st.setPaddingRelative(0, dp(2), dp(8), 0);
+        col.addView(st);
+        row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Switch sw = new Switch(this);
+        sw.setChecked(on);
+        sw.setOnCheckedChangeListener((v, checked) -> sink.set(checked));
+        row.addView(sw);
+        return row;
+    }
+
+    private boolean updateAutoInstall = false;
+    private boolean updateStartupCheckDone = false;
+    private final android.os.Handler updateUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+
+    /** Reads bundled release notes (single source, also used as the GitHub release text). */
+    private String readBundledReleaseNotes() {
+        try (java.io.InputStream in = getAssets().open("release_notes.txt");
+             java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream()) {
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+            return bo.toString("UTF-8").trim();
+        } catch (Throwable t) {
+            return "No release notes available.";
+        }
+    }
+
+    private View notesView(String text) {
+        ScrollView sv = new ScrollView(this);
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(12f);
+        tv.setTextColor(AppTheme.text());
+        tv.setLineSpacing(dp(2), 1.1f);
+        sv.addView(tv);
+        sv.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(260)));
+        return sv;
+    }
+
+    private void showWhatsNewDialog() {
+        showOledDialog("What's new", "Jellyarr v" + UpdateManager.getInstance(this).getCurrentVersionName(this),
+                notesView(readBundledReleaseNotes()), "OK", getAccentColor(), null, null, null);
+    }
+
+    /** Once after each update: show the summary of the new version. */
+    private void maybeShowWhatsNewAfterUpdate() {
+        try {
+            int cur = UpdateManager.getInstance(this).getCurrentVersionCode(this);
+            if (UpdateNotifier.lastSeenVersion(this) == cur) return;
+            UpdateNotifier.setLastSeenVersion(this, cur);
+            updateUiHandler.postDelayed(() -> { if (!isFinishing()) showWhatsNewDialog(); }, 600);
+        } catch (Throwable ignored) {}
+    }
+
+    /** Background lookup on app start; shows the in-app notice for enabled channels. */
+    private void runStartupUpdateCheck() {
+        if (updateStartupCheckDone) return;
+        updateStartupCheckDone = true;
+        new Thread(() -> {
+            try {
+                final UpdateNotifier.Result r = UpdateNotifier.fetchLatest();
+                final int cur = UpdateManager.getInstance(this).getCurrentVersionCode(this);
+                runOnUiThread(() -> {
+                    for (String ch : new String[]{UpdateManager.CHANNEL_STABLE, UpdateManager.CHANNEL_BETA}) {
+                        TextView st = updateNotifyStatusViews.get(ch);
+                        UpdateNotifier.Latest l = r.get(ch);
+                        if (st != null) st.setText(l.found() ? "Latest: v" + l.name + (l.code > cur ? "  (newer than installed)" : "  (up to date)") : "Latest: none published");
+                    }
+                    final UpdateManager um = UpdateManager.getInstance(this);
+                    if (um.isAutoDownloadEnabled() && um.isNetworkAllowedForAuto(this)) {
+                        final UpdateNotifier.Latest sel = r.get(um.getUpdateChannel(this));
+                        if (sel.found() && sel.code > cur && !sel.apkUrl.isEmpty() && !um.isReadyToInstall(sel.code)) {
+                            new Thread(() -> um.downloadBlocking(this, sel.code, sel.name, sel.apkUrl, sel.shaUrl), "fishbowl-auto-dl").start();
+                        }
+                    }
+                    if (isFinishing()) return;
+                    for (String ch : new String[]{UpdateManager.CHANNEL_STABLE, UpdateManager.CHANNEL_BETA}) {
+                        UpdateNotifier.Latest l = r.get(ch);
+                        if (l.found() && l.code > cur && UpdateNotifier.inAppNotify(this, ch)
+                                && UpdateNotifier.dismissedCode(this, ch) < l.code) {
+                            showUpdateNotice(ch, l);
+                            break;
+                        }
+                    }
+                });
+            } catch (Throwable ignored) {}
+        }, "fishbowl-update-startup").start();
+    }
+
+    private void showUpdateNotice(final String ch, final UpdateNotifier.Latest l) {
+        String label = UpdateManager.CHANNEL_STABLE.equals(ch) ? "Stable" : "Beta";
+        showOledDialog("Update available (" + label + ")", "Jellyarr v" + l.name,
+                notesView(l.notes.isEmpty() ? "No release notes." : l.notes),
+                UpdateManager.getInstance(this).isReadyToInstall(l.code) ? I18n.tr("Install Update") : I18n.tr("Download Update"),
+                getAccentColor(), () -> beginInAppUpdate(ch, l.code),
+                "LATER", () -> UpdateNotifier.setDismissed(this, ch, l.code));
+    }
+
+    /** Switch to the chosen channel, then download, verify and open the installer from inside the app. */
+    private void beginInAppUpdate(String ch, int code) {
+        UpdateManager m = UpdateManager.getInstance(this);
+        m.setUpdateChannel(ch);
+        updateChannelSelectionUI();
+        openSettingsSectionByName("Software Updates");
+        if (m.isReadyToInstall(code)) {
+            m.restoreSavedState(this);
+            m.installUpdate(this);
+            return;
+        }
+        updateAutoInstall = true;   // download once the check finds the update (no auto-install)
+        m.checkForUpdates(this, true);
+    }
+
+    private void handleUpdateIntent(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra(UpdateNotifier.EXTRA_OPEN_UPDATE, false)) return;
+        intent.removeExtra(UpdateNotifier.EXTRA_OPEN_UPDATE);
+        final String ch = intent.getStringExtra(UpdateNotifier.EXTRA_CHANNEL);
+        new Thread(() -> {
+            try {
+                final UpdateNotifier.Result r = UpdateNotifier.fetchLatest();
+                final String useCh = ch == null ? UpdateManager.CHANNEL_BETA : ch;
+                final UpdateNotifier.Latest l = r.get(useCh);
+                int cur = UpdateManager.getInstance(this).getCurrentVersionCode(this);
+                runOnUiThread(() -> { if (l.found() && l.code > cur && !isFinishing()) showUpdateNotice(useCh, l); });
+            } catch (Throwable ignored) {}
+        }, "fishbowl-update-intent").start();
+    }
+
+    private LinearLayout updateBannerBar;
+    private TextView updateBannerText;
+    private ProgressBar updateBannerProgress;
+    private Button updateBannerInstallBtn;
+    private boolean updateBannerDismissed = false;
+    private UpdateManager.State updateBannerLastState = null;
+    private int updateBannerLastPct = -1;
+
+    private View buildUpdateBanner() {
+        updateBannerBar = new LinearLayout(this);
+        updateBannerBar.setOrientation(LinearLayout.VERTICAL);
+        updateBannerBar.setBackgroundColor(AppTheme.card());
+        updateBannerBar.setVisibility(View.GONE);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPaddingRelative(dp(16), dp(6), dp(8), dp(6));
+
+        updateBannerText = new TextView(this);
+        updateBannerText.setTextSize(12.5f);
+        updateBannerText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        updateBannerText.setTextColor(AppTheme.text());
+        row.addView(updateBannerText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+
+        updateBannerInstallBtn = createPixelButton(I18n.tr("Install Update"), AppTheme.accent(), AppTheme.onAccent());
+        updateBannerInstallBtn.setTextSize(11f);
+        updateBannerInstallBtn.setVisibility(View.GONE);
+        updateBannerInstallBtn.setOnClickListener(v -> UpdateManager.getInstance(this).installUpdate(this));
+        row.addView(updateBannerInstallBtn, new LinearLayout.LayoutParams(-2, dp(34)));
+
+        TextView close = new TextView(this);
+        close.setText("✕");
+        close.setTextSize(16f);
+        close.setGravity(Gravity.CENTER);
+        close.setTextColor(AppTheme.textSecondary());
+        close.setContentDescription("Close");
+        close.setOnClickListener(v -> {
+            updateBannerDismissed = true;
+            updateBannerBar.setVisibility(View.GONE);
+            applyTopInsets();
+        });
+        row.addView(close, new LinearLayout.LayoutParams(dp(40), dp(34)));
+        updateBannerBar.addView(row);
+
+        updateBannerProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        updateBannerProgress.setMax(100);
+        updateBannerProgress.setVisibility(View.GONE);
+        updateBannerBar.addView(updateBannerProgress, new LinearLayout.LayoutParams(-1, dp(3)));
+        return updateBannerBar;
+    }
+
+    /** Shows download percent, then an install button; remains visible until the user taps X. */
+    private void refreshUpdateBanner() {
+        refreshUpdateBannerInner();
+        applyTopInsets();
+    }
+
+    private void refreshUpdateBannerInner() {
+        if (updateBannerBar == null) return;
+        UpdateManager mgr = UpdateManager.getInstance(this);
+        UpdateManager.State st = mgr.getCurrentState();
+        boolean downloading = st == UpdateManager.State.DOWNLOADING;
+        boolean verifying = st == UpdateManager.State.VERIFYING;
+        boolean ready = st == UpdateManager.State.DOWNLOAD_COMPLETE || st == UpdateManager.State.VERIFICATION_SUCCESSFUL;
+        // A new download cycle re-opens a bar that was closed earlier
+        if (downloading && updateBannerLastState != UpdateManager.State.DOWNLOADING) updateBannerDismissed = false;
+        updateBannerLastState = st;
+
+        if (!(downloading || verifying || ready) || updateBannerDismissed) {
+            if (!(downloading || verifying || ready)) updateBannerLastPct = -1;
+            updateBannerBar.setVisibility(View.GONE);
+            return;
+        }
+        String ver = mgr.getLatestVersionName();
+        String v = (ver == null || ver.isEmpty()) ? "" : " v" + ver;
+        if (downloading) {
+            long total = mgr.getTotalApkSize();
+            long got = mgr.getDownloadedBytes();
+            int pct = total > 0 ? (int) Math.min(100, got * 100 / total) : 0;
+            if (pct == updateBannerLastPct && updateBannerBar.getVisibility() == View.VISIBLE) return;
+            updateBannerLastPct = pct;
+            updateBannerText.setText(I18n.tr("Downloading update") + v + " — " + pct + "%");
+            updateBannerProgress.setVisibility(View.VISIBLE);
+            updateBannerProgress.setProgress(pct);
+            updateBannerInstallBtn.setVisibility(View.GONE);
+        } else if (verifying) {
+            updateBannerText.setText(I18n.tr("Verifying update") + v + "...");
+            updateBannerProgress.setVisibility(View.GONE);
+            updateBannerInstallBtn.setVisibility(View.GONE);
+        } else {
+            updateBannerText.setText(I18n.tr("Update") + v + " " + I18n.tr("ready to install") + " — 100%");
+            updateBannerProgress.setVisibility(View.GONE);
+            updateBannerInstallBtn.setVisibility(View.VISIBLE);
+        }
+        updateBannerBar.setVisibility(View.VISIBLE);
+    }
+
     private final UpdateManager.UpdateListener updateListener = new UpdateManager.UpdateListener() {
         @Override
         public void onUpdateStateChanged(UpdateManager.State state) {
             refreshUpdateUI();
+            refreshUpdateBanner();
+            if (updateAutoInstall) {
+                UpdateManager mgr = UpdateManager.getInstance(FishbowlActivity.this);
+                if (state == UpdateManager.State.UPDATE_AVAILABLE) {
+                    mgr.startDownload(FishbowlActivity.this);
+                } else if (state == UpdateManager.State.VERIFICATION_SUCCESSFUL) {
+                    updateAutoInstall = false;   // download only: installing is a separate tap
+                } else if (state == UpdateManager.State.UP_TO_DATE || state == UpdateManager.State.DOWNLOAD_FAILED
+                        || state == UpdateManager.State.VERIFICATION_FAILED || state == UpdateManager.State.PERMISSION_REQUIRED
+                        || state == UpdateManager.State.NETWORK_UNAVAILABLE || state == UpdateManager.State.RELEASE_UNAVAILABLE) {
+                    updateAutoInstall = false;
+                }
+            }
         }
 
         @Override
         public void onDownloadProgress(long bytesDownloaded, long totalBytes) {
             refreshUpdateProgress(bytesDownloaded, totalBytes);
+            refreshUpdateBanner();
         }
     };
 
@@ -12932,19 +14409,19 @@ public final class FishbowlActivity extends AppCompatActivity
 
         if (!isBeta) {
             btnChannelStable.setBackground(createRoundedDrawable(getAccentColor(), dp(6)));
-            btnChannelStable.setTextColor(Color.WHITE);
+            btnChannelStable.setTextColor(AppTheme.onAccent());
             btnChannelBeta.setBackground(null);
-            btnChannelBeta.setTextColor(Color.parseColor("#71717A"));
+            btnChannelBeta.setTextColor(AppTheme.textMuted());
         } else {
-            btnChannelBeta.setBackground(createRoundedDrawable(Color.parseColor("#F59E0B"), dp(6)));
-            btnChannelBeta.setTextColor(Color.WHITE);
+            btnChannelBeta.setBackground(createRoundedDrawable(AppTheme.warning(), dp(6)));
+            btnChannelBeta.setTextColor(AppTheme.contrastOn(AppTheme.warning()));
             btnChannelStable.setBackground(null);
-            btnChannelStable.setTextColor(Color.parseColor("#71717A"));
+            btnChannelStable.setTextColor(AppTheme.textMuted());
         }
 
         if (updateChannelBadge != null) {
             updateChannelBadge.setText(isBeta ? "Beta preview and bleeding-edge builds" : "Official stable releases (Recommended)");
-            updateChannelBadge.setTextColor(Color.parseColor("#71717A"));
+            updateChannelBadge.setTextColor(AppTheme.textMuted());
             updateChannelBadge.setBackground(null);
             updateChannelBadge.setPadding(0, dp(2), 0, 0);
         }
@@ -13004,8 +14481,11 @@ public final class FishbowlActivity extends AppCompatActivity
                 }
                 break;
             case UPDATE_AVAILABLE:
-                updateStatusText.setText(verInfo + "Status: Update Available! (v" + manager.getLatestVersionName() + ")\n\nWhat's new:\n" + manager.getLatestReleaseNotes());
-                updateActionBtn.setText("Download update");
+                long partial = manager.getPartialBytes(this);
+                updateStatusText.setText(verInfo + "Status: Update Available! (v" + manager.getLatestVersionName() + ")"
+                        + (partial > 0 ? "\nSaved so far: " + (partial / (1024 * 1024)) + " MB - the download will resume from here." : "")
+                        + "\n\nWhat's new:\n" + manager.getLatestReleaseNotes());
+                updateActionBtn.setText(I18n.tr("Download Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.startDownload(this));
                 break;
@@ -13015,7 +14495,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 break;
             case DOWNLOAD_COMPLETE:
                 updateStatusText.setText(verInfo + "Status: Update downloaded successfully.");
-                updateActionBtn.setText("Verify and install");
+                updateActionBtn.setText(I18n.tr("Install Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.installUpdate(this));
                 break;
@@ -13024,14 +14504,14 @@ public final class FishbowlActivity extends AppCompatActivity
                 updateActionBtn.setVisibility(View.GONE);
                 break;
             case VERIFICATION_SUCCESSFUL:
-                updateStatusText.setText(verInfo + "Status: Package verified and integrity confirmed.");
-                updateActionBtn.setText("Install update");
+                updateStatusText.setText(verInfo + "Status: Update downloaded and verified. It is saved on this device - you can install it now or later without downloading again.");
+                updateActionBtn.setText(I18n.tr("Install Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.installUpdate(this));
                 break;
             case VERIFICATION_FAILED:
                 updateStatusText.setText(verInfo + "Status: Update verification failed (corrupt file).");
-                updateActionBtn.setText("Retry download");
+                updateActionBtn.setText(I18n.tr("Download Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.startDownload(this));
                 break;
@@ -13043,7 +14523,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 break;
             case DOWNLOAD_FAILED:
                 updateStatusText.setText(verInfo + "Status: Update download failed. Check network connection.");
-                updateActionBtn.setText("Retry download");
+                updateActionBtn.setText(I18n.tr("Download Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.startDownload(this));
                 break;
@@ -13075,7 +14555,7 @@ public final class FishbowlActivity extends AppCompatActivity
         long totalMb = total / (1024 * 1024);
         int percent = total > 0 ? (int) ((downloaded * 100) / total) : 0;
 
-        updateStatusText.setText(verInfo + "Downloading update: Fishbowl v" + manager.getLatestVersionName() + "\n" + percent + "%\nProgress: " + downloadedMb + " MB / " + totalMb + " MB");
+        updateStatusText.setText(verInfo + "Downloading update: Jellyarr v" + manager.getLatestVersionName() + "\n" + percent + "%\nProgress: " + downloadedMb + " MB / " + totalMb + " MB");
     }
 
     private String readFirstLine(File f) {
