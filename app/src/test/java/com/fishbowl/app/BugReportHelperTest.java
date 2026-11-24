@@ -36,7 +36,7 @@ public class BugReportHelperTest {
         Assert.assertTrue(md.contains("- Model: I2219"));
         Assert.assertTrue(md.contains("- Android Version: 16"));
         Assert.assertTrue(md.contains("- API Level: 36"));
-        Assert.assertTrue(md.contains("- Fishbowl Version: 1.4.10-beta.2"));
+        Assert.assertTrue(md.contains("- Jellyarr Version: 1.4.10-beta.2"));
         Assert.assertTrue(md.contains("- Version Code: 101418"));
         Assert.assertTrue(md.contains("- Architecture: arm64-v8a"));
     }
