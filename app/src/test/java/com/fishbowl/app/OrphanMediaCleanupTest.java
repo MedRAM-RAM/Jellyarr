@@ -133,7 +133,7 @@ public class OrphanMediaCleanupTest {
 
     @Test
     public void testCleanupOrphanMediaFoldersWithMultipleLibraries() throws IOException {
-        File root = tempFolder.newFolder("FishbowlMedia");
+        File root = tempFolder.newFolder("JellyarrMedia");
         File movies = new File(root, "Movies");
         File tv = new File(root, "TV");
         File radarrDownloads = new File(root, "Downloads/radarr");

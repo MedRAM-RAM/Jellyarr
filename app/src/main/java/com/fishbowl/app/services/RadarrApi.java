@@ -534,6 +534,43 @@ public final class RadarrApi {
 
     public void deleteRootFolder(int id) throws Exception { call("DELETE", "/rootfolder/" + id, null, 30000); }
 
+    // ------------------------------------------------------------------ file management (media management / naming / import)
+
+    public JSONObject mediaManagementConfig() throws Exception { return obj("/config/mediamanagement"); }
+
+    public void saveMediaManagementConfig(JSONObject cfg) throws Exception {
+        call("PUT", "/config/mediamanagement/" + cfg.optInt("id", 1), cfg.toString(), 30000);
+    }
+
+    public JSONObject namingConfig() throws Exception { return obj("/config/naming"); }
+
+    public void saveNamingConfig(JSONObject cfg) throws Exception {
+        call("PUT", "/config/naming/" + cfg.optInt("id", 1), cfg.toString(), 30000);
+    }
+
+    /** Files Radarr could import from {@code folder} (GET /manualimport). Scanning a large folder can take a while. */
+    public JSONArray manualImportCandidates(String folder) throws Exception {
+        String r = call("GET", "/manualimport?folder=" + enc(folder) + "&filterExistingFiles=true", null, 120000).trim();
+        return r.isEmpty() ? new JSONArray() : new JSONArray(r);
+    }
+
+    /** Imports the given candidates; {@code mode} is "move" or "copy". */
+    public void manualImport(JSONArray files, String mode) throws Exception {
+        command(new JSONObject().put("name", "ManualImport").put("files", files).put("importMode", mode));
+    }
+
+    /** Renames every movie file to the current naming format (the "Organize" action). Returns how many movies were queued. */
+    public int renameAllMovies() throws Exception {
+        JSONArray all = movies();
+        JSONArray ids = new JSONArray();
+        for (int i = 0; i < all.length(); i++) {
+            JSONObject m = all.optJSONObject(i);
+            if (m != null && m.optBoolean("hasFile", false)) ids.put(m.optInt("id"));
+        }
+        if (ids.length() > 0) command(new JSONObject().put("name", "RenameMovie").put("movieIds", ids));
+        return ids.length();
+    }
+
     public JSONArray qualityProfiles() throws Exception { return arr("/qualityprofile"); }
 
     public JSONArray indexers() throws Exception { return arr("/indexer"); }

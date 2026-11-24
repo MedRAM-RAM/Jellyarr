@@ -2069,7 +2069,7 @@ public final class SonarrTabView {
         TextView hint = UiKit.body(act, I18n.tr("Sonarr stores each series in a folder inside this path."));
         s.box.addView(hint);
         final EditText path = field(s.box, "Folder path", "", true);
-        path.setHint("/storage/emulated/0/FishbowlMedia/TV");
+        path.setHint("/storage/emulated/0/JellyarrMedia/TV");
         path.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
         final Button add = UiKit.primary(act, I18n.tr("Add"), null);

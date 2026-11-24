@@ -2247,6 +2247,16 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
         } catch (Throwable ignored) {}
     }
 
+    /** Servarr "Authentication Required": Enabled once a unified account exists, otherwise open on the local network. */
+    private static String authRequiredValue() {
+        try {
+            android.content.Context c = com.fishbowl.app.FishbowlApplication.getInstance();
+            return c != null && com.fishbowl.app.UnifiedAccount.isConfigured(c) ? "Enabled" : "DisabledForLocalAddresses";
+        } catch (Throwable t) {
+            return "DisabledForLocalAddresses";
+        }
+    }
+
     private void createInitialConfigXml(File configXml, String baseName, int port) {
         try {
             String apiKey = java.util.UUID.randomUUID().toString().replace("-", "");
@@ -2257,7 +2267,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                     "  <LaunchBrowser>False</LaunchBrowser>\n" +
                     "  <ApiKey>" + apiKey + "</ApiKey>\n" +
                     "  <AuthenticationMethod>Forms</AuthenticationMethod>\n" +
-                    "  <AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>\n" +
+                    "  <AuthenticationRequired>" + authRequiredValue() + "</AuthenticationRequired>\n" +
                     "  <AllowedHosts>*</AllowedHosts>\n" +
                     "  <TrustedNetworks>192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.0.0.0/8, 127.0.0.1/32</TrustedNetworks>\n" +
                     "  <Branch>master</Branch>\n" +
@@ -2327,12 +2337,15 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                 !updated.contains("<AuthenticationMethod>External</AuthenticationMethod>")) {
                 updated = updated.replaceAll("<AuthenticationMethod>.*?</AuthenticationMethod>", "<AuthenticationMethod>Forms</AuthenticationMethod>");
             }
+            // With a unified account the login is always required (so signing out really signs out); without one
+            // the local network stays open, otherwise the user would be locked out of a fresh install.
+            final String authReq = authRequiredValue();
             if (updated.matches("(?s).*<AuthenticationRequired>.*?</AuthenticationRequired>.*") &&
-                !updated.contains("<AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>")) {
-                updated = updated.replaceAll("<AuthenticationRequired>.*?</AuthenticationRequired>", "<AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>");
+                !updated.contains("<AuthenticationRequired>" + authReq + "</AuthenticationRequired>")) {
+                updated = updated.replaceAll("<AuthenticationRequired>.*?</AuthenticationRequired>", "<AuthenticationRequired>" + authReq + "</AuthenticationRequired>");
             } else if (!updated.contains("<AuthenticationRequired>")) {
                 if (updated.contains("</Config>")) {
-                    updated = updated.replace("</Config>", "  <AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>\n</Config>");
+                    updated = updated.replace("</Config>", "  <AuthenticationRequired>" + authReq + "</AuthenticationRequired>\n</Config>");
                 }
             }
 

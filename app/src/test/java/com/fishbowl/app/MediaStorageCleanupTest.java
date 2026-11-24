@@ -34,7 +34,7 @@ public class MediaStorageCleanupTest {
         testRoot = new File(System.getProperty("java.io.tmpdir"), "fishbowl_storage_test_" + System.currentTimeMillis());
         testRoot.mkdirs();
 
-        mockMediaRoot = new File(testRoot, "FishbowlMedia");
+        mockMediaRoot = new File(testRoot, "JellyarrMedia");
         mockMediaRoot.mkdirs();
 
         stagingRadarr = new File(mockMediaRoot, MediaStorageManager.SUB_DOWNLOADS_RADARR);

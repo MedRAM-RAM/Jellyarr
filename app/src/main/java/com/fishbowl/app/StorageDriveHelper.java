@@ -448,14 +448,14 @@ public final class StorageDriveHelper {
         List<String> list = new ArrayList<>();
         File root = new File(rootPath);
 
-        // 1. For Internal Storage (Primary): consolidate completely into core FishbowlMedia
+        // 1. For Internal Storage (Primary): consolidate completely into core JellyarrMedia
         if (isPrimary) {
-            list.add("FishbowlMedia");
+            list.add("JellyarrMedia");
             String[] coreSubs = {"Movies", "TV", "Music", "Downloads"};
             for (String sub : coreSubs) {
-                list.add("FishbowlMedia/" + sub);
+                list.add("JellyarrMedia/" + sub);
             }
-            File coreMedia = new File(root, "FishbowlMedia");
+            File coreMedia = new File(root, "JellyarrMedia");
             if (coreMedia.exists() && coreMedia.canRead()) {
                 File[] subs = coreMedia.listFiles();
                 if (subs != null) {
@@ -469,7 +469,7 @@ public final class StorageDriveHelper {
                                 !"tv".equalsIgnoreCase(sName) &&
                                 !"music".equalsIgnoreCase(sName) &&
                                 !"downloads".equalsIgnoreCase(sName)) {
-                                list.add("FishbowlMedia/" + sName);
+                                list.add("JellyarrMedia/" + sName);
                             }
                         }
                     }

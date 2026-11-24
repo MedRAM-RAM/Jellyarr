@@ -71,7 +71,7 @@ All daemons bind to loopback and the active local LAN interface:
 Fishbowl automatically provisions a unified repository on shared storage:
 
 ```text
-/storage/emulated/0/FishbowlMedia/
+/storage/emulated/0/JellyarrMedia/
 |-- Movies/       # Movie library collection
 |-- TV/           # TV series library collection
 |-- Music/        # Audio library collection

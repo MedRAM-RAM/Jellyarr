@@ -293,7 +293,7 @@ public final class PasswordResetManager {
 
             Log.i(TAG, "Active Jellyfin Password Reset PIN detected for user: " + userName);
 
-            // 1. Write PIN to /sdcard/FishbowlMedia/password/jellyfin_password_reset_pin.txt
+            // 1. Write PIN to /sdcard/JellyarrMedia/password/jellyfin_password_reset_pin.txt
             File passwordDir = getPasswordDirectory();
             File pinTextFile = new File(passwordDir, "jellyfin_password_reset_pin.txt");
             File userPinTextFile = new File(passwordDir, "jellyfin_password_reset_" + userName + ".txt");
@@ -465,7 +465,7 @@ public final class PasswordResetManager {
             String shortText = "User: " + userName + " | PIN: " + pin + " (Expires in 5 min)";
             String detailedText = "Username: " + userName + "\n"
                     + "Reset PIN: " + pin + "\n"
-                    + "Saved in: /sdcard/FishbowlMedia/password/\n"
+                    + "Saved in: /sdcard/JellyarrMedia/password/\n"
                     + "Expires in 5 minutes. Tap 'COPY PIN' below.";
 
             NotificationCompat.Builder builder = new NotificationCompat.Builder(appContext, CHANNEL_ID)

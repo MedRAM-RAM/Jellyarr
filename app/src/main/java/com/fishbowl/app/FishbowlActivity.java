@@ -3459,7 +3459,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Destination Path Note
         TextView destNote = new TextView(this);
-        destNote.setText("Target: /storage/emulated/0/FishbowlMedia/Downloads");
+        destNote.setText("Target: /storage/emulated/0/JellyarrMedia/Downloads");
         destNote.setTextSize(10);
         destNote.setTypeface(Typeface.MONOSPACE);
         destNote.setTextColor(AppTheme.textMuted());
@@ -5134,7 +5134,8 @@ public final class FishbowlActivity extends AppCompatActivity
             }
         }
 
-        // 1. Primary Installed Services Grid (2 Columns with 12dp Breathing Space)
+        // 1. Installed services are controlled from Home (tap a service logo); this tab only shows a hint
+        //    when nothing is installed yet, then the install drawer below.
         if (installedServices.isEmpty()) {
             View emptyBox = UiKit.empty(this, "NO COMPANION SERVICES INSTALLED",
                     "Tap available services in the drawer below to install.");
@@ -5142,41 +5143,6 @@ public final class FishbowlActivity extends AppCompatActivity
             LinearLayout.LayoutParams ebLp = new LinearLayout.LayoutParams(-1, -2);
             ebLp.bottomMargin = dp(12);
             servicesCardsContainer.addView(emptyBox, ebLp);
-        } else {
-            LinearLayout currentRow = null;
-            for (int i = 0; i < installedServices.size(); i++) {
-                ManagedService s = installedServices.get(i);
-                if (i % 2 == 0) {
-                    currentRow = new LinearLayout(this);
-                    currentRow.setOrientation(LinearLayout.HORIZONTAL);
-                    currentRow.setBaselineAligned(false);
-                    LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                    rowLp.bottomMargin = dp(12);
-                    currentRow.setLayoutParams(rowLp);
-                    servicesCardsContainer.addView(currentRow);
-                }
-
-                View card = buildIndividualServiceCard(s);
-                LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
-                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-                card.setLayoutParams(cardLp);
-                if (currentRow != null) {
-                    currentRow.addView(card);
-                }
-
-                if (i % 2 == 0) {
-                    View spacer = new View(this);
-                    if (currentRow != null) {
-                        currentRow.addView(spacer, new LinearLayout.LayoutParams(dp(12), 1));
-                    }
-                }
-            }
-
-            if (installedServices.size() % 2 != 0 && currentRow != null) {
-                View emptySpacer = new View(this);
-                currentRow.addView(emptySpacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
-            }
         }
 
         // 2. Uninstalled Services Collapsible Drawer (Grayed Out)
@@ -7108,7 +7074,7 @@ public final class FishbowlActivity extends AppCompatActivity
         pLp.topMargin = dp(12);
         root.addView(btnPurge, pLp);
 
-        TextView notePurge = UiKit.caption(this, "Permanently deletes binaries, SQLite databases, and all configuration files. Downloaded media files in FishbowlMedia are NEVER deleted.");
+        TextView notePurge = UiKit.caption(this, "Permanently deletes binaries, SQLite databases, and all configuration files. Downloaded media files in JellyarrMedia are NEVER deleted.");
         notePurge.setPadding(dp(4), dp(6), dp(4), 0);
         root.addView(notePurge);
 
@@ -8762,7 +8728,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         TextView what = new TextView(this);
         what.setText("What gets synchronized:\n"
-                + "• Download folders and media library folders (Movies / Series / Music)\n"
+                + "• Media storage: download folders and library folders (Movies / Series / Music)\n"
                 + "• Transmission as the download client in Radarr and Sonarr\n"
                 + "• Prowlarr indexers pushed to Radarr and Sonarr\n"
                 + "• Existing media imported into Radarr / Sonarr\n"
@@ -8771,6 +8737,13 @@ public final class FishbowlActivity extends AppCompatActivity
         what.setTextSize(12f);
         what.setTextColor(AppTheme.textSecondary());
         content.addView(what);
+
+        // Media storage lives here too: free space, usage per library folder and the retention policy.
+        final MediaStoragePanel storagePanel = new MediaStoragePanel(this);
+        LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(-1, -2);
+        spLp.topMargin = dp(12);
+        content.addView(storagePanel.getView(), spLp);
+        storagePanel.refresh(true);
 
         TextView status = new TextView(this);
         status.setTextSize(12.5f);
@@ -9030,7 +9003,6 @@ public final class FishbowlActivity extends AppCompatActivity
         addSettingsMenuRow("General & Startup", "Auto-start, keep screen on, media stack", buildGeneralSection());
         addSettingsMenuRow("Automation", "Transmission cleanup, auto-recheck, Wi-Fi only", buildAutomationSection());
         addSettingsMenuRow("Playback & Streaming", "Codecs and transcoding", buildStreamingSection());
-        addSettingsMenuRow("Movie Importer", "Downloads and folder organizer", buildMovieImporterSection());
 
         addSettingsGroupHeader("DEVICE & SECURITY");
         addSettingsMenuRow("Storage", "Jellyarr footprint and disk usage", buildStorageSection());
@@ -11718,217 +11690,6 @@ public final class FishbowlActivity extends AppCompatActivity
         safeShow(d);
     }
 
-    // -- Tools Quick-Access Actions (Home Tab) ---------------------------------
-
-    private View buildHomeToolsSection() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(14);
-        row.setLayoutParams(lp);
-
-        Button btnImporter = createPixelButton("MOVIE IMPORTER", getSurfaceElevatedColor(), Color.WHITE);
-        btnImporter.setTextSize(10f);
-        btnImporter.setOnClickListener(v -> startActivity(new Intent(this, com.fishbowl.app.importer.MovieImportActivity.class)));
-        LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(0, dp(36), 1.0f);
-        p1.setMarginEnd(dp(5));
-        row.addView(btnImporter, p1);
-
-        Button btnStorage = createPixelButton("MEDIA STORAGE", getSurfaceElevatedColor(), getPrimaryTextColor());
-        btnStorage.setTextSize(10f);
-        btnStorage.setOnClickListener(v -> startActivity(new Intent(this, JellyfinStorageActivity.class)));
-        LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, dp(36), 1.0f);
-        p2.setMarginStart(dp(5));
-        row.addView(btnStorage, p2);
-
-        return row;
-    }
-
-    // -- Section 7: Movie Importer (Drawer - Downloads & Folder Organizer) ------
-
-    private View buildMovieImporterSection() {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-
-        TextView descTv = new TextView(this);
-        descTv.setText("Organize browser-downloaded video files into standard Jellyfin movie folder structures (e.g. Movie Title (Year)/Movie Title (Year).ext) with automatic metadata matching.");
-        descTv.setTextSize(12f);
-        descTv.setTextColor(AppTheme.textSecondary());
-        descTv.setLineSpacing(dp(3), 1.15f);
-        descTv.setPadding(0, dp(2), 0, dp(10));
-        content.addView(descTv);
-
-        // Open Movie Importer Button (High-visibility action)
-        Button btnOpenImporter = createPixelButton("OPEN MOVIE IMPORTER", AppTheme.accent(), AppTheme.onAccent());
-        btnOpenImporter.setOnClickListener(v -> startActivity(new Intent(this, com.fishbowl.app.importer.MovieImportActivity.class)));
-        LinearLayout.LayoutParams pBtn = new LinearLayout.LayoutParams(-1, dp(42));
-        pBtn.bottomMargin = dp(12);
-        content.addView(btnOpenImporter, pBtn);
-
-        // 1. Detect New Downloads Toggle (Mode C)
-        com.fishbowl.app.importer.DownloadDetectionManager dm = com.fishbowl.app.importer.DownloadDetectionManager.getInstance(this);
-        LinearLayout autoDetectRow = new LinearLayout(this);
-        autoDetectRow.setOrientation(LinearLayout.HORIZONTAL);
-        autoDetectRow.setGravity(Gravity.CENTER_VERTICAL);
-        autoDetectRow.setPadding(0, dp(4), 0, dp(4));
-
-        LinearLayout adTextCol = new LinearLayout(this);
-        adTextCol.setOrientation(LinearLayout.VERTICAL);
-
-        TextView adTitle = new TextView(this);
-        adTitle.setText("Detect New Downloads");
-        adTitle.setTextSize(13.5f);
-        adTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        adTitle.setTextColor(AppTheme.text());
-        adTextCol.addView(adTitle);
-
-        TextView adSub = new TextView(this);
-        adSub.setText("Alerts when browser downloads complete. Never auto-moves files.");
-        adSub.setTextSize(11f);
-        adSub.setTextColor(AppTheme.textMuted());
-        adSub.setPadding(0, dp(2), 0, 0);
-        adTextCol.addView(adSub);
-
-        autoDetectRow.addView(adTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        Switch detectSwitch = new Switch(this);
-        detectSwitch.setChecked(dm.isDetectionEnabled());
-        detectSwitch.setOnCheckedChangeListener((b, isChecked) -> {
-            dm.setDetectionEnabled(isChecked);
-            Toast.makeText(this, I18n.tr(isChecked ? "Download detection enabled" : "Download detection disabled"), Toast.LENGTH_SHORT).show();
-        });
-        autoDetectRow.addView(detectSwitch);
-        content.addView(autoDetectRow);
-
-        content.addView(createSettingsDivider());
-
-        // Keep Screen Awake While Importing Toggle
-        LinearLayout keepScreenRow = new LinearLayout(this);
-        keepScreenRow.setOrientation(LinearLayout.HORIZONTAL);
-        keepScreenRow.setGravity(Gravity.CENTER_VERTICAL);
-        keepScreenRow.setPadding(0, dp(4), 0, dp(4));
-
-        LinearLayout ksTextCol = new LinearLayout(this);
-        ksTextCol.setOrientation(LinearLayout.VERTICAL);
-
-        TextView ksTitle = new TextView(this);
-        ksTitle.setText("Keep Screen Awake While Importing");
-        ksTitle.setTextSize(13.5f);
-        ksTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        ksTitle.setTextColor(AppTheme.text());
-        ksTextCol.addView(ksTitle);
-
-        TextView ksSub = new TextView(this);
-        ksSub.setText("Prevents screen timeout and OS sleep while moving or copying media.");
-        ksSub.setTextSize(11f);
-        ksSub.setTextColor(AppTheme.textMuted());
-        ksSub.setPadding(0, dp(2), 0, 0);
-        ksTextCol.addView(ksSub);
-
-        keepScreenRow.addView(ksTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        Switch keepScreenSwitch = new Switch(this);
-        keepScreenSwitch.setChecked(dm.isKeepScreenOnEnabled());
-        keepScreenSwitch.setOnCheckedChangeListener((b, isChecked) -> {
-            dm.setKeepScreenOnEnabled(isChecked);
-            Toast.makeText(this, I18n.tr(isChecked ? "Screen will stay awake during imports" : "Screen wake lock disabled"), Toast.LENGTH_SHORT).show();
-        });
-        keepScreenRow.addView(keepScreenSwitch);
-        content.addView(keepScreenRow);
-
-        content.addView(createSettingsDivider());
-
-        // 2. Configure TMDB API Key Row
-        LinearLayout tmdbRow = new LinearLayout(this);
-        tmdbRow.setOrientation(LinearLayout.HORIZONTAL);
-        tmdbRow.setGravity(Gravity.CENTER_VERTICAL);
-        tmdbRow.setPadding(0, dp(4), 0, dp(4));
-
-        LinearLayout tmdbTextCol = new LinearLayout(this);
-        tmdbTextCol.setOrientation(LinearLayout.VERTICAL);
-
-        TextView tmdbTitle = new TextView(this);
-        tmdbTitle.setText("Metadata Provider (TMDB)");
-        tmdbTitle.setTextSize(13.5f);
-        tmdbTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        tmdbTitle.setTextColor(AppTheme.text());
-        tmdbTextCol.addView(tmdbTitle);
-
-        TextView tmdbSub = new TextView(this);
-        tmdbSub.setText("Optional TMDB API key for automatic posters and overviews.");
-        tmdbSub.setTextSize(11f);
-        tmdbSub.setTextColor(AppTheme.textMuted());
-        tmdbSub.setPadding(0, dp(2), 0, 0);
-        tmdbTextCol.addView(tmdbSub);
-
-        tmdbRow.addView(tmdbTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        Button btnTmdbKey = createPixelButton("KEY", getSurfaceElevatedColor(), getPrimaryTextColor());
-        btnTmdbKey.setTextSize(10f);
-        btnTmdbKey.setOnClickListener(v -> showTmdbKeyConfigDialog());
-        tmdbRow.addView(btnTmdbKey, new LinearLayout.LayoutParams(-2, dp(34)));
-        content.addView(tmdbRow);
-
-        content.addView(createSettingsDivider());
-
-        // 3. Default Naming Convention Card
-        TextView namingFormatTv = new TextView(this);
-        namingFormatTv.setText("Default Naming: Movie Title (Year)/Movie Title (Year).ext\nConflict Policy: Keep Both (safe versioning) • Retain Original: Enabled");
-        namingFormatTv.setTextSize(11f);
-        namingFormatTv.setTextColor(AppTheme.textMuted());
-        namingFormatTv.setPadding(0, dp(4), 0, dp(4));
-        content.addView(namingFormatTv);
-
-        return buildCollapsibleCard(
-                "Movie Importer",
-                "Downloads organizer, metadata matcher & detection",
-                content,
-                false
-        );
-    }
-
-    private void showTmdbKeyConfigDialog() {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-
-        TextView desc = new TextView(this);
-        desc.setText("Enter your personal TMDB API key to fetch movie posters and overviews during import.\n\nLeave blank to use filename heuristics.");
-        desc.setTextSize(11.5f);
-        desc.setTextColor(AppTheme.textSecondary());
-        desc.setPadding(0, 0, 0, dp(12));
-        content.addView(desc);
-
-        final EditText input = new EditText(this);
-        String currentKey = com.fishbowl.app.importer.TmdbMetadataProvider.getApiKey(this);
-        if (currentKey != null) input.setText(currentKey);
-        input.setSingleLine(true);
-        input.setHint("Enter TMDB v3 API Key (optional)");
-        input.setHintTextColor(AppTheme.textMuted());
-        input.setTextColor(AppTheme.text());
-        input.setBackground(createBorderedRoundedDrawable(
-                AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
-        input.setPadding(dp(14), dp(10), dp(14), dp(10));
-        input.setTextSize(13f);
-        input.setTypeface(Typeface.MONOSPACE);
-        content.addView(input);
-
-        showOledDialog(
-                "TMDB API Configuration",
-                "Movie Importer Metadata",
-                content,
-                "SAVE",
-                getAccentColor(),
-                () -> {
-                    String key = input.getText().toString().trim();
-                    com.fishbowl.app.importer.TmdbMetadataProvider.setApiKey(this, key);
-                    Toast.makeText(this, I18n.tr(key.isEmpty() ? "TMDB API key cleared" : "TMDB API key saved"), Toast.LENGTH_SHORT).show();
-                },
-                "CANCEL",
-                null
-        );
-    }
-
     // -- Section 8: About Fishbowl (Drawer - Specs, Architecture & Licenses) ----
 
     private View buildAboutSection() {
@@ -13139,7 +12900,7 @@ public final class FishbowlActivity extends AppCompatActivity
         } catch (Throwable ignored) {}
         if (dir.isFile()) return dir.length();
         String absPath = dir.getAbsolutePath();
-        if (absPath.startsWith("/storage") || absPath.startsWith("/mnt") || absPath.contains("/FishbowlMedia")) {
+        if (absPath.startsWith("/storage") || absPath.startsWith("/mnt") || absPath.contains("/JellyarrMedia") || absPath.contains("/FishbowlMedia")) {
             return 0;
         }
         File[] files = dir.listFiles();
@@ -13152,7 +12913,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 }
             } catch (Throwable ignored) {}
             String path = f.getAbsolutePath();
-            if (path.startsWith("/storage") || path.startsWith("/mnt") || path.contains("/FishbowlMedia") || f.getName().equals("storage") || f.getName().equals("FishbowlMedia")) {
+            if (path.startsWith("/storage") || path.startsWith("/mnt") || path.contains("/JellyarrMedia") || path.contains("/FishbowlMedia") || f.getName().equals("storage") || f.getName().equals("JellyarrMedia")) {
                 continue;
             }
             if (f.isFile()) {
