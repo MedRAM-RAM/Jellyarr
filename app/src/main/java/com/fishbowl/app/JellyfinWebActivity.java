@@ -192,6 +192,21 @@ public final class JellyfinWebActivity extends AppCompatActivity implements Jell
         web.setWebViewClient(new WebViewClient() {
             private String currentAttemptId = "";
             private long lastAttemptTime = 0;
+            private int authAttempts = 0;
+
+            /** Transmission's web UI uses HTTP Basic auth: answer it with the unified account (once). */
+            @Override
+            public void onReceivedHttpAuthRequest(WebView view, android.webkit.HttpAuthHandler handler, String host, String realm) {
+                try {
+                    if (authAttempts < 2 && isLocalOrLanHost(host) && UnifiedAccount.isConfigured(JellyfinWebActivity.this)) {
+                        authAttempts++;
+                        handler.proceed(UnifiedAccount.getUsername(JellyfinWebActivity.this),
+                                UnifiedAccount.getPassword(JellyfinWebActivity.this));
+                        return;
+                    }
+                } catch (Throwable ignored) {}
+                super.onReceivedHttpAuthRequest(view, handler, host, realm);
+            }
 
             @Override 
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) { 

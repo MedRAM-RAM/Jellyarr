@@ -100,7 +100,8 @@ public final class UnifiedAccount {
     }
 
     private static void setStatus(Context c, String id, String status, String msg, Progress cb) {
-        sp(c).edit().putString("status_" + id, status).putString("msg_" + id, msg == null ? "" : msg).apply();
+        sp(c).edit().putString("status_" + id, status).putString("msg_" + id, msg == null ? "" : msg)
+                .putLong("time_" + id, System.currentTimeMillis()).apply();
         if (cb != null) cb.onStatus(id, status, msg);
     }
 
@@ -134,14 +135,69 @@ public final class UnifiedAccount {
         final String user = getUsername(c).trim();
         final String pass = getPassword(c);
 
-        if (force || !"ok".equals(getStatus(c, "jellyfin"))) applyJellyfin(c, user, pass, cb);
-        if (force || !"ok".equals(getStatus(c, "sonarr"))) applyArr(c, "sonarr", 8989, "/api/v3", user, pass, cb);
-        if (force || !"ok".equals(getStatus(c, "radarr"))) applyArr(c, "radarr", 7878, "/api/v3", user, pass, cb);
-        if (force || !"ok".equals(getStatus(c, "prowlarr"))) applyArr(c, "prowlarr", 9696, "/api/v1", user, pass, cb);
-        if (force || !"ok".equals(getStatus(c, "transmission"))) applyTransmission(c, cb);
+        if (force || due(c, "jellyfin")) applyJellyfin(c, user, pass, cb);
+        if (force || due(c, "sonarr")) applyArr(c, "sonarr", 8989, "/api/v3", user, pass, cb);
+        if (force || due(c, "radarr")) applyArr(c, "radarr", 7878, "/api/v3", user, pass, cb);
+        if (force || due(c, "prowlarr")) applyArr(c, "prowlarr", 9696, "/api/v1", user, pass, cb);
+        if (force || due(c, "transmission")) applyTransmission(c, cb);
+    }
+
+    /** Automatic passes retry "pending" services; a "failed" one is retried at most every 6 hours. */
+    private static boolean due(Context c, String id) {
+        String st = getStatus(c, id);
+        if ("ok".equals(st)) return false;
+        if (!"failed".equals(st)) return true;
+        return System.currentTimeMillis() - sp(c).getLong("time_" + id, 0) > 6L * 3600 * 1000;
+    }
+
+    /** True when an automatic pass would do something (pending, or a failure old enough to retry). */
+    public static boolean hasDue(Context c) {
+        if (!isConfigured(c)) return false;
+        for (String s : SERVICES) if (due(c, s)) return true;
+        return false;
     }
 
     // ---- Sonarr / Radarr / Prowlarr
+
+    private static String appName(String id) {
+        if ("sonarr".equals(id)) return "Sonarr";
+        if ("radarr".equals(id)) return "Radarr";
+        return "Prowlarr";
+    }
+
+    /**
+     * Makes a host-config body pass the *arr validators. The app binds the services to 0.0.0.0, which the
+     * validator rejects ("use * instead"), so the body sends * (same meaning: listen on every interface).
+     */
+    private static void sanitizeHostConfig(JSONObject host, String id) throws Exception {
+        String bind = host.optString("bindAddress", "*");
+        if (bind.isEmpty() || "0.0.0.0".equals(bind)) host.put("bindAddress", "*");
+        String name = appName(id);
+        String inst = host.optString("instanceName", "");
+        if (inst.isEmpty() || !inst.toLowerCase(Locale.US).contains(name.toLowerCase(Locale.US))) host.put("instanceName", name);
+        if (host.optString("branch", "").isEmpty()) host.put("branch", "prowlarr".equals(id) ? "master" : "main");
+        if (host.has("backupInterval")) {
+            int v = host.optInt("backupInterval", 7);
+            if (v < 1 || v > 7) host.put("backupInterval", 7);
+        }
+        if (host.has("backupRetention")) {
+            int v = host.optInt("backupRetention", 28);
+            if (v < 1 || v > 90) host.put("backupRetention", 28);
+        }
+        if (host.has("logSizeLimit")) {
+            int v = host.optInt("logSizeLimit", 1);
+            if (v < 1 || v > 10) host.put("logSizeLimit", 1);
+        }
+        if (host.optBoolean("enableSsl", false)) {
+            int sp = host.optInt("sslPort", 0);
+            if (sp <= 0 || sp > 65535) host.put("enableSsl", false);
+        }
+        if (host.optBoolean("proxyEnabled", false) && host.optString("proxyHostname", "").isEmpty()) {
+            host.put("proxyEnabled", false);
+        }
+        int port = host.optInt("port", 0);
+        if (port <= 0 || port > 65535) host.put("port", "sonarr".equals(id) ? 8989 : "radarr".equals(id) ? 7878 : 9696);
+    }
 
     private static void applyArr(Context c, String id, int port, String api, String user, String pass, Progress cb) {
         try {
@@ -156,48 +212,86 @@ public final class UnifiedAccount {
                 return;
             }
             String base = "http://127.0.0.1:" + port + api;
-            String cur = http("GET", base + "/config/host", key, null, null);
-            JSONObject host = new JSONObject(cur);
+            JSONObject host = new JSONObject(http("GET", base + "/config/host", key, null, null));
+            sanitizeHostConfig(host, id);
             host.put("authenticationMethod", "forms");
-            host.put("authenticationRequired", "enabled");
+            // Same rule the app enforces in config.xml at every start: the phone itself (127.0.0.1) and the
+            // in-app tabs never need to log in; other devices on the network must use this account.
+            host.put("authenticationRequired", "disabledForLocalAddresses");
             host.put("username", user);
             host.put("password", pass);
             host.put("passwordConfirmation", pass);
             http("PUT", base + "/config/host/" + host.optInt("id", 1), key, host.toString(), null);
 
             // Keep the Transmission download client in Radarr / Sonarr in sync with the new credentials.
-            if (!"prowlarr".equals(id)) {
-                try {
-                    String list = http("GET", base + "/downloadclient", key, null, null);
-                    JSONArray arr = new JSONArray(list);
-                    for (int i = 0; i < arr.length(); i++) {
-                        JSONObject cl = arr.optJSONObject(i);
-                        if (cl == null || !"Transmission".equalsIgnoreCase(cl.optString("implementation"))) continue;
-                        JSONArray fields = cl.optJSONArray("fields");
-                        if (fields == null) continue;
-                        boolean sawUser = false, sawPass = false;
-                        for (int j = 0; j < fields.length(); j++) {
-                            JSONObject f = fields.optJSONObject(j);
-                            if (f == null) continue;
-                            if ("username".equalsIgnoreCase(f.optString("name"))) {
-                                f.put("value", user);
-                                sawUser = true;
-                            } else if ("password".equalsIgnoreCase(f.optString("name"))) {
-                                f.put("value", pass);
-                                sawPass = true;
-                            }
-                        }
-                        if (!sawUser) fields.put(new JSONObject().put("name", "username").put("value", user));
-                        if (!sawPass) fields.put(new JSONObject().put("name", "password").put("value", pass));
-                        http("PUT", base + "/downloadclient/" + cl.optInt("id") + "?forceSave=true", key, cl.toString(), null);
-                    }
-                } catch (Throwable ignored) {
-                    // non fatal: wiring is repaired on the next SYNC STACK
-                }
+            if (!"prowlarr".equals(id)) syncTransmissionClient(base, key, user, pass);
+
+            // Verify the new login really works on the web UI.
+            int verdict = verifyFormsLogin(port, user, pass);
+            if (verdict < 0) {
+                setStatus(c, id, "failed", "Saved, but the new password was refused at login", cb);
+                return;
             }
             setStatus(c, id, "ok", "", cb);
         } catch (Throwable t) {
             setStatus(c, id, "failed", String.valueOf(t.getMessage()), cb);
+        }
+    }
+
+    private static void syncTransmissionClient(String base, String key, String user, String pass) {
+        try {
+            JSONArray arr = new JSONArray(http("GET", base + "/downloadclient", key, null, null));
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject cl = arr.optJSONObject(i);
+                if (cl == null || !"Transmission".equalsIgnoreCase(cl.optString("implementation"))) continue;
+                JSONArray fields = cl.optJSONArray("fields");
+                if (fields == null) continue;
+                boolean sawUser = false, sawPass = false;
+                for (int j = 0; j < fields.length(); j++) {
+                    JSONObject f = fields.optJSONObject(j);
+                    if (f == null) continue;
+                    if ("username".equalsIgnoreCase(f.optString("name"))) {
+                        f.put("value", user);
+                        sawUser = true;
+                    } else if ("password".equalsIgnoreCase(f.optString("name"))) {
+                        f.put("value", pass);
+                        sawPass = true;
+                    }
+                }
+                if (!sawUser) fields.put(new JSONObject().put("name", "username").put("value", user));
+                if (!sawPass) fields.put(new JSONObject().put("name", "password").put("value", pass));
+                http("PUT", base + "/downloadclient/" + cl.optInt("id") + "?forceSave=true", key, cl.toString(), null);
+            }
+        } catch (Throwable ignored) {
+            // non fatal: wiring is repaired on the next SYNC STACK
+        }
+    }
+
+    /** 1 = accepted, -1 = refused, 0 = could not tell. Forms login answers with a redirect either way. */
+    private static int verifyFormsLogin(int port, String user, String pass) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL("http://127.0.0.1:" + port + "/login?returnUrl=/").openConnection();
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(10000);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            String form = "username=" + java.net.URLEncoder.encode(user, "UTF-8")
+                    + "&password=" + java.net.URLEncoder.encode(pass, "UTF-8") + "&rememberMe=on";
+            OutputStream os = conn.getOutputStream();
+            os.write(form.getBytes(StandardCharsets.UTF_8));
+            os.close();
+            int code = conn.getResponseCode();
+            String loc = conn.getHeaderField("Location");
+            if (code >= 300 && code < 400 && loc != null) return loc.contains("loginFailed") ? -1 : 1;
+            if (code == 401 || code == 403) return -1;
+            return 0;
+        } catch (Throwable t) {
+            return 0;
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
@@ -290,8 +384,34 @@ public final class UnifiedAccount {
                 }
             }
             if (exists) {
-                if (!JellyfinAccountManager.setPassword(c, user, pass)) {
+                if (jellyfinLoginWorks(user, pass)) {
+                    JellyfinAccountManager.storeKnownPassword(c, user, pass);
+                    setStatus(c, "jellyfin", "ok", "", cb);
+                    return;
+                }
+                boolean changed = false;
+                try {
+                    String tok = JellyfinLibraryClient.getToken(c);
+                    if (tok != null) {
+                        JSONArray users = new JSONArray(http("GET", "http://127.0.0.1:8096/Users", null, null, tok));
+                        for (int i = 0; i < users.length(); i++) {
+                            JSONObject u = users.optJSONObject(i);
+                            if (u == null || !user.equalsIgnoreCase(u.optString("Name"))) continue;
+                            JSONObject body = new JSONObject().put("CurrentPw", "").put("NewPw", pass).put("ResetPassword", false);
+                            http("POST", "http://127.0.0.1:8096/Users/" + u.optString("Id") + "/Password", null, body.toString(), tok);
+                            changed = true;
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                if (!changed) changed = JellyfinAccountManager.setPassword(c, user, pass);
+                if (!changed) {
                     setStatus(c, "jellyfin", "failed", "Could not update the existing user's password", cb);
+                    return;
+                }
+                JellyfinAccountManager.storeKnownPassword(c, user, pass);
+                if (!jellyfinLoginWorks(user, pass)) {
+                    setStatus(c, "jellyfin", "failed", "Password saved, but Jellyfin still refuses it (restart Jellyfin)", cb);
                     return;
                 }
                 setStatus(c, "jellyfin", "ok", "", cb);
@@ -322,6 +442,28 @@ public final class UnifiedAccount {
         }
     }
 
+    private static boolean jellyfinLoginWorks(String user, String pass) {
+        try {
+            String auth = "MediaBrowser Client=\"Jellyarr\", Device=\"Android\", DeviceId=\"jellyarr-account\", Version=\"1.0\"";
+            HttpURLConnection conn = (HttpURLConnection) new URL("http://127.0.0.1:8096/Users/AuthenticateByName").openConnection();
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(15000);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("X-Emby-Authorization", auth);
+            conn.setRequestProperty("Authorization", auth);
+            OutputStream os = conn.getOutputStream();
+            os.write(new JSONObject().put("Username", user).put("Pw", pass).toString().getBytes(StandardCharsets.UTF_8));
+            os.close();
+            int code = conn.getResponseCode();
+            conn.disconnect();
+            return code == 200;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** True when the entered credentials belong to an existing Jellyfin user (used by "Sign in"). */
     public static boolean verifyAgainstJellyfin(Context c, String user, String pass) {
         try {
@@ -344,6 +486,33 @@ public final class UnifiedAccount {
     }
 
     // ------------------------------------------------------------------ http
+
+    /** Turns an *arr validation array or a JSON error object into one short line. */
+    private static String readableError(String body) {
+        try {
+            String t = body == null ? "" : body.trim();
+            if (t.startsWith("[")) {
+                JSONArray a = new JSONArray(t);
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < a.length() && i < 3; i++) {
+                    JSONObject o = a.optJSONObject(i);
+                    if (o == null) continue;
+                    if (sb.length() > 0) sb.append("; ");
+                    String prop = o.optString("propertyName", "");
+                    if (!prop.isEmpty()) sb.append(prop).append(": ");
+                    sb.append(o.optString("errorMessage", ""));
+                }
+                return sb.toString();
+            }
+            if (t.startsWith("{")) {
+                JSONObject o = new JSONObject(t);
+                return o.optString("message", o.optString("errorMessage", o.optString("title", "")));
+            }
+            return t.length() > 160 ? t.substring(0, 160) : t;
+        } catch (Throwable e) {
+            return "";
+        }
+    }
 
     private static boolean portOpen(int port) {
         try (Socket s = new Socket()) {
@@ -383,7 +552,11 @@ public final class UnifiedAccount {
                 br.close();
             }
             if (code >= 400) {
-                throw new Exception(String.format(Locale.US, "HTTP %d at %s", code, url.replaceAll("\\?.*", "")));
+                String detail = readableError(sb.toString());
+                String where = url.replaceAll("\\?.*", "").replaceAll("^http://127\\.0\\.0\\.1:\\d+", "");
+                throw new Exception(detail.isEmpty()
+                        ? String.format(Locale.US, "HTTP %d at %s", code, where)
+                        : String.format(Locale.US, "HTTP %d: %s", code, detail));
             }
             return sb.toString();
         } finally {

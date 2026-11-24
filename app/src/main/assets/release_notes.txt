@@ -1,4 +1,9 @@
-What's new in 2.0.4-beta.18 (beta)
+What's new in 2.0.4-beta.19 (beta)
+- Fixed the unified account failing with HTTP 400 in Sonarr, Radarr and Prowlarr: existing logins are now updated and the new password is verified by a real login on every service.
+- Jellyfin password changes for an existing user now go through the Jellyfin API and are verified; errors now show the real reason instead of a URL.
+- The Transmission web page inside the app signs in automatically with the unified account.
+
+From 2.0.4-beta.18:
 - One account for every service: the same username and password now work for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission. Manage it in Settings > Security & Identity (per-service status, change, apply now, forget).
 - First launch now shows two windows: restore a backup if one is found, then sign in or create the account for all services (you can skip both).
 
