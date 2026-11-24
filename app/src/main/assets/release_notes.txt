@@ -1,4 +1,11 @@
-What's new in 2.0.4-beta.20 (beta)
+What's new in 2.0.4-beta.21 (beta)
+- Smaller app: the runtime bundle shrank from 219 MB to 137 MB (duplicate .NET 9 runtime and unused files removed, xz compression, arm64-only libraries) and first-run unpacking no longer needs a temporary copy.
+- The shared media folder is now JellyarrMedia. Existing data is renamed in place on first launch and every stored path (Radarr, Sonarr, Prowlarr, Jellyfin, Transmission) is updated.
+- Radarr, Sonarr and Prowlarr now always ask for the unified account when opening their web UI, so signing out works. Without an account the local network stays open.
+- Media tab: the service cards were removed (control services from Home). The movie importer was replaced by File management for Radarr and Sonarr: naming and rename options, Organize (rename all files), and import from a folder with Move or Copy.
+- Media storage moved into the SYNC STACK window.
+
+From 2.0.4-beta.20:
 - Full redesign with one shared design system: consistent headers, cards, buttons, chips, lists and loading / empty / error states on every screen.
 - Sonarr, Radarr, Prowlarr and Transmission tabs reviewed against the official APIs and fixed (safer actions, live lists that keep their scroll position, clear 'not running' and login errors, faster cached posters).
 - Jellyfin Library signs in automatically with the unified account and recovers from expired logins without risking an account lockout.
