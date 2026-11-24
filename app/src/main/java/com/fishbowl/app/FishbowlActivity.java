@@ -351,13 +351,42 @@ public final class FishbowlActivity extends AppCompatActivity
         }
     });
 
+    /** Runs {@code r} on the background pool; ignored once the pool is shut down in onDestroy. */
+    private void runBg(Runnable r) {
+        try {
+            bgExecutor.execute(r);
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            // activity is being destroyed
+        }
+    }
+
+    /** True while it is safe to show dialogs and touch the view tree. */
+    private boolean isUiAlive() {
+        return !isFinishing() && !isDestroyed();
+    }
+
+    /** Shows a dialog unless the activity is finishing (avoids WindowManager$BadTokenException). */
+    private boolean safeShow(Dialog d) {
+        if (d == null || !isUiAlive()) return false;
+        try {
+            d.show();
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "dialog show failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** True between onStart and onStop (pollers only run while the activity is visible). */
+    private boolean uiStarted = false;
+
     // Download Center Auto-Refresh Poller (Dynamic throttle: 1.5s active, 3.5s idle)
     private final Handler downloadAutoRefreshHandler = new Handler(Looper.getMainLooper());
     private volatile boolean hasActiveDownloads = false;
     private final Runnable downloadRefreshRunnable = new Runnable() {
         @Override
         public void run() {
-            if (activeTab == TAB_TRANSMISSION && !isFinishing() && (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1 || !isDestroyed())) {
+            if (activeTab == TAB_TRANSMISSION && uiStarted && isUiAlive()) {
                 boolean visible = downloadItemsContainer != null && downloadItemsContainer.isShown();
                 if (visible) refreshDownloadCenter();
                 long delay = (visible && hasActiveDownloads) ? 1500L : 3500L;
@@ -402,10 +431,20 @@ public final class FishbowlActivity extends AppCompatActivity
     private final Runnable healthPollRunnable = new Runnable() {
         @Override
         public void run() {
-            if (activeTab == 0) refreshServerHealthUI();
+            // Only polls while Home is the visible tab; renderActiveTab() restarts it when Home is shown again.
+            if (activeTab != 0 || !uiStarted) return;
+            refreshServerHealthUI();
             healthHandler.postDelayed(this, 4000);
         }
     };
+
+    /** Restarts the Home health poller (no-op unless Home is visible and the activity is started). */
+    private void restartHealthPolling() {
+        healthHandler.removeCallbacks(healthPollRunnable);
+        if (activeTab == 0 && uiStarted) healthHandler.post(healthPollRunnable);
+    }
+
+    private final Runnable firstRunFlowRunnable = this::maybeRunFirstRunFlow;
 
     // Network Callback & Receiver
     private ConnectivityManager.NetworkCallback networkCallback;
@@ -498,7 +537,14 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // Start watching for Jellyfin password reset token files and notify user
         PasswordResetManager.getInstance(getApplicationContext()).startMonitoring();
-        passwordResetListener = info -> runOnUiThread(() -> updatePasswordResetBanner(info));
+        passwordResetListener = new PasswordResetManager.ResetStateListener() {
+            @Override
+            public void onResetStateChanged(PasswordResetManager.ActiveResetInfo info) {
+                runOnUiThread(() -> {
+                    if (isUiAlive()) updatePasswordResetBanner(info);
+                });
+            }
+        };
         PasswordResetManager.registerListener(passwordResetListener);
 
         setContentView(I18n.attach(buildMainPixelShell()));
@@ -623,25 +669,24 @@ public final class FishbowlActivity extends AppCompatActivity
     @Override
     protected void onStart() {
         super.onStart();
+        uiStarted = true;
         controller.addListener(this);
-        controller.reconcileStateAsync();
         controller.addLogListener(this);
         MediaServiceManager.getInstance(this).addListener(serviceListener);
-        MediaServiceManager.getInstance(this).reconcileRunningServices();
         UpdateManager.getInstance(this).addListener(updateListener);
         refreshUpdateBanner();
         UpdateManager.getInstance(this).checkForUpdates(this, false);
         refreshLanAddress();
-        refreshHomeServicesBadge();
         renderCurrentState();
-        refreshUpdateUI();
+        // reconcile*, refreshHomeServicesBadge() and refreshUpdateUI() run in onResume(), which always follows.
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         PasswordResetManager.getInstance(getApplicationContext()).checkOnce();
-        mainHandler.postDelayed(this::maybeRunFirstRunFlow, 1500);
+        mainHandler.removeCallbacks(firstRunFlowRunnable);
+        mainHandler.postDelayed(firstRunFlowRunnable, 1500);
         if (controller != null) {
             controller.reconcileStateAsync();
         }
@@ -654,14 +699,13 @@ public final class FishbowlActivity extends AppCompatActivity
         runStartupUpdateCheck();
         handleUpdateIntent(getIntent());
         refreshHomeServicesBadge();
-        healthHandler.removeCallbacks(healthPollRunnable);
-        healthHandler.post(healthPollRunnable);
+        restartHealthPolling();
         refreshPermissionsUI();
         updatePasswordResetBanner(PasswordResetManager.getActiveResetInfo());
         refreshHomeAccountsUI();
 
         // Background automatic cleanup for orphan media folders (e.g. movies deleted in Jellyfin leaving only .nfo or empty folders)
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             try {
                 MediaStorageManager.getInstance(FishbowlActivity.this).cleanupOrphanMediaFolders();
             } catch (Throwable ignored) {}
@@ -680,6 +724,8 @@ public final class FishbowlActivity extends AppCompatActivity
 
     @Override
     protected void onStop() {
+        uiStarted = false;
+        mainHandler.removeCallbacks(firstRunFlowRunnable);
         controller.removeListener(this);
         controller.removeLogListener(this);
         MediaServiceManager.getInstance(this).removeListener(serviceListener);
@@ -689,6 +735,8 @@ public final class FishbowlActivity extends AppCompatActivity
         healthHandler.removeCallbacks(healthPollRunnable);
         downloadAutoRefreshHandler.removeCallbacksAndMessages(null);
         mainHandler.removeCallbacks(startupProgressPoller);
+        // the reset-PIN countdown is restarted by updatePasswordResetBanner() in onResume()
+        resetBannerCountdownHandler.removeCallbacksAndMessages(null);
         super.onStop();
     }
 
@@ -697,8 +745,19 @@ public final class FishbowlActivity extends AppCompatActivity
         unregisterUsbReceiver();
         teardownNetworkMonitor();
         controller.removeLogListener(this);
+        controller.removeListener(this);
         logUpdateHandler.removeCallbacksAndMessages(null);
         downloadAutoRefreshHandler.removeCallbacksAndMessages(null);
+        // Nothing scheduled on the UI handlers may run against a destroyed activity.
+        mainHandler.removeCallbacksAndMessages(null);
+        healthHandler.removeCallbacksAndMessages(null);
+        resetBannerCountdownHandler.removeCallbacksAndMessages(null);
+        serviceUiThrottleHandler.removeCallbacksAndMessages(null);
+        updateUiHandler.removeCallbacksAndMessages(null);
+        if (passwordResetListener != null) {
+            PasswordResetManager.unregisterListener(passwordResetListener);
+            passwordResetListener = null;
+        }
         com.fishbowl.app.services.NativeFlareSolver.getInstance().stop();
         bgExecutor.shutdown();
         super.onDestroy();
@@ -714,11 +773,8 @@ public final class FishbowlActivity extends AppCompatActivity
     @Override
     protected void onRestoreInstanceState(Bundle savedInstanceState) {
         super.onRestoreInstanceState(savedInstanceState);
-        if (savedInstanceState != null) {
-            activeTab = savedInstanceState.getInt("activeTab", 0);
-            updateBottomNavSelection();
-            renderActiveTab();
-        }
+        // onCreate() already restored the tab and the open Settings section; rendering again here
+        // only duplicated every refresh.
     }
 
     @Override
@@ -1010,9 +1066,9 @@ public final class FishbowlActivity extends AppCompatActivity
         logoParams.setMarginEnd(dp(10));
         header.addView(logo, logoParams);
 
-        // App Branding Name: FISHBOWL (Uppercase, tracking-widest)
+        // App Branding Name: JELLYARR (Uppercase, tracking-widest)
         TextView title = new TextView(this);
-        title.setText("FISHBOWL");
+        title.setText("JELLYARR");
         title.setTextSize(14f);
         title.setLetterSpacing(0.14f);
         title.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
@@ -1020,7 +1076,7 @@ public final class FishbowlActivity extends AppCompatActivity
         header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         TextView verBadge = new TextView(this);
-        verBadge.setText("v" + com.termux.BuildConfig.VERSION_NAME + " • JF v12.4.0");
+        verBadge.setText("v" + com.termux.BuildConfig.VERSION_NAME);
         verBadge.setTextSize(10);
         verBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         verBadge.setTextColor(AppTheme.textMuted());
@@ -1066,6 +1122,7 @@ public final class FishbowlActivity extends AppCompatActivity
         tab.setClickable(true);
         tab.setFocusable(true);
         tab.setContentDescription(label);
+        tab.setBackground(UiKit.rowRipple(this));
         tab.setOnClickListener(v -> {
             if (tabIndex == -1) {
                 toggleSideDrawer();
@@ -1176,6 +1233,7 @@ public final class FishbowlActivity extends AppCompatActivity
             refreshLanAddress();
             refreshHomeServicesBadge();
             refreshHomeAccountsUI();
+            restartHealthPolling();
         } else if (activeTab == 1) {
             refreshServicesTabUI();
             if (mediaToolsView != null) mediaToolsView.refresh(false);
@@ -1204,8 +1262,7 @@ public final class FishbowlActivity extends AppCompatActivity
             if (radarrTabView != null) radarrTabView.refresh();
         } else if (activeTab == TAB_TRANSMISSION) {
             if (transmissionTabView != null) transmissionTabView.refresh();
-            downloadAutoRefreshHandler.removeCallbacks(downloadRefreshRunnable);
-            downloadAutoRefreshHandler.postDelayed(downloadRefreshRunnable, 800);
+            // the download-center poller is (re)scheduled once, below
         } else if (activeTab == TAB_PROWLARR) {
             if (prowlarrTabView != null) prowlarrTabView.refresh();
         } else if (activeTab == 4) {
@@ -1807,7 +1864,7 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(getBgColor());
         // Bottom padding ensures content scrolls completely clear of the docked action bar
-        scroll.setPadding(dp(20), dp(16), dp(20), dp(130));
+        scroll.setPadding(dp(16), dp(12), dp(16), dp(130));
         scroll.setClipToPadding(false);
 
         LinearLayout layout = new LinearLayout(this);
@@ -1828,17 +1885,21 @@ public final class FishbowlActivity extends AppCompatActivity
         errorDiagnosticCard = buildErrorDiagnosticCard();
         layout.addView(errorDiagnosticCard);
 
-        // Gap dp(14) - tightened to eliminate dead void space
-        layout.addView(createSectionSpacer(dp(14)));
+        layout.addView(createSectionSpacer(dp(12)));
 
-        // 3. Client Streaming IPs & Linked Account (Seamless Borderless Rows)
-        layout.addView(buildClientStreamingIpsSection());
-
-        // Gap dp(32)
-        layout.addView(createSectionSpacer());
+        // 3. Client Streaming IPs & Linked Account (rows inside one card)
+        LinearLayout connectCard = UiKit.card(this);
+        connectCard.setPadding(dp(8), dp(12), dp(8), dp(6));
+        TextView connectTitle = UiKit.overline(this, "Connect");
+        connectTitle.setPadding(dp(8), 0, dp(8), dp(2));
+        connectCard.addView(connectTitle);
+        connectCard.addView(buildClientStreamingIpsSection());
+        layout.addView(connectCard);
 
         // 4. Services Control Plane (Horizontal Icon Row)
-        layout.addView(buildServicesControlPlaneSection());
+        LinearLayout servicesCard = UiKit.card(this);
+        servicesCard.addView(buildServicesControlPlaneSection());
+        layout.addView(servicesCard);
 
         scroll.addView(layout);
         root.addView(scroll, new FrameLayout.LayoutParams(
@@ -2029,7 +2090,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void updateHomeLinkedAccountStatus() {
         if (homeLinkedAccountValueText == null) return;
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> users =
                     com.fishbowl.app.security.FishbowlSecurityManager.getRegisteredUsers(this);
             runOnUiThread(() -> {
@@ -2073,7 +2134,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         LinearLayout inner = new LinearLayout(this);
         inner.setOrientation(LinearLayout.VERTICAL);
-        inner.setPadding(dp(20), dp(10), dp(20), dp(12));
+        inner.setPadding(dp(16), dp(10), dp(16), dp(12));
 
         // Primary Action: OPEN JELLYFIN (White button, black text) or START SERVER
         btnOpenJellyfin = createPixelButton("OPEN JELLYFIN", AppTheme.accent(), AppTheme.onAccent());
@@ -2123,7 +2184,7 @@ public final class FishbowlActivity extends AppCompatActivity
         });
         applyDockButtonStyle(btnRestartServer, "Restart", AppTheme.outline(), Color.WHITE, R.drawable.ic_restart, true);
         LinearLayout.LayoutParams lpRestart = new LinearLayout.LayoutParams(0, dp(44), 1.0f);
-        lpRestart.setMarginEnd(dp(4));
+        lpRestart.setMarginEnd(dp(6));
         subControls.addView(btnRestartServer, lpRestart);
 
         btnStopServer = createPixelButton("Stop", Color.TRANSPARENT, Color.WHITE);
@@ -2139,7 +2200,7 @@ public final class FishbowlActivity extends AppCompatActivity
         });
         applyDockButtonStyle(btnStopServer, "Stop", AppTheme.danger(), Color.WHITE, R.drawable.ic_stop, true);
         LinearLayout.LayoutParams lpStop = new LinearLayout.LayoutParams(0, dp(44), 1.0f);
-        lpStop.setMarginStart(dp(4));
+        lpStop.setMarginStart(dp(6));
         subControls.addView(btnStopServer, lpStop);
 
         inner.addView(subControls);
@@ -2153,14 +2214,14 @@ public final class FishbowlActivity extends AppCompatActivity
             controller.resetCrashLoop(this);
         });
         btnResetCrash.setVisibility(View.GONE);
-        LinearLayout.LayoutParams pCrash = new LinearLayout.LayoutParams(-1, dp(38));
+        LinearLayout.LayoutParams pCrash = new LinearLayout.LayoutParams(-1, dp(42));
         pCrash.topMargin = dp(6);
         inner.addView(btnResetCrash, pCrash);
 
         btnReinstallRuntime = createPixelButton("REINSTALL RUNTIME", AppTheme.inner(), Color.WHITE);
         btnReinstallRuntime.setOnClickListener(v -> showReinstallConfirmation());
         btnReinstallRuntime.setVisibility(View.GONE);
-        LinearLayout.LayoutParams pReinstall = new LinearLayout.LayoutParams(-1, dp(38));
+        LinearLayout.LayoutParams pReinstall = new LinearLayout.LayoutParams(-1, dp(42));
         pReinstall.topMargin = dp(6);
         inner.addView(btnReinstallRuntime, pReinstall);
 
@@ -2288,15 +2349,32 @@ public final class FishbowlActivity extends AppCompatActivity
         transcodeEngineBadge.setTextColor(isHw ? AppTheme.warning() : getAccentColor());
     }
 
+    /** One health probe at a time: renderCurrentState() runs every 500 ms while the server starts. */
+    private volatile boolean healthRefreshInFlight = false;
+
     private void refreshServerHealthUI() {
         if (healthStatusBadge == null && healthUptimeText == null && healthStorageText == null) return;
-        bgExecutor.execute(() -> {
-            JellyfinController.ServerHealth health = controller.getServerHealth();
-            StorageDriveHelper.DriveInfo extDrive = StorageDriveHelper.getPrimaryExternalDrive(this);
-            JellyfinEncodingConfig.EncodingOptions encOpts = JellyfinEncodingConfig.loadEncodingConfig(this);
-            long freeMb = controller != null ? controller.getAvailableInternalStorageMb() : 500;
+        if (healthRefreshInFlight || controller == null) return;
+        healthRefreshInFlight = true;
+        runBg(() -> {
+            final JellyfinController.ServerHealth health;
+            final StorageDriveHelper.DriveInfo extDrive;
+            final JellyfinEncodingConfig.EncodingOptions encOpts;
+            final long freeMb;
+            try {
+                health = controller.getServerHealth();
+                extDrive = StorageDriveHelper.getPrimaryExternalDrive(this);
+                encOpts = JellyfinEncodingConfig.loadEncodingConfig(this);
+                freeMb = controller.getAvailableInternalStorageMb();
+            } catch (Throwable t) {
+                healthRefreshInFlight = false;
+                return;
+            }
+            healthRefreshInFlight = false;
+            if (health == null) return;
 
             runOnUiThread(() -> {
+                if (!isUiAlive()) return;
                 if (healthStatusBadge != null) {
                     if (freeMb < 50) {
                         healthStatusBadge.setText("● STORAGE FULL");
@@ -2376,7 +2454,7 @@ public final class FishbowlActivity extends AppCompatActivity
                         transcodeActiveBadge.setTextColor(getSuccessColor());
                     }
                 }
-                if (transcodeEngineBadge != null) {
+                if (transcodeEngineBadge != null && encOpts != null) {
                     boolean isHw = JellyfinEncodingConfig.HW_ACCEL_MEDIACODEC.equalsIgnoreCase(encOpts.hardwareAccelerationType);
                     transcodeEngineBadge.setText(isHw ? "Android MediaCodec (Hardware SoC)" : "ARM NEON SIMD (Software)");
                     transcodeEngineBadge.setTextColor(isHw ? AppTheme.warning() : getAccentColor());
@@ -2394,31 +2472,32 @@ public final class FishbowlActivity extends AppCompatActivity
         // Left Column: Status Badge
         statusBadge = new TextView(this);
         statusBadge.setText("● SERVER STOPPED");
-        statusBadge.setTextSize(11.5f);
-        statusBadge.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        statusBadge.setLetterSpacing(0.06f);
+        statusBadge.setTextSize(12f);
+        statusBadge.setTypeface(UiKit.BOLD);
+        statusBadge.setLetterSpacing(0.05f);
+        statusBadge.setSingleLine(true);
         statusBadge.setTextColor(AppTheme.textSecondary());
-        statusBadge.setPadding(0, 0, 0, 0);
-        statusBadge.setBackground(null);
-        row.addView(statusBadge, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+        statusBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
+        statusBadge.setBackground(UiKit.shape(this, AppTheme.withAlpha(AppTheme.textSecondary(), 0x22), 0, UiKit.R_PILL));
+        // pill hugs its text; the remaining width goes to a flexible gap before the uptime
+        row.addView(statusBadge, new LinearLayout.LayoutParams(-2, ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1.0f));
 
         // Right Column: Inline Uptime
         LinearLayout uptimeRow = new LinearLayout(this);
         uptimeRow.setOrientation(LinearLayout.HORIZONTAL);
         uptimeRow.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
 
-        TextView lblUptime = new TextView(this);
-        lblUptime.setText("UPTIME  ");
-        lblUptime.setTextSize(10f);
-        lblUptime.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        TextView lblUptime = UiKit.text(this, "UPTIME", 11f, AppTheme.textMuted(), UiKit.BOLD);
         lblUptime.setLetterSpacing(0.08f);
-        lblUptime.setTextColor(AppTheme.textMuted());
-        uptimeRow.addView(lblUptime);
+        LinearLayout.LayoutParams upLp = new LinearLayout.LayoutParams(-2, -2);
+        upLp.setMarginEnd(dp(6));
+        uptimeRow.addView(lblUptime, upLp);
 
         healthUptimeText = new TextView(this);
         healthUptimeText.setText("0s");
-        healthUptimeText.setTextSize(11.5f);
-        healthUptimeText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        healthUptimeText.setTextSize(12.5f);
+        healthUptimeText.setTypeface(UiKit.MEDIUM);
         healthUptimeText.setTextColor(AppTheme.text());
         uptimeRow.addView(healthUptimeText);
 
@@ -2442,8 +2521,11 @@ public final class FishbowlActivity extends AppCompatActivity
         if (clientEndpointsContainer == null) return;
         clientEndpointsContainer.removeAllViews();
 
+        // Interface enumeration happens off the UI thread in refreshLanAddress(); use its cached results.
+        final String defaultIp = cachedDefaultIp != null ? cachedDefaultIp : "192.0.0.2";
+        lastRenderedNetworkSignature = networkSignature(rawLan, rawTailscale);
+
         // 1. DEFAULT Endpoint (192.0.0.2:8096) - Fixed / Carrier Default
-        final String defaultIp = NetworkUtils.getDefaultIp();
         defaultIpValueText = new TextView(this);
         defaultIpValueText.setText(defaultIp + ":8096");
         ImageView copyDefault = new ImageView(this);
@@ -2457,7 +2539,7 @@ public final class FishbowlActivity extends AppCompatActivity
         clientEndpointsContainer.addView(createHairlineDivider());
 
         // 2. Active Mobile / Wi-Fi / LAN Endpoint (Current dynamic connection)
-        NetworkUtils.LanEndpoint activeLan = NetworkUtils.getActiveLanEndpoint();
+        NetworkUtils.LanEndpoint activeLan = cachedActiveLan;
         lanIpValueText = new TextView(this);
         ImageView copyLan = new ImageView(this);
         btnCopyLanIp = copyLan;
@@ -2479,10 +2561,8 @@ public final class FishbowlActivity extends AppCompatActivity
         }
         lanIpValueText.setText(lanVal);
         rowLanView = buildEndpointRow("lan", lanLabel, lanIpValueText, copyLan, () -> {
-            String val = lanIpValueText.getText().toString();
-            if (val != null && !val.contains("not connected")) {
-                copyUrlToClipboard(lanLabel + " Endpoint", val.startsWith("http") ? val : "http://" + val);
-            }
+            // Decide from state, not from the displayed (possibly translated) text.
+            if (lanOperable) copyUrlToClipboard(lanLabel + " Endpoint", "http://" + lanVal);
         });
         View dotLan = rowLanView.findViewWithTag("dot_lan");
         setEndpointCopyState(copyLan, rowLanView, dotLan, lanOperable);
@@ -2510,18 +2590,12 @@ public final class FishbowlActivity extends AppCompatActivity
         ImageView copyAccount = new ImageView(this);
         btnCopyLinkedAccount = copyAccount;
         rowAccountView = buildEndpointRow("account", "ACCOUNT", homeLinkedAccountValueText, copyAccount, () -> {
-            if (cachedCleanAccountUsername != null && !cachedCleanAccountUsername.isEmpty()) {
-                copyUrlToClipboard("Linked Account", cachedCleanAccountUsername);
-            } else {
-                String val = homeLinkedAccountValueText.getText().toString();
-                if (val != null && !val.contains("No account") && !val.contains("Checking")) {
-                    String clean = val.replace(" (Admin)", "").trim();
-                    copyUrlToClipboard("Linked Account", clean);
-                }
-            }
+            // Only the loaded user list is copied; the label may be "Checking..." or translated.
+            String names = cachedCleanAccountUsername;
+            if (names != null && !names.isEmpty()) copyUrlToClipboard("Linked Account", names);
         });
         View dotAccount = rowAccountView.findViewWithTag("dot_account");
-        setEndpointCopyState(copyAccount, rowAccountView, dotAccount, true);
+        setEndpointCopyState(copyAccount, rowAccountView, dotAccount, false);
         clientEndpointsContainer.addView(rowAccountView);
 
         updateHomeLinkedAccountStatus();
@@ -2531,12 +2605,10 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(6), dp(10), dp(6), dp(10));
+        row.setPadding(dp(8), dp(12), dp(8), dp(12));
         row.setClickable(true);
         row.setFocusable(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            row.setBackground(createRowRippleDrawable());
-        }
+        row.setBackground(UiKit.rowRipple(this));
 
         View dot = new View(this);
         dot.setTag("dot_" + tag);
@@ -2547,18 +2619,22 @@ public final class FishbowlActivity extends AppCompatActivity
 
         TextView lbl = new TextView(this);
         lbl.setText(typeLabel);
-        lbl.setTextSize(11);
-        lbl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        lbl.setTextSize(11.5f);
+        lbl.setTypeface(UiKit.BOLD);
         lbl.setLetterSpacing(0.06f);
+        lbl.setAllCaps(true);
+        lbl.setSingleLine(true);
         lbl.setTextColor(AppTheme.textSecondary());
         LinearLayout.LayoutParams lblParams = new LinearLayout.LayoutParams(dp(84), ViewGroup.LayoutParams.WRAP_CONTENT);
         row.addView(lbl, lblParams);
 
-        valueView.setTextSize(12.5f);
-        valueView.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        valueView.setTextSize(13f);
+        // addresses are monospace; the account row shows names, so it uses the UI font
+        valueView.setTypeface("account".equals(tag) ? UiKit.MEDIUM : Typeface.MONOSPACE);
         valueView.setTextColor(AppTheme.text());
         valueView.setSingleLine(true);
         valueView.setEllipsize(TextUtils.TruncateAt.END);
+        valueView.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
         LinearLayout.LayoutParams valParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
         valParams.setMarginEnd(dp(8));
         row.addView(valueView, valParams);
@@ -2567,8 +2643,10 @@ public final class FishbowlActivity extends AppCompatActivity
         copyBtn.setColorFilter(AppTheme.textMuted());
         copyBtn.setEnabled(false);
         copyBtn.setAlpha(0.45f);
-        LinearLayout.LayoutParams cpParams = new LinearLayout.LayoutParams(dp(24), dp(24));
-        copyBtn.setPadding(dp(4), dp(4), dp(4), dp(4));
+        LinearLayout.LayoutParams cpParams = new LinearLayout.LayoutParams(dp(32), dp(32));
+        copyBtn.setPadding(dp(7), dp(7), dp(7), dp(7));
+        copyBtn.setBackground(UiKit.rowRipple(this));
+        copyBtn.setContentDescription("Copy");
         row.addView(copyBtn, cpParams);
 
         row.setOnClickListener(v -> {
@@ -2719,22 +2797,15 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout headerRow = new LinearLayout(this);
         headerRow.setOrientation(LinearLayout.HORIZONTAL);
         headerRow.setGravity(Gravity.CENTER_VERTICAL);
-        headerRow.setPadding(dp(4), 0, dp(4), dp(10));
+        headerRow.setPadding(0, 0, 0, dp(12));
 
         TextView title = new TextView(this);
         title.setText("SERVICES");
-        title.setTextSize(11);
-        title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        title.setLetterSpacing(0.08f);
-        title.setTextColor(AppTheme.textMuted());
-        headerRow.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
         styleSectionLabel(title);
+        headerRow.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        homeServicesCountBadge = new TextView(this);
-        homeServicesCountBadge.setText("7 / 7 Active");
-        homeServicesCountBadge.setTextSize(10);
-        homeServicesCountBadge.setTypeface(Typeface.MONOSPACE);
-        homeServicesCountBadge.setTextColor(AppTheme.textMuted());
+        homeServicesCountBadge = UiKit.caption(this, "7 / 7 Active");
+        homeServicesCountBadge.setTypeface(UiKit.MEDIUM);
         headerRow.addView(homeServicesCountBadge);
 
         section.addView(headerRow);
@@ -2776,20 +2847,15 @@ public final class FishbowlActivity extends AppCompatActivity
         serviceTileMap.clear();
 
         List<HomeServiceTileSpec> tiles = new ArrayList<>();
-        // 1. Core Jellyfin Service Tile (always present)
-        tiles.add(new HomeServiceTileSpec("jellyfin", "Jellyfin", R.drawable.logo_jellyfin, AppTheme.text()));
-
-        // 2. Installed Companion Service Tiles (ordered consistently)
-        if (!isMovieStreamerModeEnabled() && isMediaStackEnabled()) {
-            MediaServiceManager mgr = MediaServiceManager.getInstance(this);
-            String[] preferredOrder = new String[] {
-                    "radarr", "sonarr", "prowlarr", "transmission"
-            };
-            for (String sid : preferredOrder) {
+        // 1. Core Jellyfin tile (always present), then 2. installed companions in a fixed order
+        MediaServiceManager mgr = MediaServiceManager.getInstance(this);
+        for (String sid : homeTileIds()) {
+            if ("jellyfin".equals(sid)) {
+                tiles.add(new HomeServiceTileSpec("jellyfin", "Jellyfin", R.drawable.logo_jellyfin, AppTheme.text()));
+            } else {
                 ManagedService s = mgr.getService(sid);
-                if (s != null && s.isInstalled()) {
-                    tiles.add(new HomeServiceTileSpec(s.getId(), s.getDisplayName(), getServiceIconRes(s.getId()), AppTheme.text()));
-                }
+                String nm = s != null ? s.getDisplayName() : sid;
+                tiles.add(new HomeServiceTileSpec(sid, nm, getServiceIconRes(sid), AppTheme.text()));
             }
         }
 
@@ -2831,12 +2897,14 @@ public final class FishbowlActivity extends AppCompatActivity
         slot.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         FrameLayout tile = new FrameLayout(this);
-        FrameLayout.LayoutParams tileParams = new FrameLayout.LayoutParams(dp(40), dp(40));
+        FrameLayout.LayoutParams tileParams = new FrameLayout.LayoutParams(dp(44), dp(44));
         tileParams.gravity = Gravity.CENTER;
         tile.setLayoutParams(tileParams);
-        // Clean unboxed presentation: no background container box on service logos
+        // Clean unboxed presentation: no background container box on service logos (state ring is the background)
         tile.setClickable(true);
         tile.setFocusable(true);
+        tile.setContentDescription(name);
+        if (Build.VERSION.SDK_INT >= 23) tile.setForeground(UiKit.rowRipple(this));
 
         ImageView icon = new ImageView(this);
         icon.setImageResource(iconRes);
@@ -2863,32 +2931,43 @@ public final class FishbowlActivity extends AppCompatActivity
         parent.addView(slot);
     }
 
+    /** Ids of the Home tiles, in display order: always Jellyfin, then the installed core companions. */
+    private List<String> homeTileIds() {
+        List<String> ids = new ArrayList<>();
+        ids.add("jellyfin");
+        if (!isMovieStreamerModeEnabled() && isMediaStackEnabled()) {
+            MediaServiceManager mgr = MediaServiceManager.getInstance(this);
+            for (String sid : new String[]{"radarr", "sonarr", "prowlarr", "transmission"}) {
+                ManagedService s = mgr.getService(sid);
+                if (s != null && s.isInstalled()) ids.add(s.getId());
+            }
+        }
+        return ids;
+    }
+
     private void refreshHomeServicesBadge() {
         MediaServiceManager mgr = MediaServiceManager.getInstance(this);
         List<ManagedService> services = mgr.getAllServices();
+        // Count exactly what the Home row shows (other installed services have no tile).
+        final List<String> tileIds = homeTileIds();
         int running = 0;
-        int installed = 1; // Jellyfin core is always counted as installed
-        for (ManagedService s : services) {
-            if ("jellyfin".equalsIgnoreCase(s.getId())) {
-                if (controller != null && controller.getState() == JellyfinController.State.RUNNING) {
-                    running++;
-                }
+        for (String id : tileIds) {
+            if ("jellyfin".equals(id)) {
+                if (controller != null && controller.getState() == JellyfinController.State.RUNNING) running++;
             } else {
-                if (s.isInstalled()) {
-                    installed++;
-                }
-                if (s.isRunning()) {
-                    running++;
-                }
+                ManagedService s = mgr.getService(id);
+                if (s != null && s.isRunning()) running++;
             }
         }
 
         final int fRunning = running;
-        final int fInstalled = installed;
+        final int fInstalled = tileIds.size();
         final List<ManagedService> fServices = services;
 
         runOnUiThread(() -> {
-            if (homeServicesRow != null && serviceTileMap.size() != fInstalled) {
+            // Rebuild only when the set of tiles changed (the old size check never matched with extra services
+            // installed or in streamer mode, so the row was rebuilt on every state change).
+            if (homeServicesRow != null && !new HashSet<>(tileIds).equals(serviceTileMap.keySet())) {
                 rebuildHomeServiceTiles();
             }
 
@@ -3151,113 +3230,66 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setBackgroundColor(getBgColor());
-        layout.setPadding(dp(16), dp(10), dp(16), dp(8));
+        layout.setPadding(dp(16), dp(12), dp(16), dp(8));
         layout.setClipToPadding(false);
 
-        // Header Title Row: "SYSTEM CONSOLE" + subtitle
-        LinearLayout headerRow = new LinearLayout(this);
-        headerRow.setOrientation(LinearLayout.VERTICAL);
-        headerRow.setPadding(0, 0, 0, dp(10));
+        // Header: title + one-line subtitle (UiKit page header)
+        layout.addView(UiKit.header(this, "System Console", "Live logs from every service", null));
 
-        TextView title = new TextView(this);
-        title.setText("SYSTEM CONSOLE");
-        title.setTextSize(13);
-        title.setLetterSpacing(0.12f);
-        title.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        title.setTextColor(AppTheme.text());
-        headerRow.addView(title);
-
-        TextView subtitle = new TextView(this);
-        subtitle.setText("Live multi-daemon streams and error telemetry");
-        subtitle.setTextSize(10.5f);
-        subtitle.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
-        subtitle.setTextColor(AppTheme.textMuted());
-        subtitle.setPadding(0, dp(2), 0, 0);
-        headerRow.addView(subtitle);
-
-        layout.addView(headerRow);
-
-        // Service Selector Chips (Horizontally Scrollable)
-        HorizontalScrollView hScrollServices = new HorizontalScrollView(this);
-        hScrollServices.setHorizontalScrollBarEnabled(false);
-        hScrollServices.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        LinearLayout.LayoutParams hParams = new LinearLayout.LayoutParams(-1, -2);
-        hParams.bottomMargin = dp(8);
-        hScrollServices.setLayoutParams(hParams);
-
+        // Service selector chips (horizontally scrollable; tagged so the drawer swipe leaves it alone)
         logServiceChipsContainer = new LinearLayout(this);
         logServiceChipsContainer.setOrientation(LinearLayout.HORIZONTAL);
-
         refreshLogServiceChips();
-        hScrollServices.addView(logServiceChipsContainer);
-        layout.addView(hScrollServices);
+        HorizontalScrollView hScrollServices = UiKit.chipScroller(this, logServiceChipsContainer);
+        LinearLayout.LayoutParams hParams = new LinearLayout.LayoutParams(-1, -2);
+        hParams.bottomMargin = dp(8);
+        layout.addView(hScrollServices, hParams);
 
-        // Controls Toolbar: Level Filters (Left) + Action Buttons (Right)
+        // Controls toolbar: level filters (start) + actions (end)
         LinearLayout controlsRow = new LinearLayout(this);
         controlsRow.setOrientation(LinearLayout.HORIZONTAL);
         controlsRow.setGravity(Gravity.CENTER_VERTICAL);
-        controlsRow.setPadding(0, 0, 0, dp(8));
+        controlsRow.setPadding(0, 0, 0, dp(10));
 
         logLevelChipsContainer = new LinearLayout(this);
         logLevelChipsContainer.setOrientation(LinearLayout.HORIZONTAL);
-        String[] levels = {"ALL", "ERR", "WRN", "INF"};
-        for (String lvl : levels) {
-            Button lvlChip = new Button(this);
-            lvlChip.setText(lvl);
-            lvlChip.setTextSize(9.5f);
-            lvlChip.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            lvlChip.setAllCaps(true);
-            lvlChip.setMinHeight(0);
-            lvlChip.setMinimumHeight(0);
-            lvlChip.setMinWidth(0);
-            lvlChip.setMinimumWidth(0);
-            lvlChip.setPadding(dp(7), dp(4), dp(7), dp(4));
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                lvlChip.setStateListAnimator(null);
-            }
+        String[] levels = {"ALL", "ERROR", "WARNING", "INFO"};
+        String[] levelLabels = {"All", "Errors", "Warnings", "Info"};
+        for (int li = 0; li < levels.length; li++) {
+            final String lvl = levels[li];
+            TextView lvlChip = UiKit.chip(this, levelLabels[li], lvl.equals(selectedLogLevel));
+            lvlChip.setTag(lvl);   // logic reads the tag, never the (translated) label
+            lvlChip.setPadding(dp(12), dp(6), dp(12), dp(6));
             lvlChip.setOnClickListener(v -> {
-                if ("ERR".equals(lvl)) selectedLogLevel = "ERROR";
-                else if ("WRN".equals(lvl)) selectedLogLevel = "WARNING";
-                else if ("INF".equals(lvl)) selectedLogLevel = "INFO";
-                else selectedLogLevel = "ALL";
+                selectedLogLevel = lvl;
                 updateLogLevelChips();
                 refreshUnifiedLogsDisplay();
             });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(26));
-            lp.setMarginEnd(dp(4));
-            logLevelChipsContainer.addView(lvlChip, lp);
+            logLevelChipsContainer.addView(lvlChip, UiKit.chipLp(this));
         }
-        controlsRow.addView(logLevelChipsContainer);
+        HorizontalScrollView levelScroll = UiKit.chipScroller(this, logLevelChipsContainer);
+        controlsRow.addView(levelScroll, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        // Spacer between filters and actions
-        View spacer = new View(this);
-        controlsRow.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
-
-        // Auto-Scroll Toggle Button
-        btnToggleAutoScroll = createPixelButton(autoScrollEnabled ? "AUTO: ON" : "AUTO: OFF",
-                autoScrollEnabled ? AppTheme.withAlpha(AppTheme.success(), 35) : getSurfaceElevatedColor(),
-                autoScrollEnabled ? getSuccessColor() : getSecondaryTextColor());
-        btnToggleAutoScroll.setTextSize(9);
-        btnToggleAutoScroll.setPadding(dp(6), dp(2), dp(6), dp(2));
+        // Auto-scroll toggle
+        btnToggleAutoScroll = UiKit.button(this, I18n.tr("Auto-scroll"), AppTheme.card(), AppTheme.textSecondary(), AppTheme.outline(), null);
+        btnToggleAutoScroll.setTextSize(12f);
+        btnToggleAutoScroll.setPadding(dp(10), 0, dp(10), 0);
+        styleAutoScrollButton();
         btnToggleAutoScroll.setOnClickListener(v -> {
             autoScrollEnabled = !autoScrollEnabled;
-            btnToggleAutoScroll.setText(autoScrollEnabled ? "AUTO: ON" : "AUTO: OFF");
-            btnToggleAutoScroll.setTextColor(autoScrollEnabled ? getSuccessColor() : getSecondaryTextColor());
-            btnToggleAutoScroll.setBackground(createBorderedRoundedDrawable(
-                    autoScrollEnabled ? AppTheme.withAlpha(AppTheme.success(), 35) : getSurfaceElevatedColor(),
-                    autoScrollEnabled ? getSuccessColor() : getBorderColor(), dp(1), dp(8)));
+            styleAutoScrollButton();
             if (autoScrollEnabled && logsScrollView != null) {
                 logsScrollView.post(() -> logsScrollView.fullScroll(View.FOCUS_DOWN));
             }
         });
-        LinearLayout.LayoutParams pAuto = new LinearLayout.LayoutParams(-2, dp(26));
-        pAuto.setMarginEnd(dp(4));
+        LinearLayout.LayoutParams pAuto = new LinearLayout.LayoutParams(-2, dp(34));
+        pAuto.setMarginStart(dp(8));
         controlsRow.addView(btnToggleAutoScroll, pAuto);
 
         // Copy Button
-        Button btnCopy = createPixelButton("COPY", getSurfaceElevatedColor(), getPrimaryTextColor());
-        btnCopy.setTextSize(9);
-        btnCopy.setPadding(dp(6), dp(2), dp(6), dp(2));
+        Button btnCopy = UiKit.outline(this, buttonLabel("COPY"), null);
+        btnCopy.setTextSize(12f);
+        btnCopy.setPadding(dp(10), 0, dp(10), 0);
         btnCopy.setOnClickListener(v -> {
             String content = (logsOutputText != null) ? logsOutputText.getText().toString() : "";
             if (!content.isEmpty()) {
@@ -3268,14 +3300,14 @@ public final class FishbowlActivity extends AppCompatActivity
                 }
             }
         });
-        LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(-2, dp(26));
-        pCopy.setMarginEnd(dp(4));
+        LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(-2, dp(34));
+        pCopy.setMarginStart(dp(6));
         controlsRow.addView(btnCopy, pCopy);
 
         // Clear Button
-        Button btnClear = createPixelButton("CLEAR", getSurfaceElevatedColor(), AppTheme.danger());
-        btnClear.setTextSize(9);
-        btnClear.setPadding(dp(6), dp(2), dp(6), dp(2));
+        Button btnClear = UiKit.danger(this, buttonLabel("CLEAR"), null);
+        btnClear.setTextSize(12f);
+        btnClear.setPadding(dp(10), 0, dp(10), 0);
         btnClear.setOnClickListener(v -> {
             if ("ALL".equalsIgnoreCase(selectedLogService)) {
                 if (controller != null) controller.clearDisplayedLogs();
@@ -3294,7 +3326,9 @@ public final class FishbowlActivity extends AppCompatActivity
             refreshUnifiedLogsDisplay();
             Toast.makeText(this, I18n.tr("Cleared " + selectedLogService + " logs"), Toast.LENGTH_SHORT).show();
         });
-        controlsRow.addView(btnClear, new LinearLayout.LayoutParams(-2, dp(26)));
+        LinearLayout.LayoutParams pClear = new LinearLayout.LayoutParams(-2, dp(34));
+        pClear.setMarginStart(dp(6));
+        controlsRow.addView(btnClear, pClear);
 
         layout.addView(controlsRow);
 
@@ -3304,12 +3338,7 @@ public final class FishbowlActivity extends AppCompatActivity
         logsScrollView.setHorizontalScrollBarEnabled(false);
         logsScrollView.setOverScrollMode(View.OVER_SCROLL_NEVER);
         logsScrollView.setFillViewport(true);
-        logsScrollView.setBackground(createBorderedRoundedDrawable(
-                AppTheme.card(),
-                AppTheme.outline(),
-                dp(1),
-                dp(10)
-        ));
+        logsScrollView.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_INNER));
 
         logsOutputText = new TextView(this);
         logsOutputText.setTextColor(AppTheme.text());
@@ -3318,15 +3347,16 @@ public final class FishbowlActivity extends AppCompatActivity
         logsOutputText.setLineSpacing(dp(2), 1.15f);
         logsOutputText.setPadding(dp(12), dp(10), dp(12), dp(10));
         logsOutputText.setTextIsSelectable(true);
+        // Log lines are English / machine text: keep them left-to-right even in the Arabic UI.
+        logsOutputText.setTextDirection(View.TEXT_DIRECTION_LTR);
+        logsOutputText.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        logsOutputText.setGravity(Gravity.START);
 
         logsScrollView.addView(logsOutputText);
         layout.addView(logsScrollView, new LinearLayout.LayoutParams(-1, 0, 1.0f));
 
         // Subtitle status line at bottom of terminal
-        logsStatusSubtitle = new TextView(this);
-        logsStatusSubtitle.setTextSize(9.5f);
-        logsStatusSubtitle.setTypeface(Typeface.MONOSPACE);
-        logsStatusSubtitle.setTextColor(AppTheme.textMuted());
+        logsStatusSubtitle = UiKit.caption(this, "");
         logsStatusSubtitle.setPadding(dp(4), dp(6), dp(4), 0);
         layout.addView(logsStatusSubtitle);
 
@@ -3456,7 +3486,7 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void refreshDownloadCenter() {
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             List<MediaStorageManager.TorrentInfo> torrents = MediaStorageManager.getInstance(this).queryTransmissionTorrents();
             runOnUiThread(() -> {
                 if (downloadItemsContainer == null) return;
@@ -3958,7 +3988,6 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void refreshLogServiceChips() {
         if (logServiceChipsContainer == null) return;
-        logServiceChipsContainer.removeAllViews();
 
         List<String> installedServices = new ArrayList<>();
         installedServices.add("ALL");
@@ -3986,90 +4015,69 @@ public final class FishbowlActivity extends AppCompatActivity
             selectedLogService = "ALL";
         }
 
+        // Same set of chips as shown already: only restyle (keeps the row's scroll position, no flicker).
+        List<String> shown = new ArrayList<>();
+        for (int i = 0; i < logServiceChipsContainer.getChildCount(); i++) {
+            Object tag = logServiceChipsContainer.getChildAt(i).getTag();
+            if (tag instanceof String) shown.add((String) tag);
+        }
+        if (shown.equals(installedServices)) {
+            updateLogServiceChips();
+            return;
+        }
+        logServiceChipsContainer.removeAllViews();
+
         for (String svcName : installedServices) {
-            Button chip = new Button(this);
-            chip.setText(svcName);
-            chip.setTextSize(10);
-            chip.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            chip.setAllCaps(true);
-            chip.setMinHeight(0);
-            chip.setMinimumHeight(0);
-            chip.setMinWidth(0);
-            chip.setMinimumWidth(0);
-            chip.setPadding(dp(10), dp(5), dp(10), dp(5));
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                chip.setStateListAnimator(null);
-            }
+            String label = "ALL".equals(svcName) ? "All"
+                    : "JELLYFIN".equals(svcName) ? "Jellyfin" : displayNameForService(svcName.toLowerCase(Locale.ROOT));
+            TextView chip = UiKit.chip(this, label, svcName.equalsIgnoreCase(selectedLogService));
+            chip.setTag(svcName);   // selection logic reads the tag, never the (translated) label
+            chip.setPadding(dp(12), dp(6), dp(12), dp(6));
             chip.setOnClickListener(v -> {
                 selectedLogService = svcName;
                 updateLogServiceChips();
                 refreshUnifiedLogsDisplay();
             });
-
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(28));
-            lp.setMarginEnd(dp(6));
-            logServiceChipsContainer.addView(chip, lp);
+            logServiceChipsContainer.addView(chip, UiKit.chipLp(this));
         }
         updateLogServiceChips();
     }
 
+    private String displayNameForService(String id) {
+        try {
+            ManagedService ms = MediaServiceManager.getInstance(this).getService(id);
+            if (ms != null && ms.getDisplayName() != null) return ms.getDisplayName();
+        } catch (Throwable ignored) {}
+        return id.isEmpty() ? id : id.substring(0, 1).toUpperCase(Locale.ROOT) + id.substring(1);
+    }
+
+    /** Selected chip uses the accent container; running services get a small green dot before the name. */
     private void updateLogServiceChips() {
         if (logServiceChipsContainer == null) return;
         for (int i = 0; i < logServiceChipsContainer.getChildCount(); i++) {
             View child = logServiceChipsContainer.getChildAt(i);
-            if (!(child instanceof Button)) continue;
-            Button chip = (Button) child;
-            String text = chip.getText().toString();
-            boolean isSel = text.equalsIgnoreCase(selectedLogService);
+            if (!(child instanceof TextView) || !(child.getTag() instanceof String)) continue;
+            TextView chip = (TextView) child;
+            String key = (String) child.getTag();
+            boolean isSel = key.equalsIgnoreCase(selectedLogService);
 
             boolean isSvcRunning;
-            if ("ALL".equalsIgnoreCase(text)) {
-                isSvcRunning = true;
-            } else if ("JELLYFIN".equalsIgnoreCase(text)) {
+            if ("ALL".equalsIgnoreCase(key)) {
+                isSvcRunning = false;
+            } else if ("JELLYFIN".equalsIgnoreCase(key)) {
                 isSvcRunning = (controller != null && controller.getState() == JellyfinController.State.RUNNING);
             } else {
-                ManagedService ms = MediaServiceManager.getInstance(this).getService(text.toLowerCase(Locale.ROOT));
+                ManagedService ms = MediaServiceManager.getInstance(this).getService(key.toLowerCase(Locale.ROOT));
                 isSvcRunning = (ms != null && ms.isRunning());
             }
-
-            int brandColor = "ALL".equalsIgnoreCase(text) ? AppTheme.accent() : getServiceBrandColor(text.toLowerCase(Locale.ROOT));
-
-            if (isSel) {
-                if (isSvcRunning && !"ALL".equalsIgnoreCase(text)) {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            brandColor,
-                            brandColor,
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(AppTheme.contrastOn(brandColor));
-                } else {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            AppTheme.accent(),
-                            AppTheme.accent(),
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(AppTheme.onAccent());
-                }
+            UiKit.styleChip(this, chip, isSel);
+            if (isSvcRunning) {
+                GradientDrawable dot = createCircleDrawable(AppTheme.success());
+                dot.setSize(dp(6), dp(6));
+                chip.setCompoundDrawablesRelativeWithIntrinsicBounds(dot, null, null, null);
+                chip.setCompoundDrawablePadding(dp(6));
             } else {
-                if (isSvcRunning && !"ALL".equalsIgnoreCase(text)) {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            AppTheme.bg(),
-                            brandColor,
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(brandColor);
-                } else {
-                    chip.setBackground(createBorderedRoundedDrawable(
-                            AppTheme.bg(),
-                            AppTheme.outline(),
-                            dp(1),
-                            dp(8)
-                    ));
-                    chip.setTextColor(AppTheme.textMuted());
-                }
+                chip.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, null, null);
             }
         }
     }
@@ -4078,36 +4086,18 @@ public final class FishbowlActivity extends AppCompatActivity
         if (logLevelChipsContainer == null) return;
         for (int i = 0; i < logLevelChipsContainer.getChildCount(); i++) {
             View child = logLevelChipsContainer.getChildAt(i);
-            if (!(child instanceof Button)) continue;
-            Button chip = (Button) child;
-            String text = chip.getText().toString();
-            boolean isSel = ("ALL".equals(text) && "ALL".equals(selectedLogLevel))
-                    || ("ERR".equals(text) && "ERROR".equals(selectedLogLevel))
-                    || ("WRN".equals(text) && "WARNING".equals(selectedLogLevel))
-                    || ("INF".equals(text) && "INFO".equals(selectedLogLevel));
-
-            int chipColor = "ERR".equals(text) ? getDangerColor()
-                    : ("WRN".equals(text) ? getWarningColor()
-                    : ("INF".equals(text) ? AppTheme.success() : AppTheme.text()));
-
-            if (isSel) {
-                chip.setBackground(createBorderedRoundedDrawable(
-                        Color.argb(35, Color.red(chipColor), Color.green(chipColor), Color.blue(chipColor)),
-                        chipColor,
-                        dp(1),
-                        dp(6)
-                ));
-                chip.setTextColor(chipColor);
-            } else {
-                chip.setBackground(createBorderedRoundedDrawable(
-                        AppTheme.bg(),
-                        AppTheme.outline(),
-                        dp(1),
-                        dp(6)
-                ));
-                chip.setTextColor(AppTheme.textMuted());
-            }
+            if (!(child instanceof TextView) || !(child.getTag() instanceof String)) continue;
+            UiKit.styleChip(this, (TextView) child, child.getTag().equals(selectedLogLevel));
         }
+    }
+
+    private void styleAutoScrollButton() {
+        if (btnToggleAutoScroll == null) return;
+        btnToggleAutoScroll.setText(I18n.tr(autoScrollEnabled ? "Auto-scroll on" : "Auto-scroll off"));
+        btnToggleAutoScroll.setTextColor(autoScrollEnabled ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
+        btnToggleAutoScroll.setBackground(UiKit.pressable(this,
+                autoScrollEnabled ? AppTheme.accentContainer() : AppTheme.card(),
+                autoScrollEnabled ? 0 : AppTheme.outline(), UiKit.R_INNER));
     }
 
     private int getServiceColor(String serviceTag) {
@@ -4191,7 +4181,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private void refreshUnifiedLogsDisplay() {
         if (logsOutputText == null) return;
         final int gen = unifiedLogsGen.incrementAndGet();
-        bgExecutor.execute(() -> {
+        runBg(() -> {
             final UnifiedLogsResult out;
             try {
                 out = computeUnifiedLogs();
@@ -4327,9 +4317,20 @@ public final class FishbowlActivity extends AppCompatActivity
     public void setMediaStackEnabled(boolean enabled) {
         getFishbowlPrefs().edit().putBoolean("media_stack_enabled", enabled).apply();
         if (!enabled) {
-            try {
-                MediaServiceManager.getInstance(this).uninstallAllCompanionServices();
-            } catch (Throwable ignored) {}
+            // Stopping services and deleting their folders (hundreds of MB) must not block the UI thread.
+            final Context app = getApplicationContext();
+            runBg(() -> {
+                try {
+                    MediaServiceManager.getInstance(app).uninstallAllCompanionServices();
+                } catch (Throwable ignored) {}
+                runOnUiThread(() -> {
+                    if (!isUiAlive()) return;
+                    lastServicesSignature = null;
+                    rebuildHomeServiceTiles();
+                    refreshHomeServicesBadge();
+                    refreshServicesTabUI();
+                });
+            });
             if (activeTab == 1) {
                 activeTab = 0;
             }
@@ -4437,10 +4438,7 @@ public final class FishbowlActivity extends AppCompatActivity
         placeholderTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         placeholderTitle.setPadding(0, dp(14), 0, dp(4));
         col.addView(placeholderTitle);
-        TextView soon = new TextView(this);
-        soon.setText("Coming soon");
-        soon.setTextSize(12f);
-        soon.setTextColor(AppTheme.textMuted());
+        TextView soon = UiKit.caption(this, "Coming soon");
         col.addView(soon);
         wrap.addView(col, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
         return wrap;
@@ -4533,51 +4531,101 @@ public final class FishbowlActivity extends AppCompatActivity
         for (int i = 0; i < sideDrawerItems.getChildCount(); i++) {
             View c = sideDrawerItems.getChildAt(i);
             boolean sel = c.getTag() instanceof Integer && (Integer) c.getTag() == activeTab;
-            c.setBackground(createRoundedDrawable(sel ? AppTheme.accentContainer() : Color.TRANSPARENT, dp(16)));
+            c.setBackground(UiKit.pressable(this, sel ? AppTheme.accentContainer() : Color.TRANSPARENT, 0, UiKit.R_CARD));
             ImageView ic = c.findViewWithTag("icon");
             if (ic != null) ic.setColorFilter(sel ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
         }
     }
 
     private float edgeDownX, edgeDownY;
+    private long edgeDownTime;
     private boolean edgeTracking = false;
+    private boolean swallowDrawerGesture = false;
+    private final int[] swipeHitLoc = new int[2];
 
-    /** Swipe anywhere: a horizontal drag toward the inside (rightwards in LTR, leftwards in RTL) opens the drawer; the opposite drag closes it. */
+    /**
+     * True when the finger landed on something that scrolls or drags sideways (chip rows, sliders,
+     * seek bars, pagers, horizontal lists, wide tables...). Walks the visible view tree under the
+     * raw touch point, so tab views do not need to cooperate beyond tagging custom scrollers "h-scroll".
+     */
+    private boolean touchStartsOnHorizontalScroller(float rawX, float rawY) {
+        Window w = getWindow();
+        View root = w != null ? w.getDecorView() : null;
+        return root != null && blocksDrawerSwipe(root, Math.round(rawX), Math.round(rawY), 0);
+    }
+
+    private boolean blocksDrawerSwipe(View v, int x, int y, int depth) {
+        if (v == null || depth > 80 || v.getVisibility() != View.VISIBLE || v.getWidth() <= 0 || v.getHeight() <= 0) return false;
+        if (v == sideDrawerPanel || v == sideDrawerScrim) return false;
+        v.getLocationOnScreen(swipeHitLoc);
+        if (x < swipeHitLoc[0] || y < swipeHitLoc[1]
+                || x >= swipeHitLoc[0] + v.getWidth() || y >= swipeHitLoc[1] + v.getHeight()) return false;
+        if (v instanceof HorizontalScrollView || v instanceof android.widget.AbsSeekBar
+                || "h-scroll".equals(v.getTag())
+                || v.canScrollHorizontally(1) || v.canScrollHorizontally(-1)) return true;
+        String cls = v.getClass().getName();
+        if (cls.contains("ViewPager") || cls.endsWith("Slider")) return true;
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = g.getChildCount() - 1; i >= 0; i--) {
+                if (blocksDrawerSwipe(g.getChildAt(i), x, y, depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Swipe anywhere: a clearly horizontal fling toward the inside (rightwards in LTR, leftwards in RTL)
+     * opens the drawer; the opposite fling closes it. Gestures that start on a horizontal scroller,
+     * during setup, or with more than one finger are left to the views.
+     */
     @Override
     public boolean dispatchTouchEvent(android.view.MotionEvent ev) {
+        int action = ev.getActionMasked();
+        if (swallowDrawerGesture) {
+            // The rest of a gesture that opened / closed the drawer belongs to nobody else.
+            if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
+                swallowDrawerGesture = false;
+            }
+            if (action != android.view.MotionEvent.ACTION_DOWN) return true;
+            swallowDrawerGesture = false;
+        }
         try {
             if (sideDrawerPanel != null) {
-                int w = getResources().getDisplayMetrics().widthPixels;
                 int slop = android.view.ViewConfiguration.get(this).getScaledTouchSlop();
                 boolean rtl = isRtlLayout();
-                switch (ev.getActionMasked()) {
+                switch (action) {
                     case android.view.MotionEvent.ACTION_DOWN: {
-                        float x = ev.getRawX();
-                        edgeTracking = true;
-                        edgeDownX = x;
+                        boolean setupShowing = setupOverlayView != null && setupOverlayView.getVisibility() == View.VISIBLE;
+                        edgeDownX = ev.getRawX();
                         edgeDownY = ev.getRawY();
+                        edgeDownTime = ev.getEventTime();
+                        edgeTracking = !setupShowing
+                                && (sideDrawerOpen || !touchStartsOnHorizontalScroller(edgeDownX, edgeDownY));
                         break;
                     }
+                    case android.view.MotionEvent.ACTION_POINTER_DOWN:
+                        edgeTracking = false;
+                        break;
                     case android.view.MotionEvent.ACTION_MOVE: {
                         if (!edgeTracking) break;
                         float dx = ev.getRawX() - edgeDownX;
                         float dy = ev.getRawY() - edgeDownY;
-                        if (Math.abs(dx) > slop * 4 && Math.abs(dx) > Math.abs(dy) * 2.5f) {
+                        if (Math.abs(dy) > slop * 2 && Math.abs(dy) > Math.abs(dx)) {
+                            edgeTracking = false;   // vertical scroll: never steal it later
+                            break;
+                        }
+                        boolean quick = ev.getEventTime() - edgeDownTime < 700;
+                        if (quick && Math.abs(dx) > Math.max(slop * 4, dp(48)) && Math.abs(dx) > Math.abs(dy) * 2.5f) {
                             boolean inward = rtl ? dx < 0 : dx > 0;
                             edgeTracking = false;
-                            if (!sideDrawerOpen && inward) {
-                                openSideDrawer();
+                            if (sideDrawerOpen != inward) {
+                                if (inward) openSideDrawer(); else closeSideDrawer();
                                 android.view.MotionEvent c = android.view.MotionEvent.obtain(ev);
                                 c.setAction(android.view.MotionEvent.ACTION_CANCEL);
                                 super.dispatchTouchEvent(c);
                                 c.recycle();
-                                return true;
-                            } else if (sideDrawerOpen && !inward) {
-                                closeSideDrawer();
-                                android.view.MotionEvent c = android.view.MotionEvent.obtain(ev);
-                                c.setAction(android.view.MotionEvent.ACTION_CANCEL);
-                                super.dispatchTouchEvent(c);
-                                c.recycle();
+                                swallowDrawerGesture = true;
                                 return true;
                             }
                         }
@@ -4921,7 +4969,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         scroll.addView(content);
         dialog.setContentView(I18n.attach(scroll));
-        dialog.show();
+        safeShow(dialog);
         runAudit.run();
     }
 
@@ -4939,101 +4987,61 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setSmoothScrollingEnabled(true);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(getBgColor());
-        scroll.setPadding(dp(20), dp(14), dp(20), dp(125));
+        scroll.setPadding(dp(16), dp(12), dp(16), dp(125));
         scroll.setClipToPadding(false);
 
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
 
-        // -- Clean Unboxed Stack Header ------------------------------------
+        // -- Page header: title + live "x / y Active" summary ------------------
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(0, dp(4), 0, dp(12));
 
-        // Title row
-        LinearLayout topRow = new LinearLayout(this);
-        topRow.setOrientation(LinearLayout.HORIZONTAL);
-        topRow.setGravity(Gravity.CENTER_VERTICAL);
+        servicesSummaryBadge = UiKit.caption(this, "Loading...");
+        servicesSummaryBadge.setTypeface(UiKit.MEDIUM);
+        header.addView(UiKit.header(this, "Media Stack", null, servicesSummaryBadge));
 
-        TextView title = new TextView(this);
-        title.setText("MEDIA STACK");
-        title.setTextSize(18);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(AppTheme.text());
-        topRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        servicesSummaryBadge = new TextView(this);
-        servicesSummaryBadge.setText("Loading...");
-        servicesSummaryBadge.setTextSize(11);
-        servicesSummaryBadge.setTypeface(Typeface.MONOSPACE);
-        servicesSummaryBadge.setTextColor(getSuccessColor());
-        topRow.addView(servicesSummaryBadge);
-        topRow.setPadding(0, 0, 0, dp(12));
-        header.addView(topRow);
-
-        // -- Master controls row: Unified Dynamic Master Toggle + SYNC STACK -----------
+        // -- Master controls row: START ALL (only while everything is stopped) + SYNC STACK -----------
         LinearLayout masterRow = new LinearLayout(this);
         masterRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams mrLp = new LinearLayout.LayoutParams(-1, -2);
-        mrLp.bottomMargin = dp(6);
+        mrLp.bottomMargin = dp(4);
         masterRow.setLayoutParams(mrLp);
 
-        masterStackToggleBtn = createOutlinePixelButton("START ALL", Color.WHITE, Color.WHITE);
-        masterStackToggleBtn.setTextSize(11f);
-        masterStackToggleBtn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        masterStackToggleBtn.setLetterSpacing(0.06f);
+        masterStackToggleBtn = UiKit.primary(this, buttonLabel("START ALL"), null);
         masterRow.addView(masterStackToggleBtn, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
 
         masterStackGap = new View(this);
-        masterRow.addView(masterStackGap, new LinearLayout.LayoutParams(dp(8), 1));
+        masterRow.addView(masterStackGap, new LinearLayout.LayoutParams(dp(12), 1));
 
-        Button btnSyncAll = createOutlinePixelButton("SYNC STACK", AppTheme.textSecondary(), AppTheme.text());
-        btnSyncAll.setTextSize(11f);
-        btnSyncAll.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnSyncAll.setLetterSpacing(0.06f);
-        btnSyncAll.setOnClickListener(v -> syncAndAutoWireAllServices());
+        Button btnSyncAll = UiKit.outline(this, buttonLabel("SYNC STACK"), v -> syncAndAutoWireAllServices());
         masterRow.addView(btnSyncAll, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
 
         header.addView(masterRow);
 
-        // 1dp Hairline Divider
-        View hDiv = new View(this);
-        hDiv.setBackgroundColor(AppTheme.outline());
-        LinearLayout.LayoutParams hDivLp = new LinearLayout.LayoutParams(-1, dp(1));
-        hDivLp.topMargin = dp(10);
-        header.addView(hDiv, hDivLp);
-
-        // Clean Section Header above cards with compact [+ INSTALL] and [− UNINSTALL] actions
+        // Section header above the cards with compact Install / Uninstall actions
         LinearLayout cardsHeader = new LinearLayout(this);
         cardsHeader.setOrientation(LinearLayout.HORIZONTAL);
         cardsHeader.setGravity(Gravity.CENTER_VERTICAL);
-        cardsHeader.setPadding(dp(2), dp(12), dp(2), dp(2));
+        cardsHeader.setPadding(0, dp(20), 0, 0);
 
         TextView cardsTitle = new TextView(this);
         cardsTitle.setText("COMPANION SERVICES");
-        cardsTitle.setTextSize(11f);
-        cardsTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        cardsTitle.setLetterSpacing(0.08f);
-        cardsTitle.setTextColor(AppTheme.textMuted());
-        cardsHeader.addView(cardsTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
         styleSectionLabel(cardsTitle);
+        cardsHeader.addView(cardsTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        Button btnInstallBatch = createOutlinePixelButton("+ INSTALL", AppTheme.accent(), AppTheme.accent());
-        btnInstallBatch.setTextSize(9f);
-        btnInstallBatch.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnInstallBatch.setPadding(dp(10), 0, dp(10), 0);
-        btnInstallBatch.setOnClickListener(v -> showSelectiveInstallDialog());
-        cardsHeader.addView(btnInstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)));
+        Button btnInstallBatch = UiKit.tonal(this, buttonLabel("INSTALL"), v -> showSelectiveInstallDialog());
+        btnInstallBatch.setTextSize(12f);
+        btnInstallBatch.setPadding(dp(12), 0, dp(12), 0);
+        cardsHeader.addView(btnInstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
 
         View batchGap = new View(this);
         cardsHeader.addView(batchGap, new LinearLayout.LayoutParams(dp(8), 1));
 
-        Button btnUninstallBatch = createOutlinePixelButton("− UNINSTALL", AppTheme.danger(), AppTheme.danger());
-        btnUninstallBatch.setTextSize(9f);
-        btnUninstallBatch.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        btnUninstallBatch.setPadding(dp(10), 0, dp(10), 0);
-        btnUninstallBatch.setOnClickListener(v -> showSelectiveUninstallDialog());
-        cardsHeader.addView(btnUninstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)));
+        Button btnUninstallBatch = UiKit.danger(this, buttonLabel("UNINSTALL"), v -> showSelectiveUninstallDialog());
+        btnUninstallBatch.setTextSize(12f);
+        btnUninstallBatch.setPadding(dp(12), 0, dp(12), 0);
+        cardsHeader.addView(btnUninstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
 
         header.addView(cardsHeader);
 
@@ -5048,7 +5056,7 @@ public final class FishbowlActivity extends AppCompatActivity
         lt.setDuration(220);
         servicesCardsContainer.setLayoutTransition(lt);
         LinearLayout.LayoutParams scParams = new LinearLayout.LayoutParams(-1, -2);
-        scParams.topMargin = dp(10);
+        scParams.topMargin = dp(12);
         servicesCardsContainer.setLayoutParams(scParams);
         layout.addView(servicesCardsContainer);
 
@@ -5090,37 +5098,18 @@ public final class FishbowlActivity extends AppCompatActivity
         servicesCardsContainer.removeAllViews();
 
         if (!isMediaStackEnabled()) {
-            LinearLayout disabledCard = new LinearLayout(this);
-            disabledCard.setOrientation(LinearLayout.VERTICAL);
-            disabledCard.setPadding(dp(16), dp(16), dp(16), dp(16));
-            disabledCard.setBackground(createBorderedRoundedDrawable(
-                    AppTheme.card(),
-                    AppTheme.outline(),
-                    dp(1),
-                    dp(12)
-            ));
-            LinearLayout.LayoutParams dcp = new LinearLayout.LayoutParams(-1, -2);
-            dcp.bottomMargin = dp(14);
-            disabledCard.setLayoutParams(dcp);
+            LinearLayout disabledCard = UiKit.card(this);
 
-            TextView dTitle = new TextView(this);
-            dTitle.setText("MEDIA STACK IS PAUSED");
-            dTitle.setTextSize(12f);
-            dTitle.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+            TextView dTitle = UiKit.subtitle(this, "MEDIA STACK IS PAUSED");
             dTitle.setTextColor(AppTheme.warning());
             disabledCard.addView(dTitle);
 
-            TextView dSub = new TextView(this);
-            dSub.setText("Jellyarr is currently operating in standalone Jellyfin mode to conserve storage and RAM. Companion services are paused.");
-            dSub.setTextSize(10.5f);
-            dSub.setTextColor(AppTheme.textSecondary());
-            dSub.setPadding(0, dp(4), 0, dp(12));
+            TextView dSub = UiKit.body(this, "Jellyarr is currently operating in standalone Jellyfin mode to conserve storage and RAM. Companion services are paused.");
+            dSub.setPadding(0, dp(4), 0, dp(4));
             disabledCard.addView(dSub);
 
-            Button btnEnable = createPixelButton("ENABLE COMPANION SERVICES", AppTheme.inner(), AppTheme.accent());
-            btnEnable.setTextSize(10f);
-            btnEnable.setOnClickListener(v -> setMediaStackEnabled(true));
-            disabledCard.addView(btnEnable, new LinearLayout.LayoutParams(-1, dp(36)));
+            disabledCard.addView(UiKit.buttonRow(this,
+                    UiKit.tonal(this, buttonLabel("ENABLE COMPANION SERVICES"), v -> setMediaStackEnabled(true))));
 
             servicesCardsContainer.addView(disabledCard);
             return;
@@ -5147,26 +5136,12 @@ public final class FishbowlActivity extends AppCompatActivity
 
         // 1. Primary Installed Services Grid (2 Columns with 12dp Breathing Space)
         if (installedServices.isEmpty()) {
-            LinearLayout emptyBox = new LinearLayout(this);
-            emptyBox.setOrientation(LinearLayout.VERTICAL);
-            emptyBox.setGravity(Gravity.CENTER);
-            emptyBox.setPadding(dp(16), dp(20), dp(16), dp(16));
-
-            TextView emptyTitle = new TextView(this);
-            emptyTitle.setText("NO COMPANION SERVICES INSTALLED");
-            emptyTitle.setTextSize(11f);
-            emptyTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            emptyTitle.setTextColor(AppTheme.textMuted());
-            emptyBox.addView(emptyTitle);
-
-            TextView emptySub = new TextView(this);
-            emptySub.setText("Tap available services in the drawer below to install.");
-            emptySub.setTextSize(9.5f);
-            emptySub.setTextColor(AppTheme.textMuted());
-            emptySub.setPadding(0, dp(4), 0, 0);
-            emptyBox.addView(emptySub);
-
-            servicesCardsContainer.addView(emptyBox);
+            View emptyBox = UiKit.empty(this, "NO COMPANION SERVICES INSTALLED",
+                    "Tap available services in the drawer below to install.");
+            emptyBox.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+            LinearLayout.LayoutParams ebLp = new LinearLayout.LayoutParams(-1, -2);
+            ebLp.bottomMargin = dp(12);
+            servicesCardsContainer.addView(emptyBox, ebLp);
         } else {
             LinearLayout currentRow = null;
             for (int i = 0; i < installedServices.size(); i++) {
@@ -5217,16 +5192,14 @@ public final class FishbowlActivity extends AppCompatActivity
             LinearLayout drawerHeader = new LinearLayout(this);
             drawerHeader.setOrientation(LinearLayout.HORIZONTAL);
             drawerHeader.setGravity(Gravity.CENTER_VERTICAL);
-            drawerHeader.setPadding(dp(4), dp(8), dp(4), dp(8));
+            drawerHeader.setPadding(dp(8), dp(10), dp(8), dp(10));
             drawerHeader.setClickable(true);
             drawerHeader.setFocusable(true);
+            drawerHeader.setBackground(UiKit.rowRipple(this));
 
             TextView drawerTitle = new TextView(this);
             drawerTitle.setText("AVAILABLE SERVICES (" + uninstalledServices.size() + ")");
-            drawerTitle.setTextSize(11f);
-            drawerTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            drawerTitle.setLetterSpacing(0.08f);
-            drawerTitle.setTextColor(AppTheme.textMuted());
+            styleSectionLabel(drawerTitle);
             drawerHeader.addView(drawerTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
             ImageView chevron = new ImageView(this);
@@ -5311,8 +5284,8 @@ public final class FishbowlActivity extends AppCompatActivity
             } else {
                 masterStackToggleBtn.setVisibility(View.VISIBLE);
                 if (masterStackGap != null) masterStackGap.setVisibility(View.VISIBLE);
-                masterStackToggleBtn.setText("START ALL");
-                applyOutlineButtonStyle(masterStackToggleBtn, Color.WHITE, Color.WHITE);
+                masterStackToggleBtn.setEnabled(!installedServices.isEmpty());
+                masterStackToggleBtn.setAlpha(installedServices.isEmpty() ? 0.5f : 1f);
                 masterStackToggleBtn.setOnClickListener(v -> {
                     Toast.makeText(this, I18n.tr("Starting companion media stack..."), Toast.LENGTH_SHORT).show();
                     for (ManagedService is : installedServices) {
@@ -5344,7 +5317,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private View buildIndividualServiceCard(ManagedService svc) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(12), dp(11), dp(12), dp(11));
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
 
         String id = svc.getId().toLowerCase(Locale.ROOT);
         boolean isJellyfin = "jellyfin".equals(id);
@@ -5379,7 +5352,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     break;
                 default:
                     iconTintColor = AppTheme.text();
-                    stText = "OFF";
+                    stText = "STOPPED";
                     stColor = AppTheme.textMuted();
                     break;
             }
@@ -5403,10 +5376,10 @@ public final class FishbowlActivity extends AppCompatActivity
                 stText = "RETRYING";
                 stColor = AppTheme.warning();
             } else if (isStarting) {
-                stText = "WAIT";
+                stText = "STARTING";
                 stColor = getWarningColor();
             } else if (svc.isInstalled()) {
-                stText = "OFF";
+                stText = "STOPPED";
                 stColor = AppTheme.textMuted();
             } else {
                 stText = "AVAILABLE";
@@ -5416,27 +5389,24 @@ public final class FishbowlActivity extends AppCompatActivity
 
         boolean installed = isJellyfin || svc.isInstalled();
 
-        if (!installed) {
-            card.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(10)));
-            card.setAlpha(0.55f);
-        } else {
-            card.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(10)));
-            card.setAlpha(1.0f);
-        }
+        card.setBackground(UiKit.pressable(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+        card.setAlpha(installed ? 1.0f : 0.7f);   // available (not installed) services are dimmed
 
         card.setClickable(true);
         card.setFocusable(true);
+        // Tap: install flow for available services, details sheet for installed ones (long-press kept on the address).
         card.setOnClickListener(v -> {
             if (!installed) {
                 showServiceInstallCompatibilityDialog(svc);
+            } else {
+                showServiceDetailsModal(svc);
             }
         });
 
-        // 1. Top Header Row: Icon + Name / Version + Status Badge
+        // 1. Header: logo + name / version
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setOnClickListener(v -> card.performClick());
 
         ImageView iconView = new ImageView(this);
         iconView.setImageResource(getServiceIconRes(id));
@@ -5445,115 +5415,99 @@ public final class FishbowlActivity extends AppCompatActivity
         } else {
             iconView.setColorFilter(iconTintColor);
         }
-        top.addView(iconView, new LinearLayout.LayoutParams(dp(22), dp(22)));
-
-        View spIcon = new View(this);
-        top.addView(spIcon, new LinearLayout.LayoutParams(dp(8), 1));
+        LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(dp(28), dp(28));
+        icLp.setMarginEnd(dp(10));
+        top.addView(iconView, icLp);
 
         LinearLayout titleCol = new LinearLayout(this);
         titleCol.setOrientation(LinearLayout.VERTICAL);
 
-        LinearLayout nameRow = new LinearLayout(this);
-        nameRow.setOrientation(LinearLayout.HORIZONTAL);
-        nameRow.setGravity(Gravity.CENTER_VERTICAL);
-
-        TextView name = new TextView(this);
-        name.setText(svc.getDisplayName());
-        name.setTextSize(12.5f);
-        name.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        TextView name = UiKit.singleLine(UiKit.subtitle(this, svc.getDisplayName()));
         name.setTextColor(installed ? AppTheme.text() : AppTheme.textSecondary());
-        name.setSingleLine(true);
-        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        nameRow.addView(name);
+        titleCol.addView(name);
 
-        TextView verTag = new TextView(this);
-        verTag.setText(" v" + svc.getManifest().getVersion());
-        verTag.setTextSize(8.5f);
-        verTag.setTypeface(Typeface.MONOSPACE);
-        verTag.setTextColor(AppTheme.textMuted());
-        nameRow.addView(verTag);
-
-        titleCol.addView(nameRow);
+        TextView verTag = UiKit.singleLine(UiKit.text(this, "v" + svc.getManifest().getVersion(), 11f, AppTheme.textMuted(), Typeface.MONOSPACE));
+        titleCol.addView(verTag);
         top.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView stateBadge = new TextView(this);
-        stateBadge.setText("● " + stText);
-        stateBadge.setTextSize(8.5f);
-        stateBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        stateBadge.setTextColor(stColor);
-        top.addView(stateBadge);
 
         card.addView(top);
 
-        // 2. Compact Endpoint / IP Row
+        // 2. Status badge
+        TextView stateBadge = UiKit.badge(this, I18n.tr(stText), stColor);
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(-2, -2);
+        sbLp.topMargin = dp(10);
+        card.addView(stateBadge, sbLp);
+
+        // 3. Compact endpoint row (tap = copy, long-press = details)
         int defaultPort = svc.getManifest().getDefaultPort();
         String webPath = svc.getManifest().getWebPath();
         if (webPath == null) webPath = "/";
         String localUrl = "http://127.0.0.1:" + defaultPort + (webPath.equals("/") ? "" : webPath);
-        String rawLanIp = getRawLanIp();
+        String rawLanIp = cachedRawLanIp;
         String lanUrl = (rawLanIp != null) ? "http://" + rawLanIp + ":" + defaultPort + (webPath.equals("/") ? "" : webPath) : null;
         final String finalCopyUrl = lanUrl != null ? lanUrl : localUrl;
 
         LinearLayout epRow = new LinearLayout(this);
         epRow.setOrientation(LinearLayout.HORIZONTAL);
-        epRow.setGravity(Gravity.CENTER);
-        epRow.setPadding(dp(4), dp(4), dp(4), dp(4));
+        epRow.setGravity(Gravity.CENTER_VERTICAL);
+        epRow.setPadding(dp(10), dp(7), dp(10), dp(7));
         epRow.setClickable(true);
         epRow.setFocusable(true);
+        epRow.setBackground(UiKit.pressable(this, AppTheme.inner(), 0, UiKit.R_INNER));
         epRow.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " URL", finalCopyUrl));
         epRow.setOnLongClickListener(v -> {
             showServiceDetailsModal(svc);
             return true;
         });
         LinearLayout.LayoutParams epLp = new LinearLayout.LayoutParams(-1, -2);
-        epLp.topMargin = dp(6);
-        epLp.bottomMargin = dp(6);
+        epLp.topMargin = dp(10);
+        epLp.bottomMargin = dp(10);
         epRow.setLayoutParams(epLp);
 
         TextView epText = new TextView(this);
         epText.setText(lanUrl != null ? rawLanIp + ":" + defaultPort : "127.0.0.1:" + defaultPort);
-        epText.setTextSize(10.5f);
-        epText.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+        epText.setTextSize(12f);
+        epText.setTypeface(Typeface.MONOSPACE);
         epText.setTextColor(installed ? AppTheme.text() : AppTheme.textMuted());
-        epText.setGravity(Gravity.CENTER);
         epText.setSingleLine(true);
         epText.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-        epRow.addView(epText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, -2));
+        epText.setTextDirection(View.TEXT_DIRECTION_LTR);
+        epRow.addView(epText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+
+        ImageView epCopy = new ImageView(this);
+        epCopy.setImageResource(R.drawable.ic_copy);
+        epCopy.setColorFilter(AppTheme.textMuted());
+        epCopy.setContentDescription("Copy");
+        LinearLayout.LayoutParams ecLp = new LinearLayout.LayoutParams(dp(14), dp(14));
+        ecLp.setMarginStart(dp(6));
+        epRow.addView(epCopy, ecLp);
 
         card.addView(epRow);
 
-        // 3. Compact Bottom Action Row (Single Row, Adaptive)
+        // 4. Actions (single row, adaptive)
         LinearLayout bottomRow = new LinearLayout(this);
         bottomRow.setOrientation(LinearLayout.HORIZONTAL);
         bottomRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams brLp = new LinearLayout.LayoutParams(-1, dp(32));
-        brLp.topMargin = dp(2);
-        bottomRow.setLayoutParams(brLp);
+        bottomRow.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(38)));
 
         if (svc.isBlocked()) {
-            Button btnBlocked = createOutlinePixelButton("INCOMPATIBLE", AppTheme.outlineStrong(), AppTheme.textMuted());
-            btnBlocked.setTextSize(9f);
+            Button btnBlocked = compactCardButton(UiKit.outline(this, buttonLabel("INCOMPATIBLE"), null));
             btnBlocked.setEnabled(false);
+            btnBlocked.setAlpha(0.6f);
             bottomRow.addView(btnBlocked, new LinearLayout.LayoutParams(-1, -1));
         } else if (!installed) {
-            Button btnInstall = createOutlinePixelButton("INSTALL", AppTheme.outlineStrong(), AppTheme.text());
-            btnInstall.setTextSize(9.5f);
-            btnInstall.setOnClickListener(v -> showServiceInstallCompatibilityDialog(svc));
+            Button btnInstall = compactCardButton(UiKit.tonal(this, buttonLabel("INSTALL"), v -> showServiceInstallCompatibilityDialog(svc)));
             bottomRow.addView(btnInstall, new LinearLayout.LayoutParams(-1, -1));
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.CRASH_LOOP_PROTECTION) {
-            Button btnReset = createOutlinePixelButton("RESET CRASH LOOP", AppTheme.danger(), AppTheme.danger());
-            btnReset.setTextSize(9f);
-            btnReset.setOnClickListener(v -> {
+            Button btnReset = compactCardButton(UiKit.danger(this, buttonLabel("RESET CRASH LOOP"), v -> {
                 MediaServiceManager.getInstance(this).resetCrashLoop(svc.getId());
                 refreshServicesTabUI();
                 refreshHomeServicesBadge();
-            });
+            }));
             bottomRow.addView(btnReset, new LinearLayout.LayoutParams(-1, -1));
         } else if (!isRunning) {
             String startLabel = (svc.getState() == com.fishbowl.app.model.ServiceState.RECOVERING) ? "RETRY NOW" : "START";
-            Button btnStart = createOutlinePixelButton(startLabel, Color.WHITE, Color.WHITE);
-            btnStart.setTextSize(9.5f);
-            btnStart.setOnClickListener(v -> {
+            Button btnStart = compactCardButton(UiKit.primary(this, buttonLabel(startLabel), v -> {
                 if (isJellyfin) {
                     triggerServerAction(JellyfinServerService.ACTION_START);
                 } else {
@@ -5563,20 +5517,20 @@ public final class FishbowlActivity extends AppCompatActivity
                     refreshServicesTabUI();
                     refreshHomeServicesBadge();
                 }, 500);
-            });
+            }));
+            if (isStarting) {
+                btnStart.setEnabled(false);
+                btnStart.setAlpha(0.6f);
+            }
             bottomRow.addView(btnStart, new LinearLayout.LayoutParams(-1, -1));
         } else {
-            Button btnWeb = createPixelButton("WEB UI", AppTheme.accent(), AppTheme.onAccent());
-            btnWeb.setTextSize(9f);
-            btnWeb.setOnClickListener(v -> openServiceWeb(svc));
+            Button btnWeb = compactCardButton(UiKit.primary(this, buttonLabel("WEB UI"), v -> openServiceWeb(svc)));
             bottomRow.addView(btnWeb, new LinearLayout.LayoutParams(0, -1, 1.15f));
 
             View spB1 = new View(this);
-            bottomRow.addView(spB1, new LinearLayout.LayoutParams(dp(6), 1));
+            bottomRow.addView(spB1, new LinearLayout.LayoutParams(dp(8), 1));
 
-            Button btnStop = createOutlinePixelButton("STOP", AppTheme.danger(), AppTheme.danger());
-            btnStop.setTextSize(9f);
-            btnStop.setOnClickListener(v -> {
+            Button btnStop = compactCardButton(UiKit.danger(this, buttonLabel("STOP"), v -> {
                 if (isJellyfin) {
                     controller.stop();
                     triggerServerAction(JellyfinServerService.ACTION_STOP);
@@ -5587,7 +5541,7 @@ public final class FishbowlActivity extends AppCompatActivity
                     refreshServicesTabUI();
                     refreshHomeServicesBadge();
                 }, 500);
-            });
+            }));
             bottomRow.addView(btnStop, new LinearLayout.LayoutParams(0, -1, 0.95f));
         }
 
@@ -5595,19 +5549,28 @@ public final class FishbowlActivity extends AppCompatActivity
         return card;
     }
 
+    /** UiKit button sized for the narrow two-column service cards. */
+    private Button compactCardButton(Button b) {
+        b.setTextSize(12.5f);
+        b.setPadding(dp(8), 0, dp(8), 0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        return b;
+    }
+
     private void showServiceDetailsModal(ManagedService svc) {
-        Dialog d = new Dialog(this);
+        if (svc == null || !isUiAlive()) return;
+        final Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
         scroll.setHorizontalScrollBarEnabled(false);
         scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        scroll.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), AppTheme.outline(), dp(1), dp(14)));
+        scroll.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
         scroll.addView(root);
 
         String id = svc.getId().toLowerCase(Locale.ROOT);
@@ -5615,306 +5578,133 @@ public final class FishbowlActivity extends AppCompatActivity
         boolean isRunning = isJellyfin ? (controller != null && controller.getState() == JellyfinController.State.RUNNING) : svc.isRunning();
         boolean installed = isJellyfin || svc.isInstalled();
 
-        // 1. Header: Icon + Title + Version + Category + Status Badge
-        LinearLayout headerRow = new LinearLayout(this);
-        headerRow.setOrientation(LinearLayout.HORIZONTAL);
-        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        // 1. Header: logo + name / version + close
+        LinearLayout headerRow = UiKit.row(this);
 
         ImageView icon = new ImageView(this);
         icon.setImageResource(getServiceIconRes(id));
         if (!isColorLogoRes(getServiceIconRes(id))) icon.setColorFilter(getServiceBrandColor(id));
-        headerRow.addView(icon, new LinearLayout.LayoutParams(dp(32), dp(32)));
+        LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(dp(36), dp(36));
+        icLp.setMarginEnd(dp(12));
+        headerRow.addView(icon, icLp);
 
-        View spH = new View(this);
-        headerRow.addView(spH, new LinearLayout.LayoutParams(dp(10), 1));
-
-        LinearLayout titleCol = new LinearLayout(this);
-        titleCol.setOrientation(LinearLayout.VERTICAL);
-
-        TextView title = new TextView(this);
-        title.setText(svc.getDisplayName().toUpperCase(Locale.ROOT));
-        title.setTextSize(15f);
-        title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        title.setTextColor(AppTheme.text());
-        titleCol.addView(title);
-
-        TextView subTitle = new TextView(this);
-        subTitle.setText("v" + svc.getManifest().getVersion());
-        subTitle.setTextSize(9.5f);
-        subTitle.setTypeface(Typeface.MONOSPACE);
-        subTitle.setTextColor(AppTheme.textMuted());
-        subTitle.setPadding(0, dp(1), 0, 0);
-        titleCol.addView(subTitle);
-
+        LinearLayout titleCol = UiKit.column(this);
+        titleCol.addView(UiKit.singleLine(UiKit.title(this, svc.getDisplayName())));
+        titleCol.addView(UiKit.singleLine(UiKit.text(this, "v" + svc.getManifest().getVersion(), 12f, AppTheme.textMuted(), Typeface.MONOSPACE)));
         headerRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        headerRow.addView(dialogCloseButton(d));
+        root.addView(headerRow);
 
-        TextView stateBadge = new TextView(this);
+        // 2. Status badge
         String stBadgeText;
         int stBadgeColor;
         if (svc.isBlocked()) {
-            stBadgeText = "● BLOCKED";
+            stBadgeText = "BLOCKED";
             stBadgeColor = getDangerColor();
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.CRASH_LOOP_PROTECTION) {
-            stBadgeText = "● CRASH LOOP";
+            stBadgeText = "CRASH LOOP";
             stBadgeColor = getDangerColor();
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.ERROR || svc.getState() == com.fishbowl.app.model.ServiceState.FAILED) {
-            stBadgeText = "● ERROR";
+            stBadgeText = "FAILED";
             stBadgeColor = getDangerColor();
         } else if (svc.getState() == com.fishbowl.app.model.ServiceState.RECOVERING) {
-            stBadgeText = "● RETRYING";
+            stBadgeText = "RETRYING";
             stBadgeColor = AppTheme.warning();
         } else if (svc.isStarting()) {
-            stBadgeText = "● STARTING";
+            stBadgeText = "STARTING";
             stBadgeColor = getWarningColor();
         } else if (isRunning) {
-            stBadgeText = "● RUNNING";
+            stBadgeText = "RUNNING";
             stBadgeColor = AppTheme.success();
         } else if (installed) {
-            stBadgeText = "● STOPPED";
+            stBadgeText = "STOPPED";
             stBadgeColor = AppTheme.textMuted();
         } else {
-            stBadgeText = "● AVAILABLE";
+            stBadgeText = "AVAILABLE";
             stBadgeColor = AppTheme.accent();
         }
-        stateBadge.setText(stBadgeText);
-        stateBadge.setTextSize(9f);
-        stateBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        stateBadge.setTextColor(stBadgeColor);
-        stateBadge.setPadding(dp(8), dp(4), dp(8), dp(4));
-        stateBadge.setBackground(createBorderedRoundedDrawable(AppTheme.bg(), stBadgeColor, dp(1), dp(4)));
-        headerRow.addView(stateBadge);
-
-        root.addView(headerRow);
+        TextView stateBadge = UiKit.badge(this, I18n.tr(stBadgeText), stBadgeColor);
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(-2, -2);
+        sbLp.topMargin = dp(12);
+        root.addView(stateBadge, sbLp);
 
         if (!isJellyfin && svc.getLastError() != null && !svc.getLastError().trim().isEmpty() && !isRunning) {
-            LinearLayout errBox = new LinearLayout(this);
-            errBox.setOrientation(LinearLayout.VERTICAL);
-            errBox.setPadding(dp(12), dp(10), dp(12), dp(10));
-            errBox.setBackground(createBorderedRoundedDrawable(AppTheme.dangerContainer(), AppTheme.danger(), dp(1), dp(8)));
+            LinearLayout errBox = UiKit.inset(this);
+            errBox.setBackground(UiKit.shape(this, AppTheme.dangerContainer(), 0, UiKit.R_INNER));
             LinearLayout.LayoutParams ebLp = new LinearLayout.LayoutParams(-1, -2);
-            ebLp.topMargin = dp(10);
+            ebLp.topMargin = dp(12);
             errBox.setLayoutParams(ebLp);
 
-            TextView errTitle = new TextView(this);
-            errTitle.setText("DIAGNOSTIC NOTICE");
-            errTitle.setTextSize(9f);
-            errTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            errTitle.setTextColor(AppTheme.danger());
+            TextView errTitle = UiKit.text(this, "DIAGNOSTIC NOTICE", 11f, AppTheme.danger(), UiKit.BOLD);
+            errTitle.setLetterSpacing(0.06f);
             errBox.addView(errTitle);
 
-            TextView errDesc = new TextView(this);
-            errDesc.setText(svc.getLastError());
-            errDesc.setTextSize(10f);
-            errDesc.setTypeface(Typeface.MONOSPACE);
-            errDesc.setTextColor(AppTheme.danger());
-            errDesc.setPadding(0, dp(2), 0, 0);
+            TextView errDesc = UiKit.body(this, svc.getLastError());
+            errDesc.setTextColor(AppTheme.text());
+            errDesc.setTextIsSelectable(true);
+            errDesc.setPadding(0, dp(4), 0, 0);
             errBox.addView(errDesc);
 
             root.addView(errBox);
         }
 
-        // Divider
-        View div1 = new View(this);
-        div1.setBackgroundColor(AppTheme.inner());
-        LinearLayout.LayoutParams d1Lp = new LinearLayout.LayoutParams(-1, dp(1));
-        d1Lp.topMargin = dp(12);
-        d1Lp.bottomMargin = dp(12);
-        root.addView(div1, d1Lp);
-
-        // 2. Single Unified Info Card
-        LinearLayout infoBox = new LinearLayout(this);
-        infoBox.setOrientation(LinearLayout.VERTICAL);
-        infoBox.setPadding(dp(14), dp(12), dp(14), dp(12));
-        infoBox.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(8)));
-        LinearLayout.LayoutParams ibLp = new LinearLayout.LayoutParams(-1, -2);
-        ibLp.bottomMargin = dp(16);
-        infoBox.setLayoutParams(ibLp);
-
-        // Item A: URL / Endpoints (All available LAN endpoints + Local Loopback)
+        // 3. Addresses: every LAN endpoint + local loopback
         int defaultPort = svc.getManifest().getDefaultPort();
-        String webPath = svc.getManifest().getWebPath();
-        if (webPath == null) webPath = "/";
+        String webPathRaw = svc.getManifest().getWebPath();
+        final String webPath = webPathRaw == null ? "/" : webPathRaw;
         String localUrl = "http://127.0.0.1:" + defaultPort + (webPath.equals("/") ? "" : webPath);
 
-        TextView lblUrl = new TextView(this);
-        lblUrl.setText("NETWORK & LAN ACCESS URLS");
-        lblUrl.setTextSize(8.5f);
-        lblUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblUrl.setTextColor(AppTheme.textMuted());
-        infoBox.addView(lblUrl);
-
+        root.addView(detailSectionLabel("NETWORK & LAN ACCESS URLS"));
+        LinearLayout urlBox = UiKit.inset(this);
         java.util.List<NetworkUtils.LanEndpoint> endpoints = NetworkUtils.getAllAvailableLanEndpoints();
-        if (endpoints != null && !endpoints.isEmpty()) {
+        if (endpoints != null) {
             for (NetworkUtils.LanEndpoint ep : endpoints) {
                 String epUrl = ep.getUrl(defaultPort, webPath);
-
-                LinearLayout urlRow = new LinearLayout(this);
-                urlRow.setOrientation(LinearLayout.HORIZONTAL);
-                urlRow.setGravity(Gravity.CENTER_VERTICAL);
-                urlRow.setPadding(0, dp(2), 0, dp(4));
-
-                TextView lblBadge = new TextView(this);
-                lblBadge.setText(ep.label.toUpperCase(Locale.ROOT));
-                lblBadge.setTextSize(7.5f);
-                lblBadge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                lblBadge.setTextColor(AppTheme.accent());
-                lblBadge.setPadding(dp(4), dp(2), dp(4), dp(2));
-                lblBadge.setBackground(createBorderedRoundedDrawable(AppTheme.accentContainer(), AppTheme.accent(), dp(1), dp(3)));
-                LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(-2, -2);
-                badgeLp.setMarginEnd(dp(6));
-                urlRow.addView(lblBadge, badgeLp);
-
-                TextView valUrl = new TextView(this);
-                valUrl.setText(epUrl);
-                valUrl.setTextSize(10f);
-                valUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                valUrl.setTextColor(AppTheme.text());
-                valUrl.setSingleLine(true);
-                valUrl.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-                urlRow.addView(valUrl, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-                TextView btnCopyUrl = new TextView(this);
-                btnCopyUrl.setText("COPY");
-                btnCopyUrl.setTextSize(9f);
-                btnCopyUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-                btnCopyUrl.setTextColor(AppTheme.accent());
-                btnCopyUrl.setPadding(dp(8), dp(4), dp(4), dp(4));
-                btnCopyUrl.setClickable(true);
-                btnCopyUrl.setFocusable(true);
-                btnCopyUrl.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " " + ep.label + " URL", epUrl));
-                urlRow.addView(btnCopyUrl);
-
-                infoBox.addView(urlRow);
+                urlBox.addView(detailCopyRow(ep.label, epUrl, true, svc.getDisplayName() + " " + ep.label + " URL", epUrl));
             }
         }
+        urlBox.addView(detailCopyRow("LOCAL", localUrl, true, svc.getDisplayName() + " Local URL", localUrl));
+        TextView sopNotice = UiKit.caption(this, "Note: Browsers isolate cookies per IP/host (Same-Origin Policy). Logging in on USB/Wi-Fi IP does not transfer to 127.0.0.1 or other IPs.");
+        sopNotice.setPadding(0, dp(6), 0, dp(2));
+        urlBox.addView(sopNotice);
+        root.addView(urlBox);
 
-        // Always show Local Loopback (127.0.0.1)
-        LinearLayout localRow = new LinearLayout(this);
-        localRow.setOrientation(LinearLayout.HORIZONTAL);
-        localRow.setGravity(Gravity.CENTER_VERTICAL);
-        localRow.setPadding(0, dp(2), 0, dp(4));
-
-        TextView lblLocal = new TextView(this);
-        lblLocal.setText("LOCAL");
-        lblLocal.setTextSize(7.5f);
-        lblLocal.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblLocal.setTextColor(AppTheme.textSecondary());
-        lblLocal.setPadding(dp(4), dp(2), dp(4), dp(2));
-        lblLocal.setBackground(createBorderedRoundedDrawable(AppTheme.accentContainer(), AppTheme.textMuted(), dp(1), dp(3)));
-        LinearLayout.LayoutParams localBadgeLp = new LinearLayout.LayoutParams(-2, -2);
-        localBadgeLp.setMarginEnd(dp(6));
-        localRow.addView(lblLocal, localBadgeLp);
-
-        TextView valLocalUrl = new TextView(this);
-        valLocalUrl.setText(localUrl);
-        valLocalUrl.setTextSize(10f);
-        valLocalUrl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        valLocalUrl.setTextColor(AppTheme.text());
-        valLocalUrl.setSingleLine(true);
-        valLocalUrl.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-        localRow.addView(valLocalUrl, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView btnCopyLocal = new TextView(this);
-        btnCopyLocal.setText("COPY");
-        btnCopyLocal.setTextSize(9f);
-        btnCopyLocal.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        btnCopyLocal.setTextColor(AppTheme.accent());
-        btnCopyLocal.setPadding(dp(8), dp(4), dp(4), dp(4));
-        btnCopyLocal.setClickable(true);
-        btnCopyLocal.setFocusable(true);
-        btnCopyLocal.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " Local URL", localUrl));
-        localRow.addView(btnCopyLocal);
-
-        infoBox.addView(localRow);
-
-        TextView sopNotice = new TextView(this);
-        sopNotice.setText("Note: Browsers isolate cookies per IP/host (Same-Origin Policy). Logging in on USB/Wi-Fi IP does not transfer to 127.0.0.1 or other IPs.");
-        sopNotice.setTextSize(8f);
-        sopNotice.setTypeface(Typeface.MONOSPACE);
-        sopNotice.setTextColor(AppTheme.textMuted());
-        sopNotice.setPadding(0, dp(2), 0, dp(6));
-        infoBox.addView(sopNotice);
-
-        // Item B: Credentials / API Key
-        String credVal;
-        final String copyCredVal;
+        // 4. Credentials: unified account login (when set) and the service API key
+        root.addView(detailSectionLabel("CREDENTIALS / AUTHENTICATION"));
+        LinearLayout credBox = UiKit.inset(this);
+        boolean unified = UnifiedAccount.isConfigured(this);
+        String unifiedUser = UnifiedAccount.getUsername(this);
+        if (unified) {
+            credBox.addView(detailCopyRow(null, I18n.tr("Unified account") + ": " + unifiedUser, false,
+                    svc.getDisplayName() + " Username", unifiedUser));
+        }
         if ("jellyfin".equalsIgnoreCase(id)) {
-            credVal = "Admin account created during initial setup";
-            copyCredVal = "http://127.0.0.1:8096";
+            if (!unified) {
+                credBox.addView(detailCopyRow(null, "Admin account created during initial setup", false,
+                        svc.getDisplayName() + " URL", "http://127.0.0.1:8096"));
+            }
         } else if ("transmission".equalsIgnoreCase(id)) {
-            credVal = "Username: fishbowl  |  Password: fishbowl";
-            copyCredVal = "User: fishbowl | Password: fishbowl";
+            if (!unified) {
+                credBox.addView(detailCopyRow(null, "No login required. Set a unified account in Settings > Security & Identity to protect it.", false,
+                        svc.getDisplayName() + " URL", "http://127.0.0.1:9091/transmission/web/"));
+            }
         } else {
             String apiKey = MediaServiceManager.getInstance(this).getServiceApiKey(id);
             if (apiKey != null && !apiKey.isEmpty()) {
-                credVal = "API Key: " + apiKey;
-                copyCredVal = apiKey;
-            } else {
-                credVal = "Zero-Auth (Auto-generated on startup)";
-                copyCredVal = "http://127.0.0.1:" + svc.getManifest().getDefaultPort();
+                credBox.addView(detailCopyRow("API", apiKey, true, svc.getDisplayName() + " API Key", apiKey));
+            } else if (!unified) {
+                credBox.addView(detailCopyRow(null, "Zero-Auth (Auto-generated on startup)", false,
+                        svc.getDisplayName() + " URL", "http://127.0.0.1:" + defaultPort));
             }
         }
+        root.addView(credBox);
 
-        View divInfo1 = new View(this);
-        divInfo1.setBackgroundColor(AppTheme.inner());
-        infoBox.addView(divInfo1, new LinearLayout.LayoutParams(-1, dp(1)));
-
-        TextView lblCred = new TextView(this);
-        lblCred.setText("CREDENTIALS / AUTHENTICATION");
-        lblCred.setTextSize(8.5f);
-        lblCred.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblCred.setTextColor(AppTheme.textMuted());
-        lblCred.setPadding(0, dp(8), 0, 0);
-        infoBox.addView(lblCred);
-
-        LinearLayout credRow = new LinearLayout(this);
-        credRow.setOrientation(LinearLayout.HORIZONTAL);
-        credRow.setGravity(Gravity.CENTER_VERTICAL);
-        credRow.setPadding(0, dp(2), 0, dp(8));
-
-        TextView valCred = new TextView(this);
-        valCred.setText(credVal);
-        valCred.setTextSize(10f);
-        valCred.setTypeface(Typeface.MONOSPACE);
-        valCred.setTextColor(AppTheme.text());
-        valCred.setSingleLine(true);
-        valCred.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        credRow.addView(valCred, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView btnCopyCred = new TextView(this);
-        btnCopyCred.setText("COPY");
-        btnCopyCred.setTextSize(9f);
-        btnCopyCred.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        btnCopyCred.setTextColor(AppTheme.accent());
-        btnCopyCred.setPadding(dp(8), dp(4), dp(4), dp(4));
-        btnCopyCred.setClickable(true);
-        btnCopyCred.setFocusable(true);
-        btnCopyCred.setOnClickListener(v -> copyUrlToClipboard(svc.getDisplayName() + " Credentials", copyCredVal));
-        credRow.addView(btnCopyCred);
-
-        infoBox.addView(credRow);
-
-        // Item C: Status & Storage
-        View divInfo2 = new View(this);
-        divInfo2.setBackgroundColor(AppTheme.inner());
-        infoBox.addView(divInfo2, new LinearLayout.LayoutParams(-1, dp(1)));
-
-        TextView lblFoot = new TextView(this);
-        lblFoot.setText("STATUS & STORAGE");
-        lblFoot.setTextSize(8.5f);
-        lblFoot.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        lblFoot.setTextColor(AppTheme.textMuted());
-        lblFoot.setPadding(0, dp(8), 0, 0);
-        infoBox.addView(lblFoot);
-
-        File instDir = new File(svc.getManifest().getInstallDir());
-        File confDir = new File(svc.getManifest().getConfigDir());
-        long binBytes = calculateDirSize(instDir);
-        long cfgBytes = calculateDirSize(confDir);
-        String footStr = installed ?
-                ("Port: " + defaultPort + " • Size: " + MediaStorageManager.formatBytes(binBytes + cfgBytes)) :
-                ("Port: " + defaultPort + " • Est. Size: ~" + svc.getManifest().getStorageRequiredMb() + " MB");
-
+        // 5. Status & storage (folder sizes are computed off the UI thread)
+        root.addView(detailSectionLabel("STATUS & STORAGE"));
+        LinearLayout statBox = UiKit.inset(this);
+        addDetailKv(statBox, "Port", String.valueOf(defaultPort), true);
+        final TextView sizeValue = addDetailKv(statBox, installed ? "Size" : "Est. Size",
+                installed ? I18n.tr("Calculating...") : "~" + svc.getManifest().getStorageRequiredMb() + " MB", false);
         File mediaTargetDir = null;
         if ("radarr".equalsIgnoreCase(id)) {
             mediaTargetDir = MediaStorageManager.getInstance(this).getMoviesDir();
@@ -5925,56 +5715,32 @@ public final class FishbowlActivity extends AppCompatActivity
         } else if ("jellyfin".equalsIgnoreCase(id)) {
             mediaTargetDir = MediaStorageManager.getInstance(this).getMediaRoot();
         }
-
         if (mediaTargetDir != null) {
-            footStr += "\nPath: " + mediaTargetDir.getAbsolutePath();
+            TextView pathLabel = UiKit.caption(this, "Path");
+            pathLabel.setPadding(0, dp(6), 0, dp(2));
+            statBox.addView(pathLabel);
+            TextView pathVal = UiKit.mono(this, mediaTargetDir.getAbsolutePath());
+            pathVal.setTextDirection(View.TEXT_DIRECTION_LTR);
+            statBox.addView(pathVal);
         }
+        root.addView(statBox);
 
-        TextView valFoot = new TextView(this);
-        valFoot.setText(footStr);
-        valFoot.setTextSize(10f);
-        valFoot.setTypeface(Typeface.MONOSPACE);
-        valFoot.setTextColor(AppTheme.text());
-        valFoot.setPadding(0, dp(2), 0, dp(2));
-        infoBox.addView(valFoot);
-
-        root.addView(infoBox);
-
-        // 7. Modal Bottom Action Buttons Row
-        LinearLayout actionRow = new LinearLayout(this);
-        actionRow.setOrientation(LinearLayout.HORIZONTAL);
-        actionRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams aLp = new LinearLayout.LayoutParams(-1, -2);
-        aLp.topMargin = dp(4);
-        actionRow.setLayoutParams(aLp);
-
+        // 6. Actions: primary row, then secondary row (logs / uninstall)
         if (!installed) {
-            Button btnInstall = createPixelButton("INSTALL", AppTheme.accent(), AppTheme.onAccent());
-            btnInstall.setTextSize(10f);
-            btnInstall.setOnClickListener(v -> {
+            root.addView(UiKit.buttonRow(this, UiKit.primary(this, buttonLabel("INSTALL"), v -> {
                 d.dismiss();
                 showServiceInstallCompatibilityDialog(svc);
-            });
-            actionRow.addView(btnInstall, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+            })));
         } else {
             if (isRunning) {
-                Button btnWeb = createPixelButton("WEB UI", AppTheme.accent(), AppTheme.onAccent());
-                btnWeb.setTextSize(10f);
-                btnWeb.setOnClickListener(v -> {
+                Button btnWeb = UiKit.primary(this, buttonLabel("WEB UI"), v -> {
                     d.dismiss();
                     openServiceWeb(svc);
                 });
-                actionRow.addView(btnWeb, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
-
-                View spB1 = new View(this);
-                actionRow.addView(spB1, new LinearLayout.LayoutParams(dp(6), 1));
-
-                Button btnStop = createOutlinePixelButton("STOP", AppTheme.danger(), AppTheme.danger());
-                btnStop.setTextSize(10f);
-                btnStop.setOnClickListener(v -> {
+                Button btnStop = UiKit.danger(this, buttonLabel("STOP"), v -> {
                     d.dismiss();
                     if (isJellyfin) {
-                        controller.stop();
+                        if (controller != null) controller.stop();
                         triggerServerAction(JellyfinServerService.ACTION_STOP);
                     } else {
                         MediaServiceManager.getInstance(this).stopService(svc.getId());
@@ -5984,11 +5750,9 @@ public final class FishbowlActivity extends AppCompatActivity
                         refreshHomeServicesBadge();
                     }, 500);
                 });
-                actionRow.addView(btnStop, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+                root.addView(UiKit.buttonRow(this, btnWeb, btnStop));
             } else {
-                Button btnStart = createOutlinePixelButton("START", Color.WHITE, Color.WHITE);
-                btnStart.setTextSize(10f);
-                btnStart.setOnClickListener(v -> {
+                Button btnStart = UiKit.primary(this, buttonLabel("START"), v -> {
                     d.dismiss();
                     if (isJellyfin) {
                         triggerServerAction(JellyfinServerService.ACTION_START);
@@ -6000,55 +5764,111 @@ public final class FishbowlActivity extends AppCompatActivity
                         refreshHomeServicesBadge();
                     }, 500);
                 });
-                actionRow.addView(btnStart, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+                root.addView(UiKit.buttonRow(this, btnStart));
             }
 
             if (!isJellyfin) {
-                View spBLog = new View(this);
-                actionRow.addView(spBLog, new LinearLayout.LayoutParams(dp(6), 1));
-
-                Button btnLogs = createOutlinePixelButton("LOGS", AppTheme.accent(), AppTheme.accent());
-                btnLogs.setTextSize(9.5f);
-                btnLogs.setOnClickListener(v -> {
+                Button btnLogs = UiKit.outline(this, buttonLabel("LOGS"), v -> {
                     d.dismiss();
                     showServiceLogsDialog(svc);
                 });
-                actionRow.addView(btnLogs, new LinearLayout.LayoutParams(0, dp(36), 0.9f));
-
-                View spB2 = new View(this);
-                actionRow.addView(spB2, new LinearLayout.LayoutParams(dp(6), 1));
-
-                Button btnUninst = createOutlinePixelButton("UNINSTALL", AppTheme.danger(), AppTheme.danger());
-                btnUninst.setTextSize(9.5f);
-                btnUninst.setOnClickListener(v -> {
+                Button btnUninst = UiKit.danger(this, buttonLabel("UNINSTALL"), v -> {
                     d.dismiss();
                     confirmUninstallService(svc);
                 });
-                actionRow.addView(btnUninst, new LinearLayout.LayoutParams(0, dp(36), 1.0f));
+                root.addView(UiKit.buttonRow(this, btnLogs, btnUninst));
             }
         }
 
-        View spB4 = new View(this);
-        actionRow.addView(spB4, new LinearLayout.LayoutParams(dp(6), 1));
-
-        Button btnClose = createOutlinePixelButton("CLOSE", AppTheme.outlineStrong(), AppTheme.textSecondary());
-        btnClose.setTextSize(10f);
-        btnClose.setOnClickListener(v -> d.dismiss());
-        actionRow.addView(btnClose, new LinearLayout.LayoutParams(-2, dp(36)));
-
-        root.addView(actionRow);
-
         d.setContentView(I18n.attach(scroll));
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
-            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
-            wlp.copyFrom(d.getWindow().getAttributes());
-            wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.94);
-            wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(wlp);
+        applyDialogWindow(d, 0.94f);
+        if (!safeShow(d)) return;
+
+        if (installed) {
+            final File instDir = new File(svc.getManifest().getInstallDir());
+            final File confDir = new File(svc.getManifest().getConfigDir());
+            runBg(() -> {
+                long total = calculateDirSize(instDir) + calculateDirSize(confDir);
+                runOnUiThread(() -> {
+                    if (d.isShowing()) sizeValue.setText(MediaStorageManager.formatBytes(total));
+                });
+            });
         }
-        d.show();
+    }
+
+    /** Section label inside a dialog sheet (UiKit overline with the 16dp section gap above). */
+    private TextView detailSectionLabel(String text) {
+        TextView t = UiKit.overline(this, text);
+        t.setPadding(0, dp(16), 0, dp(6));
+        return t;
+    }
+
+    /** Key / value line inside an inset box; returns the value view so it can be updated later. */
+    private TextView addDetailKv(LinearLayout parent, String key, String value, boolean mono) {
+        LinearLayout r = UiKit.row(this);
+        r.setPadding(0, dp(3), 0, dp(3));
+        r.addView(UiKit.caption(this, key), new LinearLayout.LayoutParams(0, -2, 1.0f));
+        TextView v = UiKit.text(this, value, 13f, AppTheme.text(), mono ? Typeface.MONOSPACE : UiKit.MEDIUM);
+        r.addView(v);
+        parent.addView(r);
+        return v;
+    }
+
+    /** One value (URL, key, login) with an optional small label pill and a copy button. */
+    private View detailCopyRow(String label, String value, boolean mono, final String copyLabel, final String copyValue) {
+        LinearLayout row = UiKit.row(this);
+        row.setPadding(0, dp(2), 0, dp(2));
+        if (label != null && !label.isEmpty()) {
+            TextView b = UiKit.text(this, label, 10.5f, AppTheme.onAccentContainer(), UiKit.BOLD);
+            b.setAllCaps(true);
+            b.setSingleLine(true);
+            b.setPadding(dp(8), dp(2), dp(8), dp(2));
+            b.setBackground(UiKit.shape(this, AppTheme.accentContainer(), 0, UiKit.R_PILL));
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+            blp.setMarginEnd(dp(8));
+            row.addView(b, blp);
+        }
+        TextView v = UiKit.text(this, value, mono ? 12.5f : 13f, AppTheme.text(), mono ? Typeface.MONOSPACE : null);
+        v.setSingleLine(true);
+        v.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        if (mono) v.setTextDirection(View.TEXT_DIRECTION_LTR);
+        row.addView(v, new LinearLayout.LayoutParams(0, -2, 1.0f));
+
+        ImageView copy = new ImageView(this);
+        copy.setImageResource(R.drawable.ic_copy);
+        copy.setColorFilter(AppTheme.textSecondary());
+        copy.setPadding(dp(9), dp(9), dp(9), dp(9));
+        copy.setBackground(UiKit.rowRipple(this));
+        copy.setContentDescription("Copy");
+        copy.setOnClickListener(x -> copyUrlToClipboard(copyLabel, copyValue));
+        row.addView(copy, new LinearLayout.LayoutParams(dp(36), dp(36)));
+        return row;
+    }
+
+    /** Compact "✕" icon button that dismisses {@code d}. */
+    private View dialogCloseButton(final Dialog d) {
+        TextView close = UiKit.text(this, "✕", 16f, AppTheme.textSecondary(), UiKit.MEDIUM);
+        close.setGravity(Gravity.CENTER);
+        close.setContentDescription("Close");
+        close.setClickable(true);
+        close.setFocusable(true);
+        close.setBackground(UiKit.rowRipple(this));
+        close.setOnClickListener(v -> d.dismiss());
+        close.setLayoutParams(new LinearLayout.LayoutParams(dp(36), dp(36)));
+        return close;
+    }
+
+    /** Transparent window (the content draws its own rounded card), themed dim, width fraction of the screen. */
+    private void applyDialogWindow(Dialog d, float widthFraction) {
+        Window w = d.getWindow();
+        if (w == null) return;
+        w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        w.setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
+        WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
+        wlp.copyFrom(w.getAttributes());
+        wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * widthFraction);
+        wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
+        w.setAttributes(wlp);
     }
 
     private void openServiceWeb(ManagedService svc) {
@@ -6098,10 +5918,9 @@ public final class FishbowlActivity extends AppCompatActivity
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         d.setCancelable(true);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(16), dp(16), dp(16));
-        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
         // Title row with "✕" close button
         LinearLayout titleRow = new LinearLayout(this);
@@ -6111,54 +5930,35 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout titleCol = new LinearLayout(this);
         titleCol.setOrientation(LinearLayout.VERTICAL);
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText((svc != null ? svc.getDisplayName() : "Service") + " Logs");
-        titleTv.setTextSize(14f);
-        titleTv.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        titleTv.setTextColor(AppTheme.text());
+        TextView titleTv = UiKit.singleLine(UiKit.title(this, (svc != null ? svc.getDisplayName() : "Service") + " " + buttonLabel("LOGS")));
         titleCol.addView(titleTv);
 
-        TextView subTv = new TextView(this);
-        subTv.setText("Errors, crashes & diagnostics");
-        subTv.setTextSize(10.5f);
-        subTv.setTextColor(AppTheme.textMuted());
+        TextView subTv = UiKit.caption(this, "Errors, crashes & diagnostics");
+        subTv.setPadding(0, dp(2), 0, 0);
         titleCol.addView(subTv);
 
         titleRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView closeBtn = new TextView(this);
-        closeBtn.setText("✕");
-        closeBtn.setTextSize(13f);
-        closeBtn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        closeBtn.setTextColor(AppTheme.textSecondary());
-        closeBtn.setGravity(Gravity.CENTER);
-        closeBtn.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(6)));
-        closeBtn.setClickable(true);
-        closeBtn.setFocusable(true);
-        closeBtn.setOnClickListener(v -> d.dismiss());
-        titleRow.addView(closeBtn, new LinearLayout.LayoutParams(dp(28), dp(28)));
+        titleRow.addView(dialogCloseButton(d));
 
         root.addView(titleRow);
 
         // Filter Toggle Bar: [ERRORS & CRASHES] (Active by default) | [ALL LOGS]
         LinearLayout toggleBar = new LinearLayout(this);
         toggleBar.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams tbLp = new LinearLayout.LayoutParams(-1, dp(30));
-        tbLp.topMargin = dp(10);
+        LinearLayout.LayoutParams tbLp = new LinearLayout.LayoutParams(-1, dp(36));
+        tbLp.topMargin = dp(14);
         tbLp.bottomMargin = dp(8);
         toggleBar.setLayoutParams(tbLp);
 
         Button btnErrors = createOutlinePixelButton("ERRORS & CRASHES", AppTheme.danger(), AppTheme.danger());
-        btnErrors.setTextSize(9f);
-        btnErrors.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        btnErrors.setTextSize(12f);
         toggleBar.addView(btnErrors, new LinearLayout.LayoutParams(0, -1, 1.0f));
 
         View toggleGap = new View(this);
         toggleBar.addView(toggleGap, new LinearLayout.LayoutParams(dp(8), 1));
 
         Button btnAllLogs = createOutlinePixelButton("ALL LOGS", AppTheme.outlineStrong(), AppTheme.textMuted());
-        btnAllLogs.setTextSize(9f);
-        btnAllLogs.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        btnAllLogs.setTextSize(12f);
         toggleBar.addView(btnAllLogs, new LinearLayout.LayoutParams(0, -1, 1.0f));
 
         root.addView(toggleBar);
@@ -6168,16 +5968,17 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setVerticalScrollBarEnabled(true);
         scroll.setHorizontalScrollBarEnabled(false);
         scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        scroll.setBackground(createRoundedDrawable(AppTheme.card(), dp(8)));
-        scroll.setPadding(dp(10), dp(10), dp(10), dp(10));
-        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(-1, dp(230));
+        scroll.setBackground(UiKit.shape(this, AppTheme.inner(), 0, UiKit.R_INNER));
+        scroll.setPadding(dp(12), dp(10), dp(12), dp(10));
+        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(-1, dp(260));
         scLp.bottomMargin = dp(12);
         scroll.setLayoutParams(scLp);
 
         TextView tvLogs = new TextView(this);
-        tvLogs.setTextSize(10f);
+        tvLogs.setTextSize(11f);
         tvLogs.setTypeface(Typeface.MONOSPACE);
         tvLogs.setTextIsSelectable(true);
+        tvLogs.setTextDirection(View.TEXT_DIRECTION_LTR);   // log lines stay left-to-right in the Arabic UI
         scroll.addView(tvLogs);
 
         root.addView(scroll);
@@ -6189,9 +5990,9 @@ public final class FishbowlActivity extends AppCompatActivity
         Runnable updateLogDisplay = () -> {
             if (isErrorViewHolder[0]) {
                 btnErrors.setTextColor(AppTheme.danger());
-                btnErrors.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.danger(), 30), AppTheme.danger(), dp(1), dp(6)));
+                btnErrors.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.danger(), 30), AppTheme.danger(), dp(1), dp(12)));
                 btnAllLogs.setTextColor(AppTheme.textMuted());
-                btnAllLogs.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(6)));
+                btnAllLogs.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(12)));
 
                 String errorLogs = svc != null ? svc.getErrorAndCrashLogs(200) : "";
                 if (errorLogs.trim().isEmpty()) {
@@ -6208,9 +6009,9 @@ public final class FishbowlActivity extends AppCompatActivity
                 }
             } else {
                 btnAllLogs.setTextColor(AppTheme.accent());
-                btnAllLogs.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.accent(), 30), AppTheme.accent(), dp(1), dp(6)));
+                btnAllLogs.setBackground(createBorderedRoundedDrawable(AppTheme.withAlpha(AppTheme.accent(), 30), AppTheme.accent(), dp(1), dp(12)));
                 btnErrors.setTextColor(AppTheme.textMuted());
-                btnErrors.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(6)));
+                btnErrors.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(12)));
 
                 String allLogs = svc != null ? svc.getRecentLogs(200) : "";
                 tvLogs.setTextColor(AppTheme.text());
@@ -6237,8 +6038,7 @@ public final class FishbowlActivity extends AppCompatActivity
         actionsRow.setGravity(Gravity.CENTER_VERTICAL);
 
         Button btnCopy = createOutlinePixelButton("COPY", AppTheme.outlineStrong(), Color.WHITE);
-        btnCopy.setTextSize(9f);
-        btnCopy.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        btnCopy.setTextSize(12f);
         btnCopy.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
@@ -6247,46 +6047,36 @@ public final class FishbowlActivity extends AppCompatActivity
                 Toast.makeText(this, I18n.tr("Copied logs to clipboard"), Toast.LENGTH_SHORT).show();
             }
         });
-        actionsRow.addView(btnCopy, new LinearLayout.LayoutParams(0, dp(34), 1.0f));
+        actionsRow.addView(btnCopy, new LinearLayout.LayoutParams(0, dp(40), 1.0f));
 
         View aGap1 = new View(this);
         actionsRow.addView(aGap1, new LinearLayout.LayoutParams(dp(6), 1));
 
         Button btnExportTxt = createOutlinePixelButton("EXPORT .TXT", AppTheme.accent(), AppTheme.accent());
-        btnExportTxt.setTextSize(9f);
-        btnExportTxt.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        btnExportTxt.setTextSize(12f);
         btnExportTxt.setOnClickListener(v -> {
             String fullReport = generateDiagnosticReport(svc);
             exportReportAsTxtFile(fullReport, svc != null ? svc.getId() : "system");
         });
-        actionsRow.addView(btnExportTxt, new LinearLayout.LayoutParams(0, dp(34), 1.3f));
+        actionsRow.addView(btnExportTxt, new LinearLayout.LayoutParams(0, dp(40), 1.3f));
 
         View aGap2 = new View(this);
         actionsRow.addView(aGap2, new LinearLayout.LayoutParams(dp(6), 1));
 
         Button btnReport = createOutlinePixelButton("REPORT ISSUE", AppTheme.warning(), AppTheme.warning());
-        btnReport.setTextSize(9f);
-        btnReport.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        btnReport.setTextSize(12f);
         btnReport.setOnClickListener(v -> {
             String fullReport = generateDiagnosticReport(svc);
             String svcName = svc != null ? svc.getDisplayName() : "Service";
             com.fishbowl.app.diagnostics.BugReportHelper.openBugReportFlow(this, "[" + svcName + "] Issue Report", fullReport);
         });
-        actionsRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(34), 1.4f));
+        actionsRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(40), 1.4f));
 
         root.addView(actionsRow);
 
         d.setContentView(I18n.attach(root));
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
-            lp.copyFrom(d.getWindow().getAttributes());
-            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.94);
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(lp);
-        }
-        d.show();
+        applyDialogWindow(d, 0.94f);
+        safeShow(d);
     }
 
     private void exportReportAsTxtFile(String reportText, String serviceName) {
@@ -6531,31 +6321,49 @@ public final class FishbowlActivity extends AppCompatActivity
     private boolean firstRunFlowShowing = false;
     private long lastUnifiedAutoApply = 0;
 
+    /** True while runUnifiedApply() is pushing the account to the services (UI thread state). */
+    private boolean unifiedApplyRunning = false;
+    private boolean unifiedApplyForced = false;
+    private boolean unifiedApplyRerun = false;
+    private boolean unifiedApplyRerunAnnounce = false;
+    /** Services that already reported a result during the current apply. */
+    private final Set<String> unifiedReportedThisRun = new HashSet<>();
+
     /** Called from onResume: first-run restore + account dialogs, then silent apply of pending services. */
     private void maybeRunFirstRunFlow() {
         try {
-            if (isFinishing()) return;
+            if (!isUiAlive()) return;
             if (!UnifiedAccount.isFirstRunDone(this) && !firstRunFlowShowing) {
                 if (UnifiedAccount.isConfigured(this)) {
                     UnifiedAccount.setFirstRunDone(this);
                 } else {
                     firstRunFlowShowing = true;
-                    android.content.SharedPreferences sp = getSharedPreferences("fishbowl", MODE_PRIVATE);
-                    List<File> backups = new ArrayList<>();
-                    try {
-                        List<File> found = BackupRestoreManager.listExistingBackups(this);
-                        if (found != null) backups.addAll(found);
-                    } catch (Throwable ignored) {}
-                    java.util.Collections.sort(backups, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
-                    if (!sp.getBoolean("first_run_restore_prompted", false) && !backups.isEmpty()) {
-                        showFirstRunRestoreDialog(backups.get(0));
-                    } else {
-                        showUnifiedAccountDialog(true);
-                    }
+                    final boolean restorePrompted = getSharedPreferences("fishbowl", MODE_PRIVATE)
+                            .getBoolean("first_run_restore_prompted", false);
+                    // Backup discovery scans storage: keep it off the UI thread.
+                    runBg(() -> {
+                        List<File> backups = new ArrayList<>();
+                        if (!restorePrompted) {
+                            try {
+                                List<File> found = BackupRestoreManager.listExistingBackups(getApplicationContext());
+                                if (found != null) backups.addAll(found);
+                            } catch (Throwable ignored) {}
+                            java.util.Collections.sort(backups, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+                        }
+                        final File newest = backups.isEmpty() ? null : backups.get(0);
+                        runOnUiThread(() -> {
+                            if (!isUiAlive()) {
+                                firstRunFlowShowing = false;
+                                return;
+                            }
+                            if (newest != null) showFirstRunRestoreDialog(newest);
+                            else showUnifiedAccountDialog(true);
+                        });
+                    });
                 }
                 return;
             }
-            if (UnifiedAccount.hasPending(this) && !firstRunFlowShowing
+            if (UnifiedAccount.hasDue(this) && !firstRunFlowShowing
                     && System.currentTimeMillis() - lastUnifiedAutoApply > 45000L) {
                 lastUnifiedAutoApply = System.currentTimeMillis();
                 runUnifiedApply(false, false);
@@ -6570,138 +6378,97 @@ public final class FishbowlActivity extends AppCompatActivity
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         d.setCancelable(false);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout root = UiKit.column(this);
         root.setPadding(dp(20), dp(20), dp(20), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(16)));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        TextView title = new TextView(this);
-        title.setText(I18n.tr("RESTORE A BACKUP?"));
-        title.setTextSize(15f);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(AppTheme.text());
-        root.addView(title);
+        root.addView(UiKit.title(this, buttonLabel("RESTORE A BACKUP?")));
 
-        TextView sub = new TextView(this);
-        sub.setText(I18n.tr("A Jellyarr backup was found on this phone. Restore it to bring back your settings, accounts and library."));
-        sub.setTextSize(12.5f);
-        sub.setTextColor(AppTheme.textSecondary());
-        sub.setPadding(0, dp(8), 0, dp(10));
+        TextView sub = UiKit.body(this, I18n.tr("A Jellyarr backup was found on this phone. Restore it to bring back your settings, accounts and library."));
+        sub.setPadding(0, dp(6), 0, dp(12));
         root.addView(sub);
 
-        TextView file = new TextView(this);
-        file.setText(backup.getName() + "\n" + android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", backup.lastModified())
+        LinearLayout fileBox = UiKit.inset(this);
+        TextView file = UiKit.mono(this, backup.getName());
+        file.setTextDirection(View.TEXT_DIRECTION_LTR);
+        fileBox.addView(file);
+        TextView meta = UiKit.caption(this, android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", backup.lastModified())
                 + "  •  " + android.text.format.Formatter.formatShortFileSize(this, backup.length()));
-        file.setTextSize(11.5f);
-        file.setTypeface(Typeface.MONOSPACE);
-        file.setTextColor(AppTheme.text());
-        file.setPadding(dp(12), dp(10), dp(12), dp(10));
-        file.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
-        root.addView(file);
+        meta.setPadding(0, dp(4), 0, 0);
+        fileBox.addView(meta);
+        root.addView(fileBox);
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(-1, -2);
-        rowLp.topMargin = dp(16);
-        row.setLayoutParams(rowLp);
-
-        Button skip = createOutlinePixelButton(I18n.tr("SKIP"), AppTheme.outlineStrong(), AppTheme.textSecondary());
-        skip.setOnClickListener(v -> {
+        Button skip = UiKit.outline(this, buttonLabel("SKIP"), v -> {
             getSharedPreferences("fishbowl", MODE_PRIVATE).edit().putBoolean("first_run_restore_prompted", true).apply();
             d.dismiss();
             showUnifiedAccountDialog(true);
         });
-        LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, dp(44), 1f);
-        l1.setMarginEnd(dp(8));
-        row.addView(skip, l1);
-
-        Button restore = createPixelButton(I18n.tr("RESTORE"), AppTheme.accent(), AppTheme.onAccent());
-        restore.setOnClickListener(v -> {
+        Button restore = UiKit.primary(this, buttonLabel("RESTORE"), v -> {
             getSharedPreferences("fishbowl", MODE_PRIVATE).edit().putBoolean("first_run_restore_prompted", true).apply();
             firstRunFlowShowing = false;
             d.dismiss();
             confirmAndRestoreFromFile(backup);
         });
-        row.addView(restore, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        LinearLayout row = UiKit.buttonRow(this, skip, restore);
+        ((LinearLayout.LayoutParams) row.getLayoutParams()).topMargin = dp(18);
         root.addView(row);
 
         d.setContentView(I18n.attach(root));
         styleDialogWindow(d);
-        d.show();
+        if (!safeShow(d)) firstRunFlowShowing = false;
     }
 
     private void styleDialogWindow(Dialog d) {
-        try {
-            Window w = d.getWindow();
-            if (w != null) {
-                w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
-                w.setLayout((int) (getResources().getDisplayMetrics().widthPixels * 0.92f), ViewGroup.LayoutParams.WRAP_CONTENT);
-            }
-        } catch (Throwable ignored) {}
+        applyDialogWindow(d, 0.92f);
     }
 
     private EditText accountInput(String hint, boolean password) {
-        EditText e = new EditText(this);
-        e.setHint(I18n.tr(hint));
-        e.setSingleLine(true);
-        e.setTextSize(14f);
-        e.setTextColor(AppTheme.text());
-        e.setHintTextColor(AppTheme.textMuted());
-        e.setPadding(dp(14), dp(10), dp(14), dp(10));
-        e.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
+        EditText e = UiKit.input(this, I18n.tr(hint));
         e.setInputType(password
                 ? (android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD)
                 : (android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
                 | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS));
+        // the field keeps the UI font; password variation would otherwise switch it to monospace
+        e.setTypeface(Typeface.DEFAULT);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(8);
+        lp.topMargin = dp(10);
         e.setLayoutParams(lp);
         return e;
     }
 
     /** Sign in / create account dialog. firstRun = true shows SKIP FOR NOW instead of CANCEL. */
     private void showUnifiedAccountDialog(final boolean firstRun) {
+        if (!isUiAlive()) {
+            if (firstRun) firstRunFlowShowing = false;
+            return;
+        }
         final Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         d.setCancelable(!firstRun);
 
         ScrollView sv = new ScrollView(this);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
+        sv.setVerticalScrollBarEnabled(false);
+        LinearLayout root = UiKit.column(this);
         root.setPadding(dp(20), dp(20), dp(20), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(16)));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
         sv.addView(root);
 
-        TextView title = new TextView(this);
-        title.setText(I18n.tr("ONE ACCOUNT FOR ALL SERVICES"));
-        title.setTextSize(15f);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(AppTheme.text());
-        root.addView(title);
+        root.addView(UiKit.title(this, buttonLabel("ONE ACCOUNT FOR ALL SERVICES")));
 
-        TextView sub = new TextView(this);
-        sub.setText(I18n.tr("The same username and password will be used for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission."));
-        sub.setTextSize(12f);
-        sub.setTextColor(AppTheme.textSecondary());
-        sub.setPadding(0, dp(6), 0, dp(10));
+        TextView sub = UiKit.body(this, I18n.tr("The same username and password will be used for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission."));
+        sub.setPadding(0, dp(6), 0, dp(14));
         root.addView(sub);
 
+        // Segmented choice: create a new account / sign in with an existing Jellyfin user
         final boolean[] createMode = {true};
-        LinearLayout modes = new LinearLayout(this);
-        modes.setOrientation(LinearLayout.HORIZONTAL);
-        final TextView tCreate = new TextView(this);
-        final TextView tSign = new TextView(this);
-        TextView[] pills = {tCreate, tSign};
-        String[] names = {"CREATE ACCOUNT", "SIGN IN"};
+        LinearLayout modes = UiKit.row(this);
+        final TextView tCreate = UiKit.chip(this, buttonLabel("CREATE ACCOUNT"), true);
+        final TextView tSign = UiKit.chip(this, buttonLabel("SIGN IN"), false);
+        final TextView[] pills = {tCreate, tSign};
         for (int i = 0; i < 2; i++) {
-            TextView t = pills[i];
-            t.setText(I18n.tr(names[i]));
-            t.setGravity(Gravity.CENTER);
-            t.setTextSize(11f);
-            t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(38), 1f);
-            if (i == 0) lp.setMarginEnd(dp(6));
-            modes.addView(t, lp);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1f);
+            if (i == 1) lp.setMarginStart(dp(8));
+            modes.addView(pills[i], lp);
         }
         root.addView(modes);
 
@@ -6714,20 +6481,14 @@ public final class FishbowlActivity extends AppCompatActivity
         root.addView(pass);
         root.addView(confirm);
 
-        final TextView err = new TextView(this);
-        err.setTextSize(11.5f);
+        final TextView err = UiKit.caption(this, "");
         err.setTextColor(AppTheme.danger());
-        err.setPadding(0, dp(8), 0, 0);
+        err.setPadding(dp(2), dp(8), dp(2), 0);
         err.setVisibility(View.GONE);
         root.addView(err);
 
         final Runnable paint = () -> {
-            for (int i = 0; i < 2; i++) {
-                boolean sel = (i == 0) == createMode[0];
-                pills[i].setTextColor(sel ? AppTheme.onAccent() : AppTheme.textSecondary());
-                pills[i].setBackground(createBorderedRoundedDrawable(
-                        sel ? AppTheme.accent() : AppTheme.inner(), AppTheme.outline(), dp(1), dp(10)));
-            }
+            for (int i = 0; i < 2; i++) UiKit.styleChip(this, pills[i], (i == 0) == createMode[0]);
             confirm.setVisibility(createMode[0] ? View.VISIBLE : View.GONE);
             err.setVisibility(View.GONE);
         };
@@ -6735,264 +6496,302 @@ public final class FishbowlActivity extends AppCompatActivity
         tSign.setOnClickListener(v -> { createMode[0] = false; paint.run(); });
         paint.run();
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(-1, -2);
-        rowLp.topMargin = dp(16);
-        row.setLayoutParams(rowLp);
-
-        Button later = createOutlinePixelButton(I18n.tr(firstRun ? "SKIP FOR NOW" : "CANCEL"),
-                AppTheme.outlineStrong(), AppTheme.textSecondary());
-        later.setOnClickListener(v -> {
+        final Button later = UiKit.outline(this, buttonLabel(firstRun ? "SKIP FOR NOW" : "CANCEL"), v -> {
             if (firstRun) UnifiedAccount.setFirstRunDone(this);
             firstRunFlowShowing = false;
             d.dismiss();
         });
-        LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, dp(44), 1f);
-        l1.setMarginEnd(dp(8));
-        row.addView(later, l1);
-
-        Button go = createPixelButton(I18n.tr("CONTINUE"), AppTheme.accent(), AppTheme.onAccent());
+        final Button go = UiKit.primary(this, buttonLabel("CONTINUE"), null);
         go.setOnClickListener(v -> {
-            String u = user.getText().toString().trim();
-            String p = pass.getText().toString();
+            final String u = user.getText().toString().trim();
+            final String p = pass.getText().toString();
             String problem = UnifiedAccount.validate(u, p);
             if (problem == null && createMode[0] && !p.equals(confirm.getText().toString())) {
                 problem = "Passwords do not match";
-            }
-            if (problem == null && !createMode[0]) {
-                if (!UnifiedAccount.jellyfinHasUser(this, u)) {
-                    problem = "No account with this name was found on this phone. Choose CREATE ACCOUNT.";
-                } else if (!UnifiedAccount.verifyAgainstJellyfin(this, u, p)) {
-                    problem = "Wrong password for this account";
-                }
             }
             if (problem != null) {
                 err.setText(I18n.tr(problem));
                 err.setVisibility(View.VISIBLE);
                 return;
             }
-            UnifiedAccount.save(this, u, p);
-            UnifiedAccount.setFirstRunDone(this);
-            firstRunFlowShowing = false;
-            d.dismiss();
-            Toast.makeText(this, I18n.tr("Applying the account to all services..."), Toast.LENGTH_LONG).show();
-            lastUnifiedAutoApply = System.currentTimeMillis();
-            runUnifiedApply(true, true);
-            renderUnifiedAccountBody();
+            final boolean signIn = !createMode[0];
+            go.setEnabled(false);
+            later.setEnabled(false);
+            go.setText(I18n.tr("Checking..."));
+            // Sign-in reads jellyfin.db and verifies a PBKDF2 hash: never on the UI thread.
+            runBg(() -> {
+                String bgProblem = null;
+                if (signIn) {
+                    if (!UnifiedAccount.jellyfinHasUser(getApplicationContext(), u)) {
+                        bgProblem = "No account with this name was found on this phone. Choose CREATE ACCOUNT.";
+                    } else if (!UnifiedAccount.verifyAgainstJellyfin(getApplicationContext(), u, p)) {
+                        bgProblem = "Wrong password for this account";
+                    }
+                }
+                final String result = bgProblem;
+                runOnUiThread(() -> {
+                    if (!isUiAlive()) return;
+                    go.setEnabled(true);
+                    later.setEnabled(true);
+                    go.setText(buttonLabel("CONTINUE"));
+                    if (result != null) {
+                        err.setText(I18n.tr(result));
+                        err.setVisibility(View.VISIBLE);
+                        return;
+                    }
+                    UnifiedAccount.save(this, u, p);
+                    UnifiedAccount.setFirstRunDone(this);
+                    firstRunFlowShowing = false;
+                    d.dismiss();
+                    lastUnifiedAutoApply = System.currentTimeMillis();
+                    runUnifiedApply(true, true);
+                });
+            });
         });
-        row.addView(go, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        LinearLayout row = UiKit.buttonRow(this, later, go);
+        ((LinearLayout.LayoutParams) row.getLayoutParams()).topMargin = dp(18);
         root.addView(row);
 
         d.setContentView(I18n.attach(sv));
         styleDialogWindow(d);
-        d.show();
+        if (!safeShow(d) && firstRun) firstRunFlowShowing = false;
     }
 
-    /** Pushes the account to every service on a background thread; force = also re-apply services already OK. */
+    /**
+     * Pushes the account to every service on a background thread; force = also re-apply services already OK.
+     * Only one apply runs at a time; a forced request that arrives meanwhile (new password) runs right after.
+     */
     private void runUnifiedApply(final boolean force, final boolean announce) {
-        bgExecutor.execute(() -> {
-            UnifiedAccount.applyAll(this, force, (id, st, msg) -> runOnUiThread(this::renderUnifiedAccountBody));
+        if (!UnifiedAccount.isConfigured(this)) {
+            renderUnifiedAccountBody();
+            return;
+        }
+        if (unifiedApplyRunning) {
+            if (force) {
+                unifiedApplyRerun = true;
+                unifiedApplyRerunAnnounce |= announce;
+            }
+            return;
+        }
+        unifiedApplyRunning = true;
+        unifiedApplyForced = force;
+        unifiedReportedThisRun.clear();
+        renderUnifiedAccountBody();
+        if (announce && isUiAlive()) {
+            Toast.makeText(this, I18n.tr("Applying the account to all services..."), Toast.LENGTH_SHORT).show();
+        }
+        final Context app = getApplicationContext();
+        runBg(() -> {
+            try {
+                UnifiedAccount.applyAll(app, force, (id, st, msg) -> runOnUiThread(() -> {
+                    unifiedReportedThisRun.add(id);
+                    renderUnifiedAccountBody();
+                }));
+            } catch (Throwable t) {
+                Log.w(TAG, "unified apply: " + t.getMessage());
+            }
             runOnUiThread(() -> {
+                unifiedApplyRunning = false;
                 renderUnifiedAccountBody();
-                if (announce) {
+                if (announce && isUiAlive()) {
                     int ok = 0;
-                    for (String s : UnifiedAccount.SERVICES) if ("ok".equals(UnifiedAccount.getStatus(this, s))) ok++;
+                    for (String s : UnifiedAccount.SERVICES) if ("ok".equals(UnifiedAccount.getStatus(app, s))) ok++;
                     Toast.makeText(this, ok + " / " + UnifiedAccount.SERVICES.length + " " + I18n.tr("services updated"),
                             Toast.LENGTH_LONG).show();
+                }
+                if (unifiedApplyRerun && isUiAlive()) {
+                    boolean again = unifiedApplyRerunAnnounce;
+                    unifiedApplyRerun = false;
+                    unifiedApplyRerunAnnounce = false;
+                    runUnifiedApply(true, again);
                 }
             });
         });
     }
 
     private View buildUnifiedAccountCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(2), dp(2), dp(2), dp(10));
+        LinearLayout card = UiKit.column(this);
+        card.setPadding(0, 0, 0, dp(16));
 
         TextView t = new TextView(this);
         t.setText("UNIFIED ACCOUNT");
         styleSectionLabel(t);
-        t.setPadding(0, dp(2), 0, dp(6));
+        t.setPadding(0, dp(2), 0, dp(10));
         card.addView(t);
 
-        unifiedAccountBody = new LinearLayout(this);
-        unifiedAccountBody.setOrientation(LinearLayout.VERTICAL);
+        unifiedAccountBody = UiKit.column(this);
         card.addView(unifiedAccountBody);
         renderUnifiedAccountBody();
         return card;
     }
 
+    /**
+     * Header ("Signed in as ..." + what is kept in sync), then one row per service: name and status badge
+     * on one line, the error (if any) as a full-width selectable caption below. Buttons are disabled and a
+     * progress line is shown while an apply runs.
+     */
     private void renderUnifiedAccountBody() {
         if (unifiedAccountBody == null) return;
         unifiedAccountBody.removeAllViews();
         boolean configured = UnifiedAccount.isConfigured(this);
+        boolean busy = unifiedApplyRunning;
 
-        TextView who = new TextView(this);
-        who.setTextSize(13f);
-        who.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        who.setTextColor(configured ? AppTheme.text() : AppTheme.textMuted());
-        who.setText(configured
-                ? I18n.tr("Signed in as") + " " + UnifiedAccount.getUsername(this)
-                : I18n.tr("No unified account yet. One username and password for all services."));
-        who.setPadding(0, 0, 0, dp(8));
+        if (!configured) {
+            TextView none = UiKit.body(this, I18n.tr("No unified account yet. One username and password for all services."));
+            unifiedAccountBody.addView(none);
+            unifiedAccountBody.addView(UiKit.buttonRow(this,
+                    UiKit.primary(this, buttonLabel("SIGN IN / CREATE"), v -> showUnifiedAccountDialog(false))));
+            return;
+        }
+
+        TextView who = UiKit.subtitle(this, I18n.tr("Signed in as") + " " + UnifiedAccount.getUsername(this));
+        who.setTypeface(UiKit.BOLD);
         unifiedAccountBody.addView(who);
 
-        if (configured) {
-            String[] labels = {"Jellyfin", "Sonarr", "Radarr", "Prowlarr", "Transmission"};
-            for (int i = 0; i < labels.length; i++) {
-                String id = UnifiedAccount.SERVICES[i];
-                String st = UnifiedAccount.getStatus(this, id);
-                int color = "ok".equals(st) ? AppTheme.success() : "failed".equals(st) ? AppTheme.danger() : AppTheme.warning();
-                String text = "ok".equals(st) ? I18n.tr("Applied") : "failed".equals(st) ? I18n.tr("Failed") : I18n.tr("Pending");
-                String msg = UnifiedAccount.getMessage(this, id);
-                LinearLayout r = new LinearLayout(this);
-                r.setOrientation(LinearLayout.HORIZONTAL);
-                r.setGravity(Gravity.CENTER_VERTICAL);
-                r.setPadding(0, dp(4), 0, dp(4));
-                TextView dot = new TextView(this);
-                dot.setText("●");
-                dot.setTextSize(10f);
-                dot.setTextColor(color);
-                dot.setPadding(0, 0, dp(8), 0);
-                r.addView(dot);
-                TextView name = new TextView(this);
-                name.setText(labels[i]);
-                name.setTextSize(12.5f);
-                name.setTextColor(AppTheme.text());
-                r.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
-                TextView state = new TextView(this);
-                state.setText(text + (msg.isEmpty() || "ok".equals(st) ? "" : " — " + I18n.tr(msg)));
-                state.setTextSize(11f);
-                state.setTextColor(color);
-                state.setGravity(Gravity.END);
-                r.addView(state, new LinearLayout.LayoutParams(0, -2, 1.6f));
-                unifiedAccountBody.addView(r);
+        TextView explain = UiKit.caption(this, I18n.tr("This account is kept in sync for Jellyfin, Sonarr, Radarr, Prowlarr and Transmission."));
+        explain.setPadding(0, dp(4), 0, dp(10));
+        unifiedAccountBody.addView(explain);
+
+        if (busy) {
+            LinearLayout prog = UiKit.row(this);
+            prog.setPadding(0, 0, 0, dp(10));
+            ProgressBar pb = new ProgressBar(this);
+            pb.setIndeterminate(true);
+            pb.setIndeterminateTintList(ColorStateList.valueOf(AppTheme.accent()));
+            LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(dp(16), dp(16));
+            pbLp.setMarginEnd(dp(8));
+            prog.addView(pb, pbLp);
+            TextView syncing = UiKit.text(this, I18n.tr("Syncing…"), 12.5f, AppTheme.accent(), UiKit.MEDIUM);
+            prog.addView(syncing);
+            unifiedAccountBody.addView(prog);
+        }
+
+        LinearLayout list = UiKit.inset(this);
+        String[] labels = {"Jellyfin", "Sonarr", "Radarr", "Prowlarr", "Transmission"};
+        for (int i = 0; i < labels.length && i < UnifiedAccount.SERVICES.length; i++) {
+            String id = UnifiedAccount.SERVICES[i];
+            String st = UnifiedAccount.getStatus(this, id);
+            String msg = UnifiedAccount.getMessage(this, id);
+            boolean syncingRow = busy && !unifiedReportedThisRun.contains(id) && (unifiedApplyForced || !"ok".equals(st));
+
+            int color;
+            String text;
+            if (syncingRow) {
+                color = AppTheme.accent();
+                text = I18n.tr("Syncing…");
+            } else if ("ok".equals(st)) {
+                color = AppTheme.success();
+                text = I18n.tr("Applied");
+            } else if ("failed".equals(st)) {
+                color = AppTheme.danger();
+                text = I18n.tr("Failed");
+            } else {
+                color = AppTheme.warning();
+                text = I18n.tr("Pending");
+            }
+
+            if (i > 0) {
+                View div = UiKit.divider(this);
+                ((LinearLayout.LayoutParams) div.getLayoutParams()).topMargin = dp(6);
+                ((LinearLayout.LayoutParams) div.getLayoutParams()).bottomMargin = dp(6);
+                list.addView(div);
+            }
+
+            LinearLayout r = UiKit.row(this);
+            r.setPadding(0, dp(2), 0, dp(2));
+            TextView name = UiKit.singleLine(UiKit.subtitle(this, labels[i]));
+            r.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
+            r.addView(UiKit.badge(this, text, color));
+            list.addView(r);
+
+            if (!syncingRow && msg != null && !msg.isEmpty() && !"ok".equals(st)) {
+                TextView detail = UiKit.caption(this, I18n.tr(msg));
+                detail.setTextColor("failed".equals(st) ? AppTheme.danger() : AppTheme.textMuted());
+                detail.setTextIsSelectable(true);
+                detail.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+                detail.setPadding(0, dp(4), 0, dp(2));
+                list.addView(detail, new LinearLayout.LayoutParams(-1, -2));
             }
         }
+        unifiedAccountBody.addView(list);
 
-        LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-1, -2);
-        alp.topMargin = dp(10);
-        actions.setLayoutParams(alp);
-
-        Button edit = createPixelButton(I18n.tr(configured ? "CHANGE" : "SIGN IN / CREATE"), AppTheme.accent(), AppTheme.onAccent());
-        edit.setTextSize(10.5f);
-        edit.setOnClickListener(v -> showUnifiedAccountDialog(false));
-        LinearLayout.LayoutParams e1 = new LinearLayout.LayoutParams(0, dp(40), 1f);
-        actions.addView(edit, e1);
-
-        if (configured) {
-            Button apply = createOutlinePixelButton(I18n.tr("APPLY NOW"), AppTheme.outlineStrong(), AppTheme.text());
-            apply.setTextSize(10.5f);
-            apply.setOnClickListener(v -> {
-                Toast.makeText(this, I18n.tr("Applying the account to all services..."), Toast.LENGTH_SHORT).show();
-                runUnifiedApply(true, true);
-            });
-            LinearLayout.LayoutParams e2 = new LinearLayout.LayoutParams(0, dp(40), 1f);
-            e2.setMarginStart(dp(8));
-            actions.addView(apply, e2);
-
-            Button forget = createOutlinePixelButton(I18n.tr("FORGET"), AppTheme.danger(), AppTheme.danger());
-            forget.setTextSize(10.5f);
-            forget.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
-                    .setTitle(I18n.tr("Forget the saved account?"))
-                    .setMessage(I18n.tr("Only the copy stored in this app is removed. Sonarr, Radarr, Prowlarr and Jellyfin keep their current login; Transmission stops requiring a login the next time it starts."))
-                    .setPositiveButton(I18n.tr("FORGET"), (dd, w) -> {
-                        UnifiedAccount.clear(this);
-                        renderUnifiedAccountBody();
-                    })
-                    .setNegativeButton(I18n.tr("CANCEL"), null)
-                    .show());
-            LinearLayout.LayoutParams e3 = new LinearLayout.LayoutParams(0, dp(40), 1f);
-            e3.setMarginStart(dp(8));
-            actions.addView(forget, e3);
+        Button edit = UiKit.primary(this, buttonLabel("CHANGE"), v -> showUnifiedAccountDialog(false));
+        Button apply = UiKit.outline(this, busy ? I18n.tr("Syncing…") : buttonLabel("APPLY NOW"), v -> runUnifiedApply(true, true));
+        Button forget = UiKit.danger(this, buttonLabel("FORGET"), v -> confirmForgetUnifiedAccount());
+        for (Button b : new Button[]{edit, apply, forget}) {
+            b.setEnabled(!busy);
+            b.setAlpha(busy ? 0.5f : 1f);
         }
-        unifiedAccountBody.addView(actions);
+        unifiedAccountBody.addView(UiKit.buttonRow(this, edit, apply, forget));
+    }
+
+    private void confirmForgetUnifiedAccount() {
+        TextView msg = UiKit.body(this, I18n.tr("Only the copy stored in this app is removed. Sonarr, Radarr, Prowlarr and Jellyfin keep their current login; Transmission stops requiring a login the next time it starts."));
+        showOledDialog(I18n.tr("Forget the saved account?"), null, msg, "FORGET", AppTheme.danger(), () -> {
+            UnifiedAccount.clear(this);
+            renderUnifiedAccountBody();
+            refreshSecurityUsersUI();
+        }, "CANCEL", null);
     }
 
     private Dialog showOledDialog(String title, String subtitle, View contentView, String posText, int posColor, Runnable onPos, String negText, Runnable onNeg) {
         Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(20), dp(20), dp(16));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText(title);
-        titleTv.setTextSize(14f);
-        titleTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        titleTv.setTextColor(AppTheme.text());
+        TextView titleTv = UiKit.title(this, title);
         root.addView(titleTv);
 
         if (subtitle != null && !subtitle.isEmpty()) {
-            TextView subTv = new TextView(this);
-            subTv.setText(subtitle);
-            subTv.setTextSize(10.5f);
-            subTv.setTypeface(Typeface.MONOSPACE);
-            subTv.setTextColor(AppTheme.textSecondary());
-            subTv.setPadding(0, dp(2), 0, 0);
+            TextView subTv = UiKit.caption(this, subtitle);
+            subTv.setPadding(0, dp(4), 0, 0);
             root.addView(subTv);
         }
 
-        View div = new View(this);
-        div.setBackgroundColor(AppTheme.inner());
-        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(-1, dp(1));
-        divLp.topMargin = dp(10);
-        divLp.bottomMargin = dp(10);
-        root.addView(div, divLp);
-
         if (contentView != null) {
-            root.addView(contentView);
+            ViewGroup.LayoutParams given = contentView.getLayoutParams();
+            LinearLayout.LayoutParams clp = given instanceof LinearLayout.LayoutParams
+                    ? (LinearLayout.LayoutParams) given
+                    : given != null ? new LinearLayout.LayoutParams(given) : new LinearLayout.LayoutParams(-1, -2);
+            clp.topMargin = Math.max(clp.topMargin, dp(14));
+            root.addView(contentView, clp);
         }
 
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setGravity(Gravity.END);
+        // Actions aligned to the end: secondary (outlined) then primary (filled in the requested colour)
+        LinearLayout btnRow = UiKit.row(this);
+        btnRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams btnRowLp = new LinearLayout.LayoutParams(-1, -2);
-        btnRowLp.topMargin = dp(14);
+        btnRowLp.topMargin = dp(18);
         btnRow.setLayoutParams(btnRowLp);
 
         if (negText != null) {
-            Button btnNeg = createOutlinePixelButton(negText, AppTheme.outlineStrong(), AppTheme.textSecondary());
-            btnNeg.setTextSize(10f);
-            btnNeg.setOnClickListener(v -> {
+            Button btnNeg = UiKit.outline(this, buttonLabel(negText), v -> {
                 d.dismiss();
                 if (onNeg != null) onNeg.run();
             });
-            btnRow.addView(btnNeg, new LinearLayout.LayoutParams(-2, dp(34)));
+            btnNeg.setTextSize(13f);
+            btnRow.addView(btnNeg, new LinearLayout.LayoutParams(-2, dp(40)));
         }
 
         if (posText != null) {
-            if (negText != null) {
-                View sp = new View(this);
-                btnRow.addView(sp, new LinearLayout.LayoutParams(dp(8), 1));
-            }
-            Button btnPos = createOutlinePixelButton(posText, posColor, posColor);
-            btnPos.setTextSize(10f);
-            btnPos.setOnClickListener(v -> {
+            int fill = posColor == 0 ? AppTheme.accent() : posColor;
+            Button btnPos = UiKit.button(this, buttonLabel(posText), fill, AppTheme.contrastOn(fill), 0, v -> {
                 d.dismiss();
                 if (onPos != null) onPos.run();
             });
-            btnRow.addView(btnPos, new LinearLayout.LayoutParams(-2, dp(34)));
+            btnPos.setTextSize(13f);
+            LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-2, dp(40));
+            if (negText != null) plp.setMarginStart(dp(8));
+            btnRow.addView(btnPos, plp);
         }
 
-        root.addView(btnRow);
+        if (negText != null || posText != null) root.addView(btnRow);
         d.setContentView(I18n.attach(root));
-
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
-            lp.copyFrom(d.getWindow().getAttributes());
-            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(lp);
-        }
-        d.show();
+        applyDialogWindow(d, 0.90f);
+        safeShow(d);
         return d;
     }
 
@@ -7124,84 +6923,55 @@ public final class FishbowlActivity extends AppCompatActivity
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         d.setCancelable(false);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        LinearLayout titleRow = new LinearLayout(this);
-        titleRow.setOrientation(LinearLayout.HORIZONTAL);
-        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout titleRow = UiKit.row(this);
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText(title);
-        titleTv.setTextSize(13.5f);
-        titleTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        titleTv.setTextColor(AppTheme.text());
+        TextView titleTv = UiKit.title(this, title);
         titleRow.addView(titleTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         TextView cancelBtn = null;
         if (cancellable) {
-            cancelBtn = new TextView(this);
-            cancelBtn.setText("✕");
-            cancelBtn.setTextSize(13f);
-            cancelBtn.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-            cancelBtn.setTextColor(AppTheme.textSecondary());
+            cancelBtn = UiKit.text(this, "✕", 16f, AppTheme.textSecondary(), UiKit.MEDIUM);
             cancelBtn.setGravity(Gravity.CENTER);
-            cancelBtn.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(6)));
+            cancelBtn.setContentDescription("Cancel");
+            cancelBtn.setBackground(UiKit.rowRipple(this));
             cancelBtn.setClickable(true);
             cancelBtn.setFocusable(true);
-            titleRow.addView(cancelBtn, new LinearLayout.LayoutParams(dp(28), dp(28)));
+            titleRow.addView(cancelBtn, new LinearLayout.LayoutParams(dp(36), dp(36)));
         }
         root.addView(titleRow);
 
-        TextView msgTv = new TextView(this);
-        msgTv.setText(initialMessage);
-        msgTv.setTextSize(10.5f);
-        msgTv.setTypeface(Typeface.MONOSPACE);
-        msgTv.setTextColor(AppTheme.textSecondary());
-        msgTv.setPadding(0, dp(4), 0, dp(12));
+        TextView msgTv = UiKit.body(this, initialMessage);
+        msgTv.setPadding(0, dp(6), 0, dp(14));
         root.addView(msgTv);
 
         ProgressBar pb = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         pb.setMax(100);
         pb.setProgress(0);
         pb.setIndeterminate(false);
+        pb.setProgressTintList(ColorStateList.valueOf(AppTheme.accent()));
+        pb.setIndeterminateTintList(ColorStateList.valueOf(AppTheme.accent()));
         root.addView(pb, new LinearLayout.LayoutParams(-1, dp(6)));
 
-        LinearLayout footer = new LinearLayout(this);
-        footer.setOrientation(LinearLayout.HORIZONTAL);
-        footer.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout footer = UiKit.row(this);
         footer.setPadding(0, dp(8), 0, 0);
 
-        TextView statsTv = new TextView(this);
-        statsTv.setText("");
-        statsTv.setTextSize(9.5f);
-        statsTv.setTypeface(Typeface.MONOSPACE);
-        statsTv.setTextColor(AppTheme.textMuted());
+        // byte counts / speeds are machine values: monospace keeps the digits from jumping around
+        TextView statsTv = UiKit.text(this, "", 11f, AppTheme.textMuted(), Typeface.MONOSPACE);
         footer.addView(statsTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        TextView pctTv = new TextView(this);
-        pctTv.setText("0%");
-        pctTv.setTextSize(9.5f);
-        pctTv.setTypeface(Typeface.MONOSPACE);
-        pctTv.setTextColor(AppTheme.textSecondary());
+        TextView pctTv = UiKit.text(this, "0%", 11f, AppTheme.textSecondary(), UiKit.MEDIUM);
         pctTv.setGravity(Gravity.END);
         footer.addView(pctTv, new LinearLayout.LayoutParams(-2, -2));
 
         root.addView(footer);
 
         d.setContentView(I18n.attach(root));
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
-            lp.copyFrom(d.getWindow().getAttributes());
-            lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.90);
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(lp);
-        }
-        d.show();
+        applyDialogWindow(d, 0.90f);
+        safeShow(d);
         return new OledProgressDialog(d, titleTv, msgTv, pb, statsTv, pctTv, cancelBtn);
     }
 
@@ -7261,64 +7031,49 @@ public final class FishbowlActivity extends AppCompatActivity
             return;
         }
 
-        File installDir = new File(svc.getManifest().getInstallDir());
-        File configDir = new File(svc.getManifest().getConfigDir());
+        final File installDir = new File(svc.getManifest().getInstallDir());
+        final File configDir = new File(svc.getManifest().getConfigDir());
+        // Walking the install tree (.NET runtimes: thousands of files) must not block the UI thread.
+        runBg(() -> {
+            long bin = calculateDirSize(installDir);
+            long cfg = calculateDirSize(configDir);
+            runOnUiThread(() -> {
+                if (isUiAlive()) showUninstallOptionsDialog(svc, bin, cfg);
+            });
+        });
+    }
 
-        long binBytes = calculateDirSize(installDir);
-        long cfgBytes = calculateDirSize(configDir);
+    private void showUninstallOptionsDialog(ManagedService svc, long binBytes, long cfgBytes) {
         long totalBytes = binBytes + cfgBytes;
 
         Dialog d = new Dialog(this);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(18));
-        root.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.outline(), dp(1), dp(14)));
+        LinearLayout root = UiKit.column(this);
+        root.setPadding(dp(20), dp(18), dp(20), dp(18));
+        root.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
 
-        TextView titleTv = new TextView(this);
-        titleTv.setText("UNINSTALL " + svc.getDisplayName().toUpperCase(Locale.ROOT));
-        titleTv.setTextSize(14f);
-        titleTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        titleTv.setTextColor(AppTheme.text());
-        root.addView(titleTv);
+        LinearLayout head = UiKit.row(this);
+        LinearLayout headText = UiKit.column(this);
+        headText.addView(UiKit.title(this, buttonLabel("UNINSTALL") + " " + svc.getDisplayName()));
+        TextView subTv = UiKit.caption(this, "Storage Reclaim & Data Retention Options");
+        subTv.setPadding(0, dp(2), 0, 0);
+        headText.addView(subTv);
+        head.addView(headText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        head.addView(dialogCloseButton(d));
+        root.addView(head);
 
-        TextView subTv = new TextView(this);
-        subTv.setText("Storage Reclaim & Data Retention Options");
-        subTv.setTextSize(10f);
-        subTv.setTypeface(Typeface.MONOSPACE);
-        subTv.setTextColor(AppTheme.textSecondary());
-        subTv.setPadding(0, dp(2), 0, dp(10));
-        root.addView(subTv);
-
-        // Stats Box
-        LinearLayout statBox = new LinearLayout(this);
-        statBox.setOrientation(LinearLayout.VERTICAL);
-        statBox.setPadding(dp(10), dp(8), dp(10), dp(8));
-        statBox.setBackground(createBorderedRoundedDrawable(AppTheme.card(), AppTheme.inner(), dp(1), dp(6)));
-
-        TextView statLine1 = new TextView(this);
-        statLine1.setText("Binaries Footprint: " + MediaStorageManager.formatBytes(binBytes));
-        statLine1.setTextSize(10f);
-        statLine1.setTypeface(Typeface.MONOSPACE);
-        statLine1.setTextColor(AppTheme.danger());
-        statBox.addView(statLine1);
-
-        TextView statLine2 = new TextView(this);
-        statLine2.setText("Database & Configs: " + MediaStorageManager.formatBytes(cfgBytes));
-        statLine2.setTextSize(10f);
-        statLine2.setTypeface(Typeface.MONOSPACE);
-        statLine2.setTextColor(AppTheme.textSecondary());
-        statBox.addView(statLine2);
-
+        // Stats box
+        LinearLayout statBox = UiKit.inset(this);
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(-1, -2);
+        sbLp.topMargin = dp(14);
+        statBox.setLayoutParams(sbLp);
+        addDetailKv(statBox, I18n.tr("Binaries"), MediaStorageManager.formatBytes(binBytes), false);
+        addDetailKv(statBox, I18n.tr("Database & Configs"), MediaStorageManager.formatBytes(cfgBytes), false);
         root.addView(statBox);
 
-        // Option 1 Button: Reclaim Binaries Only (Preserve Database)
-        Button btnKeepDb = createOutlinePixelButton("RECLAIM BINARIES ONLY (KEEP DATABASE)", Color.WHITE, Color.WHITE);
-        btnKeepDb.setTextSize(10f);
-        LinearLayout.LayoutParams kLp = new LinearLayout.LayoutParams(-1, dp(38));
-        kLp.topMargin = dp(12);
-        btnKeepDb.setLayoutParams(kLp);
+        // Option 1: reclaim binaries only (preserve database)
+        Button btnKeepDb = UiKit.outline(this, buttonLabel("RECLAIM BINARIES ONLY (KEEP DATABASE)"), null);
         btnKeepDb.setOnClickListener(v -> {
             d.dismiss();
             OledProgressDialog progress = showOledProgressDialog("UNINSTALLING " + svc.getDisplayName().toUpperCase(Locale.ROOT), "Stopping process and reclaiming binaries...");
@@ -7329,22 +7084,16 @@ public final class FishbowlActivity extends AppCompatActivity
                 Toast.makeText(this, I18n.tr(svc.getDisplayName() + " binaries removed. Database & config preserved!"), Toast.LENGTH_LONG).show();
             });
         });
-        root.addView(btnKeepDb);
+        LinearLayout.LayoutParams kLp = new LinearLayout.LayoutParams(-1, dp(44));
+        kLp.topMargin = dp(16);
+        root.addView(btnKeepDb, kLp);
 
-        TextView noteKeep = new TextView(this);
-        noteKeep.setText("Reclaims ~" + MediaStorageManager.formatBytes(binBytes) + ". Settings, API keys, and library mappings remain saved. Reinstalling later restores your existing library instantly.");
-        noteKeep.setTextSize(9f);
-        noteKeep.setTypeface(Typeface.MONOSPACE);
-        noteKeep.setTextColor(AppTheme.textMuted());
-        noteKeep.setPadding(dp(4), dp(3), dp(4), dp(8));
+        TextView noteKeep = UiKit.caption(this, "Reclaims ~" + MediaStorageManager.formatBytes(binBytes) + ". Settings, API keys, and library mappings remain saved. Reinstalling later restores your existing library instantly.");
+        noteKeep.setPadding(dp(4), dp(6), dp(4), dp(4));
         root.addView(noteKeep);
 
-        // Option 2 Button: Clean Wipe (Purge All Data)
-        Button btnPurge = createOutlinePixelButton("PURGE EVERYTHING (CLEAN WIPE)", AppTheme.danger(), AppTheme.danger());
-        btnPurge.setTextSize(10f);
-        LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(-1, dp(38));
-        pLp.topMargin = dp(4);
-        btnPurge.setLayoutParams(pLp);
+        // Option 2: clean wipe (purge all data)
+        Button btnPurge = UiKit.danger(this, buttonLabel("PURGE EVERYTHING (CLEAN WIPE)"), null);
         btnPurge.setOnClickListener(v -> {
             d.dismiss();
             OledProgressDialog progress = showOledProgressDialog("PURGING " + svc.getDisplayName().toUpperCase(Locale.ROOT), "Stopping process and removing all data...");
@@ -7355,33 +7104,17 @@ public final class FishbowlActivity extends AppCompatActivity
                 Toast.makeText(this, I18n.tr(svc.getDisplayName() + " completely purged. " + MediaStorageManager.formatBytes(totalBytes) + " reclaimed!"), Toast.LENGTH_LONG).show();
             });
         });
-        root.addView(btnPurge);
+        LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(-1, dp(44));
+        pLp.topMargin = dp(12);
+        root.addView(btnPurge, pLp);
 
-        TextView notePurge = new TextView(this);
-        notePurge.setText("Permanently deletes binaries, SQLite databases, and all configuration files. Downloaded media files in FishbowlMedia are NEVER deleted.");
-        notePurge.setTextSize(9f);
-        notePurge.setTypeface(Typeface.MONOSPACE);
-        notePurge.setTextColor(AppTheme.textMuted());
-        notePurge.setPadding(dp(4), dp(3), dp(4), dp(10));
+        TextView notePurge = UiKit.caption(this, "Permanently deletes binaries, SQLite databases, and all configuration files. Downloaded media files in FishbowlMedia are NEVER deleted.");
+        notePurge.setPadding(dp(4), dp(6), dp(4), 0);
         root.addView(notePurge);
 
-        // Cancel Button
-        Button btnCancel = createOutlinePixelButton("CANCEL", AppTheme.outlineStrong(), AppTheme.textSecondary());
-        btnCancel.setTextSize(10f);
-        btnCancel.setOnClickListener(v -> d.dismiss());
-        root.addView(btnCancel, new LinearLayout.LayoutParams(-1, dp(34)));
-
         d.setContentView(I18n.attach(root));
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            d.getWindow().setDimAmount(AppTheme.isDark() ? 0.85f : 0.5f);
-            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
-            wlp.copyFrom(d.getWindow().getAttributes());
-            wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.92);
-            wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            d.getWindow().setAttributes(wlp);
-        }
-        d.show();
+        applyDialogWindow(d, 0.92f);
+        safeShow(d);
     }
 
     public interface DownloadProgressCallback {
@@ -8647,7 +8380,7 @@ public final class FishbowlActivity extends AppCompatActivity
         selectAllLabel.setTextSize(11.5f);
         selectAllLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         selectAllLabel.setTextColor(AppTheme.text());
-        selectAllLabel.setPadding(dp(8), 0, 0, 0);
+        selectAllLabel.setPaddingRelative(dp(8), 0, 0, 0);
         selectAllCard.addView(selectAllLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         selectAllCard.setClickable(true);
@@ -8770,7 +8503,7 @@ public final class FishbowlActivity extends AppCompatActivity
             lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(lp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void showSelectiveUninstallDialog() {
@@ -8843,7 +8576,7 @@ public final class FishbowlActivity extends AppCompatActivity
         selectAllLabel.setTextSize(11.5f);
         selectAllLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         selectAllLabel.setTextColor(AppTheme.text());
-        selectAllLabel.setPadding(dp(8), 0, 0, 0);
+        selectAllLabel.setPaddingRelative(dp(8), 0, 0, 0);
         selectAllCard.addView(selectAllLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         selectAllCard.setClickable(true);
@@ -8944,7 +8677,7 @@ public final class FishbowlActivity extends AppCompatActivity
         purgeLabel.setText("Purge databases, configs & library indices");
         purgeLabel.setTextSize(10.5f);
         purgeLabel.setTextColor(AppTheme.danger());
-        purgeLabel.setPadding(dp(6), 0, 0, 0);
+        purgeLabel.setPaddingRelative(dp(6), 0, 0, 0);
         purgeCard.addView(purgeLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         purgeCard.setClickable(true);
@@ -8990,7 +8723,7 @@ public final class FishbowlActivity extends AppCompatActivity
             lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(lp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void setupSelectAllListener(CheckBox selectAllCb, List<ManagedService> candidates, List<CheckBox> itemCbs, Set<String> selectedIds, Runnable updateButtonText) {
@@ -9286,21 +9019,9 @@ public final class FishbowlActivity extends AppCompatActivity
         menuScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
         settingsMenu = new LinearLayout(this);
         settingsMenu.setOrientation(LinearLayout.VERTICAL);
-        settingsMenu.setPadding(dp(20), dp(14), dp(20), dp(110));
+        settingsMenu.setPadding(dp(16), dp(12), dp(16), dp(110));
 
-        TextView title = new TextView(this);
-        title.setText("SETTINGS");
-        title.setTextSize(18);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(AppTheme.text());
-        title.setPadding(0, dp(4), 0, 0);
-        settingsMenu.addView(title);
-        TextView sub = new TextView(this);
-        sub.setText("Tap a section to open it.");
-        sub.setTextSize(11);
-        sub.setTextColor(AppTheme.textMuted());
-        sub.setPadding(0, dp(2), 0, dp(14));
-        settingsMenu.addView(sub);
+        settingsMenu.addView(UiKit.header(this, "Settings", "Tap a section to open it.", null));
 
         addSettingsGroupHeader("PERSONALIZE");
         addSettingsMenuRow("Appearance", appearanceSummary(), buildAppearanceSection());
@@ -9330,21 +9051,19 @@ public final class FishbowlActivity extends AppCompatActivity
         cParams.topMargin = dp(8);
         communityRow.setLayoutParams(cParams);
 
-        Button btnGithub = createPixelButton("GITHUB", getSurfaceElevatedColor(), getPrimaryTextColor());
-        btnGithub.setTextSize(10f);
+        Button btnGithub = UiKit.outline(this, "GitHub", null);
         btnGithub.setOnClickListener(v -> {
             try {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Suz41/Fishbowl")));
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/MedRAM-RAM/Jellyarr")));
             } catch (Throwable t) {
-                Toast.makeText(this, I18n.tr("Could not open browser: https://github.com/Suz41/Fishbowl"), Toast.LENGTH_LONG).show();
+                Toast.makeText(this, I18n.tr("Could not open browser: https://github.com/MedRAM-RAM/Jellyarr"), Toast.LENGTH_LONG).show();
             }
         });
-        communityRow.addView(btnGithub, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
-        communityRow.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
-        Button btnReport = createPixelButton("REPORT A BUG", getSurfaceElevatedColor(), getAccentColor());
-        btnReport.setTextSize(10f);
+        communityRow.addView(btnGithub, new LinearLayout.LayoutParams(0, dp(42), 1.0f));
+        communityRow.addView(new View(this), new LinearLayout.LayoutParams(dp(12), 1));
+        Button btnReport = UiKit.tonal(this, buttonLabel("REPORT A BUG"), null);
         btnReport.setOnClickListener(v -> com.fishbowl.app.diagnostics.BugReportHelper.openBugReportFlow(this, null, null));
-        communityRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
+        communityRow.addView(btnReport, new LinearLayout.LayoutParams(0, dp(42), 1.0f));
         settingsMenu.addView(communityRow);
 
         menuScroll.addView(settingsMenu);
@@ -9356,19 +9075,23 @@ public final class FishbowlActivity extends AppCompatActivity
         settingsDetail.setBackgroundColor(getBgColor());
         settingsDetail.setVisibility(View.GONE);
 
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(14), dp(10), dp(20), dp(6));
-        Button back = createPixelButton("< BACK", getSurfaceElevatedColor(), getAccentColor());
-        back.setTextSize(10.5f);
+        // Compact top bar: back-arrow icon button (mirrored in RTL) + section title
+        LinearLayout bar = UiKit.row(this);
+        bar.setPaddingRelative(dp(8), dp(6), dp(16), dp(6));
+        ImageView back = new ImageView(this);
+        back.setImageResource(R.drawable.ic_back);
+        back.setColorFilter(AppTheme.text());
+        back.setScaleType(ImageView.ScaleType.CENTER);
+        back.setContentDescription("Back");
+        back.setClickable(true);
+        back.setFocusable(true);
+        back.setBackground(UiKit.rowRipple(this));
+        if (isRtlLayout()) back.setScaleX(-1f);   // ic_back is not auto-mirrored
         back.setOnClickListener(v -> closeSettingsSection());
-        bar.addView(back, new LinearLayout.LayoutParams(dp(78), dp(34)));
-        settingsDetailTitle = new TextView(this);
-        settingsDetailTitle.setTextSize(15);
-        settingsDetailTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        settingsDetailTitle.setTextColor(AppTheme.text());
-        settingsDetailTitle.setPadding(dp(12), 0, 0, 0);
+        bar.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        settingsDetailTitle = UiKit.singleLine(UiKit.title(this, ""));
+        settingsDetailTitle.setTextSize(18f);
+        settingsDetailTitle.setPaddingRelative(dp(8), 0, 0, 0);
         bar.addView(settingsDetailTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
         settingsDetail.addView(bar);
 
@@ -9377,7 +9100,7 @@ public final class FishbowlActivity extends AppCompatActivity
         settingsDetailScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
         settingsDetailBody = new LinearLayout(this);
         settingsDetailBody.setOrientation(LinearLayout.VERTICAL);
-        settingsDetailBody.setPadding(dp(20), dp(8), dp(20), dp(110));
+        settingsDetailBody.setPadding(dp(16), dp(8), dp(16), dp(110));
         settingsDetailScroll.addView(settingsDetailBody);
         settingsDetail.addView(settingsDetailScroll, new LinearLayout.LayoutParams(-1, 0, 1.0f));
         settingsRoot.addView(settingsDetail, new FrameLayout.LayoutParams(-1, -1));
@@ -9403,7 +9126,7 @@ public final class FishbowlActivity extends AppCompatActivity
         TextView tv = new TextView(this);
         tv.setText(title);
         styleSectionLabel(tv);
-        tv.setPadding(dp(4), dp(12), 0, dp(8));
+        tv.setPadding(dp(4), dp(16), dp(4), dp(8));
         settingsMenu.addView(tv);
     }
 
@@ -9413,33 +9136,28 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(16), dp(14), dp(14), dp(14));
-        row.setBackground(createCardDrawable(AppTheme.card(), dp(14)));
+        row.setPaddingRelative(dp(16), dp(14), dp(12), dp(14));
+        row.setBackground(UiKit.pressable(this, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
         row.setClickable(true);
         row.setFocusable(true);
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
-        TextView t = new TextView(this);
-        t.setText(name);
-        t.setTextSize(14f);
-        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        t.setTextColor(getPrimaryTextColor());
+        TextView t = UiKit.subtitle(this, name);
+        t.setTextSize(15f);
+        t.setTypeface(UiKit.BOLD);
         col.addView(t);
-        TextView st = new TextView(this);
-        st.setText(subtitle);
-        st.setTextSize(11f);
-        st.setTextColor(AppTheme.textMuted());
+        TextView st = UiKit.caption(this, subtitle);
         st.setPadding(0, dp(2), 0, 0);
         col.addView(st);
         row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
         ImageView arrow = new ImageView(this);
         arrow.setImageResource(R.drawable.ic_chevron_down);
-        arrow.setColorFilter(getSecondaryTextColor());
-        arrow.setRotation(-90f);
+        arrow.setColorFilter(AppTheme.textMuted());
+        arrow.setRotation(isRtlLayout() ? 90f : -90f);   // points toward the reading end in LTR and RTL
         row.addView(arrow, new LinearLayout.LayoutParams(dp(20), dp(20)));
         row.setOnClickListener(v -> openSettingsSection(name, sectionView));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.bottomMargin = dp(10);
+        lp.bottomMargin = dp(8);
         settingsMenu.addView(row, lp);
     }
 
@@ -9473,21 +9191,14 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private LinearLayout createSettingsSectionCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(createCardDrawable(AppTheme.card(), dp(14)));
-        card.setPadding(dp(16), dp(12), dp(16), dp(12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.bottomMargin = dp(14);
-        card.setLayoutParams(lp);
-        return card;
+        return UiKit.card(this);
     }
 
     private TextView createSettingsSectionHeader(String title) {
         TextView tv = new TextView(this);
         tv.setText(title);
         styleSectionLabel(tv);
-        tv.setPadding(dp(4), dp(6), 0, dp(6));
+        tv.setPaddingRelative(dp(4), dp(6), 0, dp(6));
         return tv;
     }
 
@@ -9505,9 +9216,10 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(4), 0, dp(4));
+        row.setPadding(dp(4), dp(8), dp(4), dp(8));
         row.setClickable(true);
         row.setFocusable(true);
+        row.setBackground(UiKit.rowRipple(this));
         if (onClick != null) row.setOnClickListener(onClick);
 
         LinearLayout textCol = new LinearLayout(this);
@@ -9532,11 +9244,11 @@ public final class FishbowlActivity extends AppCompatActivity
         row.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
         TextView chevron = new TextView(this);
-        chevron.setText("›");
+        chevron.setText("›");   // bidi-mirrored glyph: renders as ‹ in RTL automatically
         chevron.setTextSize(18f);
         chevron.setTypeface(Typeface.DEFAULT_BOLD);
         chevron.setTextColor(AppTheme.textMuted());
-        chevron.setPadding(dp(8), 0, dp(4), 0);
+        chevron.setPaddingRelative(dp(8), 0, dp(4), 0);
         row.addView(chevron);
 
         return row;
@@ -10646,7 +10358,7 @@ public final class FishbowlActivity extends AppCompatActivity
         cleanSub.setText("Remove finished torrents AND their downloaded files after the period below. Make sure Radarr/Sonarr have already imported them (or that they hard-link/copy), otherwise the files are lost.");
         cleanSub.setTextSize(11f);
         cleanSub.setTextColor(AppTheme.textMuted());
-        cleanSub.setPadding(0, dp(2), dp(8), 0);
+        cleanSub.setPaddingRelative(0, dp(2), dp(8), 0);
         cleanText.addView(cleanSub);
         cleanRow.addView(cleanText, new LinearLayout.LayoutParams(0, -2, 1.0f));
         Switch cleanSwitch = new Switch(this);
@@ -10745,7 +10457,7 @@ public final class FishbowlActivity extends AppCompatActivity
         recheckSub.setText("When a torrent reports any error, Jellyarr re-verifies its data and resumes it. Retries back off (5, 10, 20, 40, 80 min) and stop after 5 attempts until the error clears.");
         recheckSub.setTextSize(11f);
         recheckSub.setTextColor(AppTheme.textMuted());
-        recheckSub.setPadding(0, dp(2), dp(8), 0);
+        recheckSub.setPaddingRelative(0, dp(2), dp(8), 0);
         recheckText.addView(recheckSub);
         recheckRow.addView(recheckText, new LinearLayout.LayoutParams(0, -2, 1.0f));
         Switch recheckSwitch = new Switch(this);
@@ -10881,131 +10593,99 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private View buildSecurityJellyfinUsersCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout card = UiKit.column(this);
 
-        LinearLayout hdr = new LinearLayout(this);
-        hdr.setOrientation(LinearLayout.HORIZONTAL);
-        hdr.setGravity(Gravity.CENTER_VERTICAL);
-        hdr.setPadding(0, dp(2), 0, dp(6));
+        LinearLayout hdr = UiKit.row(this);
+        hdr.setPadding(0, dp(2), 0, dp(8));
 
         TextView title = new TextView(this);
         title.setText("JELLYFIN ACCOUNTS");
-        title.setTextSize(11f);
-        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        title.setTextColor(AppTheme.text());
+        styleSectionLabel(title);
         hdr.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        TextView btnRefresh = new TextView(this);
-        btnRefresh.setText("REFRESH");
-        btnRefresh.setTextSize(10f);
-        btnRefresh.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        btnRefresh.setTextColor(getAccentColor());
-        btnRefresh.setPadding(dp(6), dp(2), dp(6), dp(2));
+        TextView btnRefresh = UiKit.text(this, buttonLabel("REFRESH"), 12.5f, getAccentColor(), UiKit.BOLD);
+        btnRefresh.setPadding(dp(10), dp(6), dp(10), dp(6));
+        btnRefresh.setClickable(true);
+        btnRefresh.setFocusable(true);
+        btnRefresh.setBackground(UiKit.rowRipple(this));
         btnRefresh.setOnClickListener(v -> refreshSecurityUsersUI());
         hdr.addView(btnRefresh);
 
         card.addView(hdr);
 
-        securityUsersContainer = new LinearLayout(this);
-        securityUsersContainer.setOrientation(LinearLayout.VERTICAL);
+        securityUsersContainer = UiKit.column(this);
         card.addView(securityUsersContainer);
 
         refreshSecurityUsersUI();
         return card;
     }
 
+    /** True when {@code username} is the account kept in sync by UnifiedAccount (case-insensitive). */
+    private boolean isUnifiedAccountUser(String username) {
+        if (username == null || !UnifiedAccount.isConfigured(this)) return false;
+        String u = UnifiedAccount.getUsername(this);
+        return u != null && u.trim().equalsIgnoreCase(username.trim());
+    }
+
     private void refreshSecurityUsersUI() {
         if (securityUsersContainer == null) return;
-        bgExecutor.execute(() -> {
-            List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> users =
-                    com.fishbowl.app.security.FishbowlSecurityManager.getRegisteredUsers(this);
+        runBg(() -> {
+            List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> loaded;
+            try {
+                loaded = com.fishbowl.app.security.FishbowlSecurityManager.getRegisteredUsers(this);
+            } catch (Throwable t) {
+                loaded = new ArrayList<>();
+            }
+            final List<com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord> users =
+                    loaded != null ? loaded : new ArrayList<>();
 
             runOnUiThread(() -> {
-                if (securityUsersContainer == null) return;
+                if (securityUsersContainer == null || !isUiAlive()) return;
                 securityUsersContainer.removeAllViews();
 
                 if (users.isEmpty()) {
-                    TextView emptyTv = new TextView(this);
-                    emptyTv.setText("No Jellyfin users configured in jellyfin.db yet. Complete onboarding in Jellyfin Web client.");
-                    emptyTv.setTextSize(11f);
-                    emptyTv.setTextColor(AppTheme.textMuted());
+                    TextView emptyTv = UiKit.caption(this, "No Jellyfin users configured in jellyfin.db yet. Complete onboarding in Jellyfin Web client.");
                     emptyTv.setPadding(0, dp(4), 0, dp(4));
                     securityUsersContainer.addView(emptyTv);
                     return;
                 }
 
                 for (com.fishbowl.app.security.FishbowlSecurityManager.JellyfinUserRecord u : users) {
-                    LinearLayout uRow = new LinearLayout(this);
-                    uRow.setOrientation(LinearLayout.VERTICAL);
-                    uRow.setPadding(dp(12), dp(10), dp(12), dp(10));
-                    uRow.setBackground(createBorderedRoundedDrawable(
-                            AppTheme.inner(), AppTheme.outline(), dp(1), dp(8)));
+                    LinearLayout uRow = UiKit.inset(this);
                     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
                     lp.bottomMargin = dp(8);
                     uRow.setLayoutParams(lp);
 
-                    // Top Row: Username + Admin Badge + Password Status
-                    LinearLayout topRow = new LinearLayout(this);
-                    topRow.setOrientation(LinearLayout.HORIZONTAL);
-                    topRow.setGravity(Gravity.CENTER_VERTICAL);
+                    // Name, then badges (admin / unified / password state) on their own line
+                    TextView nameTv = UiKit.singleLine(UiKit.subtitle(this, u.getUsername()));
+                    nameTv.setTypeface(UiKit.BOLD);
+                    uRow.addView(nameTv);
 
-                    TextView nameTv = new TextView(this);
-                    nameTv.setText(u.getUsername());
-                    nameTv.setTextSize(13f);
-                    nameTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    nameTv.setTextColor(AppTheme.text());
-                    topRow.addView(nameTv, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
+                    LinearLayout badges = UiKit.row(this);
+                    badges.setPadding(0, dp(6), 0, 0);
                     if (u.isAdmin()) {
-                        TextView bAdmin = new TextView(this);
-                        bAdmin.setText("ADMIN");
-                        bAdmin.setTextSize(8.5f);
-                        bAdmin.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                        bAdmin.setTextColor(Color.parseColor("#A78BFA"));
-                        bAdmin.setPadding(dp(5), dp(2), dp(5), dp(2));
-                        bAdmin.setBackground(createBorderedRoundedDrawable(AppTheme.inner(), Color.parseColor("#7C3AED"), dp(1), dp(4)));
+                        TextView bAdmin = UiKit.badge(this, I18n.tr("ADMIN"), AppTheme.accent());
                         LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(-2, -2);
                         bLp.setMarginEnd(dp(6));
-                        topRow.addView(bAdmin, bLp);
+                        badges.addView(bAdmin, bLp);
                     }
-
+                    if (isUnifiedAccountUser(u.getUsername())) {
+                        TextView bUni = UiKit.badge(this, I18n.tr("Unified account"), AppTheme.accent());
+                        LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(-2, -2);
+                        bLp.setMarginEnd(dp(6));
+                        badges.addView(bUni, bLp);
+                    }
                     boolean hasPass = u.getHasPassword();
-                    TextView bPass = new TextView(this);
-                    bPass.setText(hasPass ? "PASSWORD SET" : "NO PASSWORD");
-                    bPass.setTextSize(8.5f);
-                    bPass.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-                    bPass.setTextColor(hasPass ? AppTheme.success() : AppTheme.warning());
-                    bPass.setPadding(dp(5), dp(2), dp(5), dp(2));
-                    bPass.setBackground(createBorderedRoundedDrawable(
-                            AppTheme.inner(),
-                            hasPass ? AppTheme.success() : AppTheme.warning(),
-                            dp(1), dp(4)));
-                    topRow.addView(bPass);
+                    badges.addView(UiKit.badge(this, I18n.tr(hasPass ? "PASSWORD SET" : "NO PASSWORD"),
+                            hasPass ? AppTheme.success() : AppTheme.warning()));
+                    HorizontalScrollView badgeScroll = UiKit.chipScroller(this, badges);
+                    uRow.addView(badgeScroll);
 
-                    uRow.addView(topRow);
-
-                    // Minimal Actions: Clean compact button bar
-                    LinearLayout btnRow = new LinearLayout(this);
-                    btnRow.setOrientation(LinearLayout.HORIZONTAL);
-                    LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(-1, dp(30));
-                    btnLp.topMargin = dp(8);
-                    btnRow.setLayoutParams(btnLp);
-
-                    Button btnSetPass = createPixelButton("SET PASSWORD", AppTheme.inner(), Color.WHITE);
-                    btnSetPass.setTextSize(9f);
-                    btnSetPass.setOnClickListener(v -> showSetPasswordDialog(u.getUsername()));
-                    btnRow.addView(btnSetPass, new LinearLayout.LayoutParams(0, -1, 1.0f));
-
-                    View gap = new View(this);
-                    btnRow.addView(gap, new LinearLayout.LayoutParams(dp(8), 1));
-
-                    Button btnReset = createPixelButton("RESET TO BLANK", AppTheme.inner(), AppTheme.danger());
-                    btnReset.setTextSize(9f);
-                    btnReset.setOnClickListener(v -> showResetPasswordConfirmation(u.getUsername()));
-                    btnRow.addView(btnReset, new LinearLayout.LayoutParams(0, -1, 1.0f));
-
-                    uRow.addView(btnRow);
+                    Button btnSetPass = UiKit.outline(this, buttonLabel("SET PASSWORD"), v -> showSetPasswordDialog(u.getUsername()));
+                    Button btnReset = UiKit.danger(this, buttonLabel("RESET TO BLANK"), v -> showResetPasswordConfirmation(u.getUsername()));
+                    btnSetPass.setTextSize(12.5f);
+                    btnReset.setTextSize(12.5f);
+                    uRow.addView(UiKit.buttonRow(this, btnSetPass, btnReset));
 
                     securityUsersContainer.addView(uRow);
                 }
@@ -11014,25 +10694,25 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void showSetPasswordDialog(String username) {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
+        final boolean unifiedUser = isUnifiedAccountUser(username);
+        LinearLayout content = UiKit.column(this);
 
-        TextView desc = new TextView(this);
-        desc.setText("Enter the new password for '" + username + "'. It will be securely hashed with PBKDF2-SHA512 directly into jellyfin.db.");
-        desc.setTextSize(11.5f);
-        desc.setTextColor(AppTheme.textSecondary());
+        TextView desc = UiKit.body(this, "Enter the new password for '" + username + "'. It will be securely hashed with PBKDF2-SHA512 directly into jellyfin.db.");
         desc.setPadding(0, 0, 0, dp(12));
         content.addView(desc);
 
-        final EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setHint("Enter new password");
-        input.setHintTextColor(AppTheme.textMuted());
-        input.setTextColor(AppTheme.text());
-        input.setBackground(createBorderedRoundedDrawable(
-                AppTheme.inner(), AppTheme.outlineStrong(), dp(1), dp(8)));
-        input.setPadding(dp(14), dp(10), dp(14), dp(10));
-        input.setTextSize(13f);
+        if (unifiedUser) {
+            TextView syncNote = UiKit.caption(this, I18n.tr("This is the unified account: the new password is also applied to Sonarr, Radarr, Prowlarr and Transmission."));
+            syncNote.setTextColor(AppTheme.accent());
+            syncNote.setPadding(0, 0, 0, dp(12));
+            content.addView(syncNote);
+        }
+
+        final EditText input = UiKit.input(this, "Enter new password");
+        // visible while typing (no confirm field) but never learned by the keyboard
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setTypeface(Typeface.MONOSPACE);
         content.addView(input);
 
@@ -11043,19 +10723,46 @@ public final class FishbowlActivity extends AppCompatActivity
                 "SAVE PASSWORD",
                 getAccentColor(),
                 () -> {
-                    String newPass = input.getText() != null ? input.getText().toString().trim() : "";
+                    final String newPass = input.getText() != null ? input.getText().toString().trim() : "";
                     if (newPass.isEmpty()) {
                         Toast.makeText(this, I18n.tr("Password cannot be empty. Use 'RESET TO BLANK' if you want no password."), Toast.LENGTH_LONG).show();
                         return;
                     }
-                    boolean ok = com.fishbowl.app.security.FishbowlSecurityManager.setPassword(this, username, newPass);
-                    if (ok) {
-                        Toast.makeText(this, I18n.tr("Password for '" + username + "' saved successfully."), Toast.LENGTH_LONG).show();
-                        refreshSecurityUsersUI();
-                        refreshHomeAccountsUI();
-                    } else {
-                        Toast.makeText(this, I18n.tr("Failed to save password. Is database locked?"), Toast.LENGTH_LONG).show();
+                    final String unifiedName = unifiedUser ? UnifiedAccount.getUsername(this) : null;
+                    if (unifiedUser) {
+                        // the same password goes to every service, so it must pass their rules first
+                        String problem = UnifiedAccount.validate(unifiedName, newPass);
+                        if (problem != null) {
+                            Toast.makeText(this, I18n.tr(problem), Toast.LENGTH_LONG).show();
+                            return;
+                        }
                     }
+                    final Context app = getApplicationContext();
+                    runBg(() -> {
+                        boolean saved;
+                        try {
+                            saved = com.fishbowl.app.security.FishbowlSecurityManager.setPassword(app, username, newPass);
+                        } catch (Throwable t) {
+                            saved = false;
+                        }
+                        final boolean ok = saved;
+                        runOnUiThread(() -> {
+                            if (ok && unifiedUser) {
+                                // Full sync: keep the unified account and every service on the new password.
+                                UnifiedAccount.save(app, unifiedName, newPass);
+                                lastUnifiedAutoApply = System.currentTimeMillis();
+                                runUnifiedApply(true, true);
+                            }
+                            if (!isUiAlive()) return;
+                            if (ok) {
+                                Toast.makeText(this, I18n.tr("Password for '" + username + "' saved successfully."), Toast.LENGTH_LONG).show();
+                                refreshSecurityUsersUI();
+                                refreshHomeAccountsUI();
+                            } else {
+                                Toast.makeText(this, I18n.tr("Failed to save password. Is database locked?"), Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    });
                 },
                 "CANCEL",
                 null
@@ -11063,15 +10770,17 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void showResetPasswordConfirmation(String username) {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout content = UiKit.column(this);
 
-        TextView desc = new TextView(this);
-        desc.setText("Are you sure you want to clear the password for '" + username + "'?\n\nThis writes directly into jellyfin.db. You will immediately be able to log in by leaving the password field blank.");
-        desc.setTextSize(11.5f);
-        desc.setTextColor(AppTheme.textSecondary());
-        desc.setLineSpacing(dp(2), 1.15f);
+        TextView desc = UiKit.body(this, "Are you sure you want to clear the password for '" + username + "'?\n\nThis writes directly into jellyfin.db. You will immediately be able to log in by leaving the password field blank.");
         content.addView(desc);
+
+        if (isUnifiedAccountUser(username)) {
+            TextView note = UiKit.caption(this, I18n.tr("This user is the unified account. Sonarr, Radarr, Prowlarr and Transmission keep the saved password; use Set Password to sync every service again."));
+            note.setTextColor(AppTheme.warning());
+            note.setPadding(0, dp(10), 0, 0);
+            content.addView(note);
+        }
 
         showOledDialog(
                 "Reset Password to Blank?",
@@ -11080,14 +10789,26 @@ public final class FishbowlActivity extends AppCompatActivity
                 "RESET TO BLANK",
                 getDangerColor(),
                 () -> {
-                    boolean ok = com.fishbowl.app.security.FishbowlSecurityManager.resetPasswordToBlank(this, username);
-                    if (ok) {
-                        Toast.makeText(this, I18n.tr("Password for '" + username + "' reset to blank."), Toast.LENGTH_LONG).show();
-                        refreshSecurityUsersUI();
-                        refreshHomeAccountsUI();
-                    } else {
-                        Toast.makeText(this, I18n.tr("Could not reset password. Is database locked?"), Toast.LENGTH_LONG).show();
-                    }
+                    final Context app = getApplicationContext();
+                    runBg(() -> {
+                        boolean done;
+                        try {
+                            done = com.fishbowl.app.security.FishbowlSecurityManager.resetPasswordToBlank(app, username);
+                        } catch (Throwable t) {
+                            done = false;
+                        }
+                        final boolean ok = done;
+                        runOnUiThread(() -> {
+                            if (!isUiAlive()) return;
+                            if (ok) {
+                                Toast.makeText(this, I18n.tr("Password for '" + username + "' reset to blank."), Toast.LENGTH_LONG).show();
+                                refreshSecurityUsersUI();
+                                refreshHomeAccountsUI();
+                            } else {
+                                Toast.makeText(this, I18n.tr("Could not reset password. Is database locked?"), Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    });
                 },
                 "CANCEL",
                 null
@@ -11590,7 +11311,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private void triggerExportBackup() {
         TextView[] msgHolder = new TextView[1];
         Dialog progressDialog = createBackupProgressDialog("EXPORTING BACKUP", "Staging preferences and service configs...", msgHolder);
-        progressDialog.show();
+        safeShow(progressDialog);
 
         BackupRestoreManager.exportBackup(this, new BackupRestoreManager.BackupCallback() {
             @Override
@@ -11688,7 +11409,7 @@ public final class FishbowlActivity extends AppCompatActivity
             wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void showRestoreOptionsDialog() {
@@ -11796,7 +11517,7 @@ public final class FishbowlActivity extends AppCompatActivity
             wlp.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.65);
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void launchFilePickerForRestore() {
@@ -11814,7 +11535,7 @@ public final class FishbowlActivity extends AppCompatActivity
         showConfirmRestoreDialog(file.getName(), () -> {
             TextView[] msgHolder = new TextView[1];
             Dialog progressDialog = createBackupProgressDialog("RESTORING CONFIGURATION", "Extracting and applying configuration files...", msgHolder);
-            progressDialog.show();
+            safeShow(progressDialog);
 
             BackupRestoreManager.restoreBackup(this, file, new BackupRestoreManager.RestoreCallback() {
                 @Override
@@ -11843,7 +11564,7 @@ public final class FishbowlActivity extends AppCompatActivity
         showConfirmRestoreDialog("Selected File Archive", () -> {
             TextView[] msgHolder = new TextView[1];
             Dialog progressDialog = createBackupProgressDialog("RESTORING CONFIGURATION", "Extracting and applying configuration files...", msgHolder);
-            progressDialog.show();
+            safeShow(progressDialog);
 
             BackupRestoreManager.restoreBackup(this, uri, new BackupRestoreManager.RestoreCallback() {
                 @Override
@@ -11935,7 +11656,7 @@ public final class FishbowlActivity extends AppCompatActivity
             wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     private void showRestoreSuccessModal(int prefsCount, int configsCount) {
@@ -11994,7 +11715,7 @@ public final class FishbowlActivity extends AppCompatActivity
             wlp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             d.getWindow().setAttributes(wlp);
         }
-        d.show();
+        safeShow(d);
     }
 
     // -- Tools Quick-Access Actions (Home Tab) ---------------------------------
@@ -12525,13 +12246,8 @@ public final class FishbowlActivity extends AppCompatActivity
 
     /** Settings sections now live on their own page: a single always-open card (no folded list inside). */
     private LinearLayout buildCollapsibleCard(String titleText, String subtitleText, View contentContainer, boolean initiallyExpanded) {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(createRoundedDrawable(AppTheme.card(), dp(12)));
-        card.setPadding(dp(16), dp(14), dp(16), dp(14));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.bottomMargin = dp(14);
-        card.setLayoutParams(params);
+        LinearLayout card = UiKit.card(this);
+        card.setPadding(dp(16), dp(16), dp(16), dp(16));
         contentContainer.setVisibility(View.VISIBLE);
         card.addView(contentContainer);
         return card;
@@ -13681,8 +13397,8 @@ public final class FishbowlActivity extends AppCompatActivity
             }
             statusBadge.setText("● " + statusText);
             statusBadge.setTextColor(color);
-            statusBadge.setBackground(null);
-            statusBadge.setPadding(0, 0, 0, 0);
+            statusBadge.setBackground(UiKit.shape(this, AppTheme.withAlpha(color, 0x22), 0, UiKit.R_PILL));
+            statusBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
         }
 
         // Render Slim Header Progress Bar & Notification Banner (Small progress bar not full screen)
@@ -13876,9 +13592,9 @@ public final class FishbowlActivity extends AppCompatActivity
         if (btnResetCrash != null) {
             if (crashLoop) {
                 btnResetCrash.setVisibility(View.VISIBLE);
-                boolean dbCorrupt = !BackupRestoreManager.isDatabaseHealthy(
-                        new File(com.termux.shared.termux.TermuxConstants.TERMUX_HOME_DIR, ".local/share/jellyfin/data/jellyfin.db"));
-                btnResetCrash.setText(dbCorrupt ? "AUTO-HEAL DATABASE & RESTART" : "RESET CRASH LOOP & RESTART");
+                // PRAGMA quick_check on a large jellyfin.db must not run on the UI thread.
+                refreshCrashLoopDbHealthAsync();
+                btnResetCrash.setText(crashLoopLabel());
             } else {
                 btnResetCrash.setVisibility(View.GONE);
             }
@@ -13897,9 +13613,45 @@ public final class FishbowlActivity extends AppCompatActivity
         // Refresh live server health & resources
         refreshServerHealthUI();
 
-        // Broadcast state change to Home Screen Widgets and Quick Settings Tile
-        com.fishbowl.app.widget.FishbowlWidgetProvider.updateAllWidgets(this);
-        FishbowlQuickSettingsTileService.requestTileUpdate(this);
+        // Broadcast state changes to Home Screen Widgets and the Quick Settings tile (not every 500 ms poll)
+        String widgetKey = state.name() + "/" + stage;
+        if (!widgetKey.equals(lastWidgetBroadcastKey)) {
+            lastWidgetBroadcastKey = widgetKey;
+            com.fishbowl.app.widget.FishbowlWidgetProvider.updateAllWidgets(this);
+            FishbowlQuickSettingsTileService.requestTileUpdate(this);
+        }
+    }
+
+    private String lastWidgetBroadcastKey = null;
+
+    private volatile boolean crashLoopDbCorrupt = false;
+    private volatile boolean crashLoopDbCheckRunning = false;
+    private long crashLoopDbCheckedAt = 0;
+
+    private String crashLoopLabel() {
+        return buttonLabel(crashLoopDbCorrupt ? "AUTO-HEAL DATABASE & RESTART" : "RESET CRASH LOOP & RESTART");
+    }
+
+    private void refreshCrashLoopDbHealthAsync() {
+        if (crashLoopDbCheckRunning
+                || (crashLoopDbCheckedAt > 0 && SystemClock.elapsedRealtime() - crashLoopDbCheckedAt < 30000L)) return;
+        crashLoopDbCheckRunning = true;
+        runBg(() -> {
+            boolean corrupt;
+            try {
+                corrupt = !BackupRestoreManager.isDatabaseHealthy(
+                        new File(com.termux.shared.termux.TermuxConstants.TERMUX_HOME_DIR, ".local/share/jellyfin/data/jellyfin.db"));
+            } catch (Throwable t) {
+                corrupt = false;
+            }
+            final boolean result = corrupt;
+            runOnUiThread(() -> {
+                crashLoopDbCheckRunning = false;
+                crashLoopDbCheckedAt = SystemClock.elapsedRealtime();
+                crashLoopDbCorrupt = result;
+                if (btnResetCrash != null && btnResetCrash.getVisibility() == View.VISIBLE) btnResetCrash.setText(crashLoopLabel());
+            });
+        });
     }
 
     private void updateStageRow(TextView tv, String label, boolean completed, boolean active) {
@@ -13959,20 +13711,41 @@ public final class FishbowlActivity extends AppCompatActivity
         }
     }
 
-    private void refreshLanAddress() {
-        // Fast path: instant render from in-memory cache with zero UI thread block
-        updateLanAddressViews(cachedRawLanIp, cachedRawTailscaleIp);
+    private volatile String cachedDefaultIp = null;
+    private volatile NetworkUtils.LanEndpoint cachedActiveLan = null;
+    private String lastRenderedNetworkSignature = null;
 
-        // Background asynchronous interface traversal
+    private String networkSignature(String rawLan, String rawTailscale) {
+        NetworkUtils.LanEndpoint a = cachedActiveLan;
+        return cachedDefaultIp + "|" + rawLan + "|" + rawTailscale + "|" + (a != null ? a.label + "/" + a.ip : "-");
+    }
+
+    private void refreshLanAddress() {
+        // Fast path: render from the in-memory cache (skipped when nothing changed since the last render)
+        if (clientEndpointsContainer == null || clientEndpointsContainer.getChildCount() == 0
+                || !networkSignature(cachedRawLanIp, cachedRawTailscaleIp).equals(lastRenderedNetworkSignature)) {
+            updateLanAddressViews(cachedRawLanIp, cachedRawTailscaleIp);
+        }
+
+        // Background interface traversal (network callbacks fire often; one scan at a time)
         if (!isScanningNetwork) {
             isScanningNetwork = true;
-            bgExecutor.execute(() -> {
+            runBg(() -> {
                 try {
                     String rawLan = getRawLanIp();
                     String rawTailscale = getRawTailscaleIp();
+                    cachedDefaultIp = NetworkUtils.getDefaultIp();
+                    cachedActiveLan = NetworkUtils.getActiveLanEndpoint();
                     cachedRawLanIp = rawLan;
                     cachedRawTailscaleIp = rawTailscale;
-                    runOnUiThread(() -> updateLanAddressViews(rawLan, rawTailscale));
+                    runOnUiThread(() -> {
+                        if (!isUiAlive()) return;
+                        if (networkSignature(rawLan, rawTailscale).equals(lastRenderedNetworkSignature)
+                                && clientEndpointsContainer != null && clientEndpointsContainer.getChildCount() > 0) {
+                            return;   // unchanged: avoid rebuilding the rows (and re-reading the user list)
+                        }
+                        updateLanAddressViews(rawLan, rawTailscale);
+                    });
                 } finally {
                     isScanningNetwork = false;
                 }
@@ -14074,9 +13847,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
     // -- Material 3 buttons -----------------------------------------------------
     // Every button in the app goes through resolveButtonStyle(): filled (accent / danger),
-    // tonal (accent container), outlined (neutral) or tinted. Shape is the M3 "full" pill.
-
-    private static final float M3_PILL_RADIUS = 1000f;
+    // tonal (accent container), outlined (neutral) or tinted. Shape: UiKit 12dp button radius.
 
     /** Returns {fill, textColor, strokeColor, strokeWidthPx} for the requested look. */
     private int[] resolveButtonStyle(int bg, int fg) {
@@ -14106,12 +13877,16 @@ public final class FishbowlActivity extends AppCompatActivity
         return new int[]{bg, AppTheme.contrastOn(bg), 0, 0};
     }
 
+    /** Button shape shared with UiKit: 12dp radius, ripple masked to the full shape (outlined buttons included). */
     private Drawable buttonBackground(int fill, int stroke, int strokeWidthPx, int rippleColor) {
         GradientDrawable shape = new GradientDrawable();
         shape.setColor(fill);
-        shape.setCornerRadius(M3_PILL_RADIUS);
+        shape.setCornerRadius(dp(UiKit.R_INNER));
         if (strokeWidthPx > 0) shape.setStroke(strokeWidthPx, stroke);
-        return new android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(rippleColor), shape, null);
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(AppTheme.text());
+        mask.setCornerRadius(dp(UiKit.R_INNER));
+        return new android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(rippleColor), shape, mask);
     }
 
     /** Applies colours + pill background to a button according to {@link #resolveButtonStyle}. */
@@ -14165,9 +13940,48 @@ public final class FishbowlActivity extends AppCompatActivity
         return btn;
     }
 
+    private static final Set<String> LABEL_ACRONYMS = new HashSet<>(java.util.Arrays.asList(
+            "OK", "API", "URL", "URLS", "LAN", "IP", "UI", "PIN", "DB", "TV", "USB", "OTG", "OTA", "SHA", "HTTP",
+            "CPU", "GPU", "RAM", "ID", "AAC", "NEON", "TXT", "VPN", "TMDB", "JF", "SAF", "POSIX",
+            "KB", "MB", "GB", "TB", "SQL", "DNS", "SMB", "NFS", "SSL", "TLS"));
+    private static final Set<String> LABEL_SMALL_WORDS = new HashSet<>(java.util.Arrays.asList(
+            "a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to", "vs"));
+
+    /**
+     * Text for a button: the translation when one exists (Arabic UI), otherwise an ALL-CAPS English label is
+     * shown in Title Case ("COPY REPORT" -> "Copy Report"); acronyms and mixed-case labels are kept as they are.
+     */
+    private static String buttonLabel(String label) {
+        if (label == null) return null;
+        String tr = I18n.tr(label);
+        if (tr != null && !tr.equals(label)) return tr;
+        if (!label.equals(label.toUpperCase(Locale.ROOT)) || !label.matches("(?s).*[A-Z].*")) return label;
+        String[] words = label.split(" ", -1);
+        StringBuilder sb = new StringBuilder(label.length());
+        for (int i = 0; i < words.length; i++) {
+            if (i > 0) sb.append(' ');
+            String w = words[i];
+            String core = w.replaceAll("[^A-Za-z0-9]", "");
+            if (core.isEmpty() || LABEL_ACRONYMS.contains(core) || core.matches(".*[0-9].*") || w.startsWith(".")) {
+                sb.append(w);
+                continue;
+            }
+            String lower = w.toLowerCase(Locale.ROOT);
+            if (i > 0 && LABEL_SMALL_WORDS.contains(lower)) {
+                sb.append(lower);
+                continue;
+            }
+            int k = 0;
+            while (k < lower.length() && !Character.isLetter(lower.charAt(k))) k++;
+            sb.append(lower, 0, k);
+            if (k < lower.length()) sb.append(Character.toUpperCase(lower.charAt(k))).append(lower.substring(k + 1));
+        }
+        return sb.toString();
+    }
+
     private Button createPixelButton(String text, int bgColor, int textColor) {
         Button b = new Button(this);
-        b.setText(text);
+        b.setText(buttonLabel(text));
         b.setAllCaps(false);
         baseButtonMetrics(b, 12f, 0.02f);
         b.setPadding(dp(14), 0, dp(14), 0);
@@ -14181,7 +13995,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private Button createOutlinePixelButton(String text, int outlineColor, int textColor) {
         Button b = new Button(this);
-        b.setText(text);
+        b.setText(buttonLabel(text));
         b.setAllCaps(false);
         baseButtonMetrics(b, 11.5f, 0.02f);
         b.setPadding(dp(14), 0, dp(14), 0);
@@ -14202,11 +14016,12 @@ public final class FishbowlActivity extends AppCompatActivity
 
     private void applyButtonStyle(Button btn, String text, int bgColor, int textColor, boolean enabled) {
         if (btn == null) return;
-        btn.setText(text);
+        btn.setText(buttonLabel(text));
         btn.setEnabled(enabled);
         btn.setAlpha(1.0f);
-        btn.setAllCaps(true);
-        baseButtonMetrics(btn, 12f, 0.06f);
+        btn.setAllCaps(false);
+        baseButtonMetrics(btn, 13.5f, 0.01f);
+        btn.setTypeface(UiKit.BOLD);
         btn.setPadding(0, 0, 0, 0);
         applyM3Colors(btn, bgColor, textColor);
     }
@@ -14216,9 +14031,10 @@ public final class FishbowlActivity extends AppCompatActivity
         btn.setEnabled(enabled);
         btn.setAlpha(enabled ? 1.0f : 0.5f); // M3 disabled content ~38-50%
         btn.setAllCaps(false);
-        baseButtonMetrics(btn, 12f, 0.06f);
+        baseButtonMetrics(btn, 13f, 0.01f);
+        btn.setTypeface(UiKit.BOLD);
         btn.setPadding(0, 0, 0, 0);
-        btn.setText(text.toUpperCase(Locale.US));
+        btn.setText(text);
         btn.setCompoundDrawables(null, null, null, null);
         applyM3Colors(btn, bgColor, textColor);
     }
@@ -14334,7 +14150,7 @@ public final class FishbowlActivity extends AppCompatActivity
         st.setText(sub);
         st.setTextSize(11f);
         st.setTextColor(AppTheme.textMuted());
-        st.setPadding(0, dp(2), dp(8), 0);
+        st.setPaddingRelative(0, dp(2), dp(8), 0);
         col.addView(st);
         row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
         Switch sw = new Switch(this);
@@ -14427,7 +14243,7 @@ public final class FishbowlActivity extends AppCompatActivity
         String label = UpdateManager.CHANNEL_STABLE.equals(ch) ? "Stable" : "Beta";
         showOledDialog("Update available (" + label + ")", "Jellyarr v" + l.name,
                 notesView(l.notes.isEmpty() ? "No release notes." : l.notes),
-                UpdateManager.getInstance(this).isReadyToInstall(l.code) ? "تثبيت التحديث" : "تنزيل التحديث",
+                UpdateManager.getInstance(this).isReadyToInstall(l.code) ? I18n.tr("Install Update") : I18n.tr("Download Update"),
                 getAccentColor(), () -> beginInAppUpdate(ch, l.code),
                 "LATER", () -> UpdateNotifier.setDismissed(this, ch, l.code));
     }
@@ -14479,7 +14295,7 @@ public final class FishbowlActivity extends AppCompatActivity
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(16), dp(6), dp(8), dp(6));
+        row.setPaddingRelative(dp(16), dp(6), dp(8), dp(6));
 
         updateBannerText = new TextView(this);
         updateBannerText.setTextSize(12.5f);
@@ -14487,7 +14303,7 @@ public final class FishbowlActivity extends AppCompatActivity
         updateBannerText.setTextColor(AppTheme.text());
         row.addView(updateBannerText, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        updateBannerInstallBtn = createPixelButton("تثبيت التحديث", AppTheme.accent(), AppTheme.onAccent());
+        updateBannerInstallBtn = createPixelButton(I18n.tr("Install Update"), AppTheme.accent(), AppTheme.onAccent());
         updateBannerInstallBtn.setTextSize(11f);
         updateBannerInstallBtn.setVisibility(View.GONE);
         updateBannerInstallBtn.setOnClickListener(v -> UpdateManager.getInstance(this).installUpdate(this));
@@ -14544,16 +14360,16 @@ public final class FishbowlActivity extends AppCompatActivity
             int pct = total > 0 ? (int) Math.min(100, got * 100 / total) : 0;
             if (pct == updateBannerLastPct && updateBannerBar.getVisibility() == View.VISIBLE) return;
             updateBannerLastPct = pct;
-            updateBannerText.setText("جارٍ تنزيل التحديث" + v + " — " + pct + "%");
+            updateBannerText.setText(I18n.tr("Downloading update") + v + " — " + pct + "%");
             updateBannerProgress.setVisibility(View.VISIBLE);
             updateBannerProgress.setProgress(pct);
             updateBannerInstallBtn.setVisibility(View.GONE);
         } else if (verifying) {
-            updateBannerText.setText("جارٍ التحقق من التحديث" + v + "...");
+            updateBannerText.setText(I18n.tr("Verifying update") + v + "...");
             updateBannerProgress.setVisibility(View.GONE);
             updateBannerInstallBtn.setVisibility(View.GONE);
         } else {
-            updateBannerText.setText("التحديث" + v + " جاهز للتثبيت — 100%");
+            updateBannerText.setText(I18n.tr("Update") + v + " " + I18n.tr("ready to install") + " — 100%");
             updateBannerProgress.setVisibility(View.GONE);
             updateBannerInstallBtn.setVisibility(View.VISIBLE);
         }
@@ -14669,7 +14485,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 updateStatusText.setText(verInfo + "Status: Update Available! (v" + manager.getLatestVersionName() + ")"
                         + (partial > 0 ? "\nSaved so far: " + (partial / (1024 * 1024)) + " MB - the download will resume from here." : "")
                         + "\n\nWhat's new:\n" + manager.getLatestReleaseNotes());
-                updateActionBtn.setText("تنزيل التحديث");
+                updateActionBtn.setText(I18n.tr("Download Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.startDownload(this));
                 break;
@@ -14679,7 +14495,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 break;
             case DOWNLOAD_COMPLETE:
                 updateStatusText.setText(verInfo + "Status: Update downloaded successfully.");
-                updateActionBtn.setText("تثبيت التحديث");
+                updateActionBtn.setText(I18n.tr("Install Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.installUpdate(this));
                 break;
@@ -14689,13 +14505,13 @@ public final class FishbowlActivity extends AppCompatActivity
                 break;
             case VERIFICATION_SUCCESSFUL:
                 updateStatusText.setText(verInfo + "Status: Update downloaded and verified. It is saved on this device - you can install it now or later without downloading again.");
-                updateActionBtn.setText("تثبيت التحديث");
+                updateActionBtn.setText(I18n.tr("Install Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.installUpdate(this));
                 break;
             case VERIFICATION_FAILED:
                 updateStatusText.setText(verInfo + "Status: Update verification failed (corrupt file).");
-                updateActionBtn.setText("تنزيل التحديث");
+                updateActionBtn.setText(I18n.tr("Download Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.startDownload(this));
                 break;
@@ -14707,7 +14523,7 @@ public final class FishbowlActivity extends AppCompatActivity
                 break;
             case DOWNLOAD_FAILED:
                 updateStatusText.setText(verInfo + "Status: Update download failed. Check network connection.");
-                updateActionBtn.setText("تنزيل التحديث");
+                updateActionBtn.setText(I18n.tr("Download Update"));
                 updateActionBtn.setVisibility(View.VISIBLE);
                 updateActionBtn.setOnClickListener(v -> manager.startDownload(this));
                 break;

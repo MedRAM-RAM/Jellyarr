@@ -2,13 +2,10 @@ package com.fishbowl.app;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.graphics.Color;
 import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -34,20 +31,28 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
- * "Transmission" tab: a native client for Transmission's web UI (in the spirit of nzb360).
+ * "Transmission" tab: a native client for the local Transmission daemon.
  *
  * <ul>
- *   <li>TORRENTS - live list (auto refresh every ~3 s while visible), filters, search, sort, and a detail
- *       page with files (wanted / priority), peers, trackers and actions.</li>
- *   <li>ADD - magnet links / URLs / info hashes with optional download dir and start-paused.</li>
- *   <li>SPEED - current rates, global limits, alt-speed (turtle) and session statistics.</li>
- *   <li>SETTINGS - directories, seeding ratio, peer limits, queues, DHT/PEX/LPD, encryption, blocklist, port test.</li>
+ *   <li>Torrents - the main live list (polls every 3 s only while the tab is on screen; rows are
+ *       updated in place so the scroll position stays put), filters, search, sort, and a detail page
+ *       with files (wanted / priority), peers, trackers, info and actions.</li>
+ *   <li>Add - magnet links / URLs / info hashes with an optional folder and start-paused.</li>
+ *   <li>Speed - live rates, alternative (turtle) limits, global limits and statistics.</li>
+ *   <li>Settings - folders, seeding, peers and queues, DHT/PEX/LPD, encryption, blocklist, port test.</li>
+ *   <li>History &amp; cleanup - hosts the app's Download Center (history, clear and cleanup actions)
+ *       injected through {@link #setCenterView(View, Runnable)}.</li>
  * </ul>
  */
 public final class TransmissionTabView {
@@ -57,18 +62,27 @@ public final class TransmissionTabView {
     private static final int S_SPEED = 2;
     private static final int S_SETTINGS = 3;
     private static final int S_CENTER = 4;
+    private static final String[] SECTION_NAMES = {"Torrents", "Add", "Speed", "Settings", "History & cleanup"};
 
-    private static final String[] SECTION_NAMES = {"TORRENTS", "ADD", "SPEED", "SETTINGS", "DOWNLOADS"};
-    private static final String[] FILTER_NAMES = {"All", "Downloading", "Seeding", "Paused", "Error", "Completed"};
-    private static final String[] SORT_NAMES = {"Name", "Date added", "Progress", "Size", "Download speed", "Ratio", "Queue"};
+    private static final int F_ALL = 0;
+    private static final int F_DOWNLOADING = 1;
+    private static final int F_SEEDING = 2;
+    private static final int F_PAUSED = 3;
+    private static final int F_COMPLETED = 4;
+    private static final int F_ERROR = 5;
+    private static final String[] FILTER_NAMES = {"All", "Downloading", "Seeding", "Paused", "Completed", "Error"};
+
+    private static final String[] SORT_NAMES = {"Name", "Date added", "Progress", "Size", "Download speed",
+            "Upload speed", "Ratio", "Queue"};
 
     private static final int D_FILES = 0;
     private static final int D_PEERS = 1;
     private static final int D_TRACKERS = 2;
     private static final int D_INFO = 3;
-    private static final String[] DETAIL_TABS = {"FILES", "PEERS", "TRACKERS", "INFO"};
+    private static final String[] DETAIL_TABS = {"Files", "Peers", "Trackers", "Info"};
 
     private static final long TICK_MS = 3000L;
+    private static final int MAX_FILE_ROWS = 400;
 
     private interface Job<T> { T run(TransmissionApi api) throws Exception; }
     private interface Done<T> { void run(T value); }
@@ -77,39 +91,67 @@ public final class TransmissionTabView {
 
     private final Activity act;
     private final LinearLayout root;
-    private final LinearLayout navRow;
-    private final LinearLayout listContainer;
+    private final TextView headerSub;
+    private final Button pauseAllBtn;
+    private final Button resumeAllBtn;
+    private final TextView[] navChips = new TextView[SECTION_NAMES.length];
     private final ScrollView scroll;
-    private final TextView summary;
-    private final ExecutorService bg = Executors.newFixedThreadPool(2);
+    private final LinearLayout content;
+    /** Polling, reads and quick actions: one thread, so requests never overlap. */
+    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    /** Long operations (add, move, blocklist, port test) so they never stall the live list. */
+    private final ExecutorService slow = Executors.newSingleThreadExecutor();
 
     private int section = S_TORRENTS;
-    private int requestCounter = 0;
+    private int gen = 0;
     private int detailId = 0;
     private int detailTab = D_FILES;
-    private volatile boolean polling = false;
-    private boolean errorShown = false;
+    private boolean pollPending = false;
+    private boolean pollAgain = false;
+    private boolean tickerOn = false;
+    private boolean versionRequested = false;
+    private String version = "";
 
     // torrents list state
     private JSONArray torrents = null;
-    private int filter = 0;
+    private int filter = F_ALL;
     private int sortKey = 1;
     private boolean sortDesc = true;
     private String query = "";
-    private LinearLayout rowsBox = null;
-    private LinearLayout chipRow = null;
+    private LinearLayout listShell = null;
+    private LinearLayout rowsCard = null;
+    private TextView[] filterChips = null;
+    private int styledFilter = -1;
     private TextView countView = null;
-    private TextView banner = null;
+    private LinearLayout banner = null;
+    private TextView bannerText = null;
     private Button sortButton = null;
+    private String emptyKey = null;
+    private final Map<Integer, RowHolder> rowHolders = new HashMap<>();
+    private final List<Integer> rowOrder = new ArrayList<>();
+    private final Set<Integer> busyIds = new HashSet<>();
+    private boolean failureShown = false;
+
+    // detail state
+    private DetailHolder detail = null;
 
     // speed state
     private TextView liveDown = null;
     private TextView liveUp = null;
+    private TextView liveCounts = null;
+
+    // History & cleanup (legacy Download Center)
+    private View centerView = null;
+    private Runnable centerRefresh = null;
 
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
-            if (!root.isAttachedToWindow() || !isLive()) return;
-            if (root.isShown()) tick();
+            if (!tickerOn) return;
+            if (!wantTicker()) {
+                stopTicker();
+                return;
+            }
+            requestSilent();
             root.postDelayed(this, TICK_MS);
         }
     };
@@ -117,56 +159,61 @@ public final class TransmissionTabView {
     public TransmissionTabView(Activity activity) {
         this.act = activity;
 
-        root = new LinearLayout(act);
+        root = new LinearLayout(act) {
+            @Override protected void onAttachedToWindow() {
+                super.onAttachedToWindow();
+                syncTicker();
+            }
+
+            @Override protected void onDetachedFromWindow() {
+                stopTicker();
+                super.onDetachedFromWindow();
+            }
+
+            @Override protected void onVisibilityChanged(View changedView, int visibility) {
+                super.onVisibilityChanged(changedView, visibility);
+                syncTicker();
+            }
+
+            @Override protected void onWindowVisibilityChanged(int visibility) {
+                super.onWindowVisibilityChanged(visibility);
+                syncTicker();
+            }
+        };
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(AppTheme.bg());
 
-        LinearLayout header = new LinearLayout(act);
-        header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(dp(16), dp(12), dp(16), dp(4));
+        // ---- page header: title, live subtitle, Pause All / Resume All
+        LinearLayout actions = UiKit.row(act);
+        pauseAllBtn = compact(UiKit.outline(act, I18n.tr("Pause All"), v -> pauseAll((Button) v)));
+        resumeAllBtn = compact(UiKit.outline(act, I18n.tr("Resume All"), v -> resumeAll((Button) v)));
+        actions.addView(pauseAllBtn, compactLp(false));
+        actions.addView(resumeAllBtn, compactLp(true));
+        LinearLayout header = UiKit.header(act, "Transmission", I18n.tr("Connecting…"), actions);
+        header.setPadding(dp(16), dp(12), dp(16), dp(10));
+        headerSub = UiKit.singleLine(findSubtitle(header));
+        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
 
-        LinearLayout titleRow = new LinearLayout(act);
-        titleRow.setOrientation(LinearLayout.HORIZONTAL);
-        titleRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout titleCol = new LinearLayout(act);
-        titleCol.setOrientation(LinearLayout.VERTICAL);
-        TextView title = text("TRANSMISSION", 14f, AppTheme.text(), true);
-        title.setLetterSpacing(0.14f);
-        titleCol.addView(title);
-        TextView sub = text(I18n.tr("Manage your torrents from here"), 11f, AppTheme.textMuted(), false);
-        sub.setPadding(0, dp(2), 0, 0);
-        titleCol.addView(sub);
-        titleRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        LinearLayout.LayoutParams hb = new LinearLayout.LayoutParams(-2, dp(30));
-        hb.setMarginStart(dp(6));
-        titleRow.addView(actionButton("PAUSE ALL", AppTheme.warning(), v -> pauseAll()), hb);
-        titleRow.addView(actionButton("RESUME ALL", AppTheme.success(), v -> resumeAll()), hb);
-        header.addView(titleRow);
+        // ---- section chips
+        LinearLayout chips = UiKit.row(act);
+        chips.setPadding(dp(16), 0, dp(16), dp(10));
+        for (int i = 0; i < SECTION_NAMES.length; i++) {
+            final int idx = i;
+            TextView c = UiKit.chip(act, I18n.tr(SECTION_NAMES[i]), i == section);
+            c.setOnClickListener(v -> go(idx));
+            navChips[i] = c;
+            chips.addView(c, UiKit.chipLp(act));
+        }
+        HorizontalScrollView navScroll = UiKit.chipScroller(act, chips);
+        root.addView(navScroll, new LinearLayout.LayoutParams(-1, -2));
 
-        summary = text("", 11f, AppTheme.textSecondary(), false);
-        summary.setPadding(0, dp(6), 0, dp(6));
-        header.addView(summary);
-        root.addView(header);
-
-        HorizontalScrollView navScroll = new HorizontalScrollView(act);
-        navScroll.setHorizontalScrollBarEnabled(false);
-        navRow = new LinearLayout(act);
-        navRow.setOrientation(LinearLayout.HORIZONTAL);
-        navRow.setPadding(dp(12), 0, dp(12), dp(6));
-        navScroll.addView(navRow);
-        root.addView(navScroll);
-
+        // ---- scrolling content
         scroll = new ScrollView(act);
-        listContainer = new LinearLayout(act);
-        listContainer.setOrientation(LinearLayout.VERTICAL);
-        listContainer.setPadding(dp(16), 0, dp(16), dp(24));
-        scroll.addView(listContainer, new ViewGroup.LayoutParams(-1, -2));
+        scroll.setFillViewport(true);
+        content = UiKit.column(act);
+        content.setPadding(dp(16), dp(2), dp(16), dp(24));
+        scroll.addView(content, new ViewGroup.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1.0f));
-
-        root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-            @Override public void onViewAttachedToWindow(View v) { if (isLive()) startTicker(); }
-            @Override public void onViewDetachedFromWindow(View v) { stopTicker(); }
-        });
     }
 
     public View getView() { return root; }
@@ -175,221 +222,390 @@ public final class TransmissionTabView {
     public boolean onBack() {
         if (detailId > 0) {
             detailId = 0;
+            detail = null;
             refresh();
             return true;
         }
         if (section != S_TORRENTS) {
-            section = S_TORRENTS;
-            refresh();
+            go(S_TORRENTS);
             return true;
         }
         return false;
     }
 
     public void refresh() {
+        gen++;
         renderNav();
-        stopTicker();
-        errorShown = false;
         liveDown = null;
         liveUp = null;
-        if (detailId > 0) { loadDetail(false); startTicker(); return; }
-        switch (section) {
-            case S_TORRENTS: loadTorrents(false); startTicker(); break;
-            case S_ADD: renderAdd(); break;
-            case S_SPEED: loadSpeed(); startTicker(); break;
-            case S_CENTER: renderCenter(); break;
-            default: loadSettings(); break;
+        liveCounts = null;
+        if (detailId > 0) {
+            boolean same = detail != null && detail.id == detailId && detail.root.getParent() == content;
+            loadDetail(same);
+        } else {
+            detail = null;
+            switch (section) {
+                case S_TORRENTS: loadTorrents(false); break;
+                case S_ADD: renderAdd(); break;
+                case S_SPEED: loadSpeed(); break;
+                case S_CENTER: renderCenter(); break;
+                default: loadSettings(); break;
+            }
         }
+        syncTicker();
     }
 
-    private View centerView = null;
-    private Runnable centerRefresh = null;
-
-    /** Hosts the app's Download Center (history / clear / per-torrent rows) as the DOWNLOADS section. */
+    /** Hosts the app's Download Center (history / clear / cleanup) as the "History & cleanup" section. */
     public void setCenterView(View v, Runnable refreshAction) {
         centerView = v;
         centerRefresh = refreshAction;
     }
 
-    private void renderCenter() {
-        listContainer.removeAllViews();
-        if (centerView == null) return;
-        if (centerView.getParent() instanceof ViewGroup) ((ViewGroup) centerView.getParent()).removeView(centerView);
-        listContainer.addView(centerView);
-        if (centerRefresh != null) centerRefresh.run();
+    private void go(int s) {
+        section = s;
+        detailId = 0;
+        detail = null;
+        scroll.scrollTo(0, 0);
+        refresh();
     }
+
+    private void renderNav() {
+        for (int i = 0; i < navChips.length; i++) {
+            UiKit.styleChip(act, navChips[i], i == section);
+        }
+    }
+
+    // ================================================================== live ticker
 
     private boolean isLive() {
         return detailId > 0 || section == S_TORRENTS || section == S_SPEED;
     }
 
-    private void startTicker() {
-        root.removeCallbacks(ticker);
-        root.postDelayed(ticker, TICK_MS);
+    private boolean wantTicker() {
+        return root != null && isLive() && root.isAttachedToWindow()
+                && root.getWindowVisibility() == View.VISIBLE && root.isShown();
+    }
+
+    private void syncTicker() {
+        if (root == null) return;
+        if (wantTicker()) {
+            if (!tickerOn) {
+                tickerOn = true;
+                root.removeCallbacks(ticker);
+                root.postDelayed(ticker, TICK_MS);
+            }
+        } else {
+            stopTicker();
+        }
     }
 
     private void stopTicker() {
-        root.removeCallbacks(ticker);
+        tickerOn = false;
+        if (root != null) root.removeCallbacks(ticker);
     }
 
-    private void tick() {
+    /** Refreshes the current live screen without a loading state; never stacks requests. */
+    private void requestSilent() {
         if (detailId > 0) loadDetail(true);
         else if (section == S_TORRENTS) loadTorrents(true);
         else if (section == S_SPEED) tickSpeed();
     }
 
-    private void renderNav() {
-        navRow.removeAllViews();
-        for (int i = 0; i < SECTION_NAMES.length; i++) {
-            final int idx = i;
-            TextView p = pill(SECTION_NAMES[i], idx == section && detailId == 0);
-            p.setOnClickListener(v -> { section = idx; detailId = 0; refresh(); });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(34));
-            lp.setMarginEnd(dp(6));
-            navRow.addView(p, lp);
+    private boolean beginPoll() {
+        if (pollPending) {
+            pollAgain = true;
+            return false;
+        }
+        pollPending = true;
+        return true;
+    }
+
+    private void pollDone() {
+        pollPending = false;
+        if (pollAgain) {
+            pollAgain = false;
+            root.postDelayed(() -> {
+                if (wantTicker()) requestSilent();
+            }, 150);
         }
     }
 
     // ================================================================== async helpers
 
-    private <T> void async(final Job<T> job, final Done<T> ok, final Done<Throwable> err) {
-        bg.execute(() -> {
-            try {
-                final TransmissionApi api = TransmissionApi.get(act);
-                final T r = job.run(api);
-                act.runOnUiThread(() -> { if (ok != null) ok.run(r); });
-            } catch (final Throwable t) {
+    private boolean dead() {
+        return act.isFinishing() || act.isDestroyed();
+    }
+
+    private <T> void async(ExecutorService ex, final Job<T> job, final Done<T> ok, final Done<Throwable> err) {
+        try {
+            ex.execute(() -> {
+                T result = null;
+                Throwable failure = null;
+                try {
+                    result = job.run(TransmissionApi.get(act));
+                } catch (Throwable t) {
+                    failure = t;
+                }
+                final T r = result;
+                final Throwable f = failure;
                 act.runOnUiThread(() -> {
-                    if (err != null) err.run(t);
-                    else toast(msg(t));
+                    if (dead()) return;
+                    if (f == null) {
+                        if (ok != null) ok.run(r);
+                    } else if (err != null) {
+                        err.run(f);
+                    } else {
+                        toast(msg(f));
+                    }
                 });
-            }
-        });
-    }
-
-    /** Runs a fire-and-forget action and toasts the outcome. */
-    private void action(final Job<Void> job, final String okMsg, final Runnable after) {
-        async(job, v -> {
-            if (okMsg != null) toast(okMsg);
-            if (after != null) after.run();
-        }, t -> {
-            toast(msg(t));
-            if (after != null) after.run();
-        });
-    }
-
-    private final Runnable afterAction = new Runnable() {
-        @Override public void run() {
-            if (detailId > 0) loadDetail(true);
-            else if (section == S_TORRENTS) loadTorrents(true);
+            });
+        } catch (RejectedExecutionException ignored) {
+            // executor shut down
         }
-    };
+    }
+
+    /** Runs an action with its button disabled, toasts the outcome and refreshes the live screen. */
+    private void runAction(final View button, final Job<Object> job, final String okMsg) {
+        setBusy(button, true);
+        async(io, job, v -> {
+            setBusy(button, false);
+            if (okMsg != null) toast(okMsg);
+            requestSilent();
+        }, t -> {
+            setBusy(button, false);
+            toast(msg(t));
+            requestSilent();
+        });
+    }
+
+    private static void setBusy(View b, boolean busy) {
+        if (b == null) return;
+        b.setEnabled(!busy);
+        b.setAlpha(busy ? 0.5f : 1f);
+    }
 
     private static String msg(Throwable t) {
         String m = t == null ? null : t.getMessage();
-        return m == null ? TransmissionApi.NOT_RUNNING : m;
+        return m == null || m.trim().isEmpty() ? "Unknown error." : m;
     }
 
-    private void toast(String s) { Toast.makeText(act, I18n.tr(s), Toast.LENGTH_SHORT).show(); }
-
-    private void pauseAll() {
-        action(api -> { api.torrentStop(null); return null; }, "All torrents paused.", afterAction);
+    private void toast(String s) {
+        if (s == null || dead()) return;
+        Toast.makeText(act, I18n.tr(s), s.length() > 60 ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
     }
 
-    private void resumeAll() {
-        action(api -> { api.torrentStart(null); return null; }, "All torrents resumed.", afterAction);
+    private void pauseAll(final Button b) {
+        setBusy(resumeAllBtn, true);
+        setBusy(b, true);
+        async(io, api -> { api.torrentStop(null); return null; }, v -> {
+            setBusy(b, false);
+            setBusy(resumeAllBtn, false);
+            toast("All torrents paused.");
+            requestSilent();
+        }, t -> {
+            setBusy(b, false);
+            setBusy(resumeAllBtn, false);
+            toast(msg(t));
+        });
+    }
+
+    private void resumeAll(final Button b) {
+        setBusy(pauseAllBtn, true);
+        setBusy(b, true);
+        async(io, api -> { api.torrentStart(null); return null; }, v -> {
+            setBusy(b, false);
+            setBusy(pauseAllBtn, false);
+            toast("All torrents resumed.");
+            requestSilent();
+        }, t -> {
+            setBusy(b, false);
+            setBusy(pauseAllBtn, false);
+            toast(msg(t));
+        });
+    }
+
+    // ================================================================== screen states
+
+    private void clearScreenRefs() {
+        listShell = null;
+        rowsCard = null;
+        filterChips = null;
+        styledFilter = -1;
+        countView = null;
+        banner = null;
+        bannerText = null;
+        sortButton = null;
+        emptyKey = null;
+        rowHolders.clear();
+        rowOrder.clear();
+        failureShown = false;
+    }
+
+    private void showState(View v) {
+        content.removeAllViews();
+        clearScreenRefs();
+        content.addView(v);
+    }
+
+    private void showLoading(String what) {
+        showState(UiKit.loading(act, I18n.tr(what)));
+    }
+
+    private void showFailure(Throwable t, String what) {
+        View v;
+        if (TransmissionApi.isNotRunning(t)) {
+            v = UiKit.error(act, I18n.tr("Transmission is not running"),
+                    I18n.tr("Start it from the Services tab, then retry."), I18n.tr("Retry"), x -> refresh());
+            headerSub.setText(I18n.tr("Not running"));
+        } else if (TransmissionApi.isAuthError(t)) {
+            v = UiKit.error(act, I18n.tr("Transmission login failed"),
+                    I18n.tr("Check the account in Settings > Security & Identity, then retry."), I18n.tr("Retry"), x -> refresh());
+            headerSub.setText(I18n.tr("Login failed"));
+        } else {
+            v = UiKit.error(act, I18n.tr(what), I18n.tr(msg(t)), I18n.tr("Retry"), x -> refresh());
+            headerSub.setText(I18n.tr("Offline"));
+        }
+        showState(v);
+        failureShown = true;
+    }
+
+    // ================================================================== header
+
+    private void updateHeader(JSONArray arr) {
+        long down = 0, up = 0;
+        for (int i = 0; arr != null && i < arr.length(); i++) {
+            JSONObject t = arr.optJSONObject(i);
+            if (t == null) continue;
+            down += t.optLong("rateDownload");
+            up += t.optLong("rateUpload");
+        }
+        setHeaderSpeeds(down, up, arr == null ? -1 : arr.length());
+        if (!versionRequested) {
+            versionRequested = true;
+            async(io, api -> {
+                String sv = api.sessionGet().optString("version", "");
+                return sv;
+            }, v -> {
+                String s = v == null ? "" : v.trim();
+                int sp = s.indexOf(' ');
+                version = sp > 0 ? s.substring(0, sp) : s;
+            }, t -> versionRequested = false);
+        }
+    }
+
+    private void setHeaderSpeeds(long down, long up, int count) {
+        StringBuilder sb = new StringBuilder();
+        if (!version.isEmpty()) sb.append('v').append(version).append(" · ");
+        sb.append("↓ ").append(fmtSpeed(down)).append(" · ↑ ").append(fmtSpeed(up));
+        if (count >= 0) sb.append(" · ").append(count == 1 ? I18n.tr("1 torrent") : tf("{0} torrents", count));
+        setText(headerSub, sb.toString());
     }
 
     // ================================================================== TORRENTS list
 
     private void loadTorrents(final boolean silent) {
-        if (silent && polling) return;
-        final int req = silent ? requestCounter : ++requestCounter;
-        if (silent) polling = true;
-        if (!silent) {
-            if (torrents != null) renderTorrentsShell();
-            else showMessage("Loading...");
+        final int g = gen;
+        boolean shellReady = listShell != null && listShell.getParent() == content;
+        if (silent) {
+            if (!beginPoll()) return;
+        } else if (!shellReady) {
+            if (torrents != null) {
+                buildListShell();
+                fillRows();
+            } else {
+                showLoading("Loading torrents…");
+            }
         }
-        async(api -> api.torrentList(), arr -> {
-            if (silent) polling = false;
-            if (req != requestCounter || detailId > 0 || section != S_TORRENTS) return;
+        async(io, api -> api.torrentList(), arr -> {
+            if (silent) pollDone();
+            if (g != gen || detailId > 0 || section != S_TORRENTS) return;
             torrents = arr;
-            errorShown = false;
-            if (rowsBox == null || rowsBox.getParent() != listContainer) renderTorrentsShell();
-            banner.setVisibility(View.GONE);
+            if (listShell == null || listShell.getParent() != content) buildListShell();
+            setBanner(null);
             fillRows();
-            updateSummary();
+            updateHeader(arr);
         }, t -> {
-            if (silent) polling = false;
-            if (req != requestCounter || detailId > 0 || section != S_TORRENTS) return;
-            if (torrents != null && rowsBox != null && rowsBox.getParent() == listContainer) {
-                banner.setText(I18n.tr(msg(t)));
-                banner.setVisibility(View.VISIBLE);
-                summary.setText(I18n.tr("Transmission not reachable"));
-            } else if (!errorShown) {
-                showError(t);
+            if (silent) pollDone();
+            if (g != gen || detailId > 0 || section != S_TORRENTS) return;
+            boolean shell = listShell != null && listShell.getParent() == content && torrents != null;
+            if (shell) {
+                setBanner(t);
+                headerSub.setText(I18n.tr(TransmissionApi.isNotRunning(t) ? "Not running" : "Offline"));
+            } else if (!silent || !failureShown) {
+                showFailure(t, "Could not load torrents");
             }
         });
     }
 
-    private void updateSummary() {
-        if (torrents == null) return;
-        long down = 0, up = 0;
-        int active = 0;
-        for (int i = 0; i < torrents.length(); i++) {
-            JSONObject t = torrents.optJSONObject(i);
-            if (t == null) continue;
-            down += t.optLong("rateDownload");
-            up += t.optLong("rateUpload");
-            int st = t.optInt("status");
-            if (st == TransmissionApi.ST_DOWNLOADING || st == TransmissionApi.ST_SEEDING) active++;
+    private void setBanner(Throwable t) {
+        if (banner == null) return;
+        if (t == null) {
+            banner.setVisibility(View.GONE);
+            return;
         }
-        summary.setText("DL " + fmtSpeed(down) + "   UL " + fmtSpeed(up) + "   "
-                + torrents.length() + " " + I18n.tr("torrents") + "   " + active + " " + I18n.tr("active"));
+        String m;
+        if (TransmissionApi.isNotRunning(t)) m = I18n.tr("Transmission stopped responding. Showing the last known list.");
+        else if (TransmissionApi.isAuthError(t)) m = I18n.tr(TransmissionApi.AUTH_FAILED);
+        else m = I18n.tr(msg(t));
+        setText(bannerText, m);
+        banner.setVisibility(View.VISIBLE);
     }
 
-    private void renderTorrentsShell() {
-        listContainer.removeAllViews();
-        errorShown = false;
+    private void buildListShell() {
+        content.removeAllViews();
+        clearScreenRefs();
+        listShell = UiKit.column(act);
 
-        banner = text("", 11.5f, AppTheme.danger(), false);
-        banner.setPadding(0, dp(8), 0, dp(2));
+        banner = UiKit.column(act);
+        banner.setPadding(dp(12), dp(10), dp(12), dp(10));
+        banner.setBackground(UiKit.shape(act, AppTheme.dangerContainer(), 0, UiKit.R_INNER));
+        bannerText = UiKit.body(act, "");
+        bannerText.setTextColor(AppTheme.text());
+        banner.addView(bannerText);
         banner.setVisibility(View.GONE);
-        listContainer.addView(banner);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, -2);
+        blp.bottomMargin = dp(12);
+        listShell.addView(banner, blp);
 
-        LinearLayout bar = new LinearLayout(act);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(0, dp(8), 0, dp(4));
-        final EditText search = new EditText(act);
-        search.setHint(I18n.tr("Search torrents"));
-        search.setHintTextColor(AppTheme.textMuted());
-        search.setTextColor(AppTheme.text());
-        search.setTextSize(13f);
-        search.setSingleLine(true);
+        // search + sort
+        LinearLayout bar = UiKit.row(act);
+        final EditText search = UiKit.input(act, I18n.tr("Search torrents"));
         search.setText(query);
         search.setSelection(search.getText().length());
-        bar.addView(search, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        sortButton = actionButton(sortLabel(), AppTheme.accent(), v -> showSortDialog());
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, dp(36));
+        bar.addView(search, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        sortButton = UiKit.outline(act, sortLabel(), v -> showSortDialog());
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, dp(44));
         slp.setMarginStart(dp(8));
         bar.addView(sortButton, slp);
-        listContainer.addView(bar);
+        listShell.addView(bar, new LinearLayout.LayoutParams(-1, -2));
 
-        HorizontalScrollView chipScroll = new HorizontalScrollView(act);
-        chipScroll.setHorizontalScrollBarEnabled(false);
-        chipRow = new LinearLayout(act);
-        chipRow.setOrientation(LinearLayout.HORIZONTAL);
-        chipScroll.addView(chipRow);
-        listContainer.addView(chipScroll);
+        // filter chips (counts updated in place)
+        LinearLayout chips = UiKit.row(act);
+        chips.setPadding(0, dp(12), 0, dp(4));
+        filterChips = new TextView[FILTER_NAMES.length];
+        for (int f = 0; f < FILTER_NAMES.length; f++) {
+            final int fi = f;
+            TextView c = UiKit.chip(act, I18n.tr(FILTER_NAMES[f]), f == filter);
+            c.setOnClickListener(v -> {
+                filter = fi;
+                scroll.scrollTo(0, 0);
+                fillRows();
+            });
+            filterChips[f] = c;
+            chips.addView(c, UiKit.chipLp(act));
+        }
+        styledFilter = filter;
+        listShell.addView(UiKit.chipScroller(act, chips), new LinearLayout.LayoutParams(-1, -2));
 
-        countView = text("", 11f, AppTheme.textSecondary(), false);
-        countView.setPadding(0, dp(8), 0, dp(2));
-        listContainer.addView(countView);
+        countView = UiKit.overline(act, "");
+        countView.setPadding(0, dp(12), 0, dp(8));
+        listShell.addView(countView);
 
-        rowsBox = new LinearLayout(act);
-        rowsBox.setOrientation(LinearLayout.VERTICAL);
-        listContainer.addView(rowsBox);
+        rowsCard = UiKit.card(act);
+        rowsCard.setPadding(dp(4), dp(4), dp(4), dp(4));
+        listShell.addView(rowsCard);
+
+        content.addView(listShell, new LinearLayout.LayoutParams(-1, -2));
 
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
@@ -402,32 +618,25 @@ public final class TransmissionTabView {
     }
 
     private String sortLabel() {
-        return I18n.tr("SORT") + ": " + I18n.tr(SORT_NAMES[sortKey]) + (sortDesc ? " v" : " ^");
+        return I18n.tr("Sort") + ": " + I18n.tr(SORT_NAMES[sortKey]) + (sortDesc ? " ↓" : " ↑");
     }
 
     private void showSortDialog() {
-        final LinearLayout body = dialogBody(I18n.tr("Sort by"));
-        final Dialog d = dialog(body);
-        for (int i = 0; i < SORT_NAMES.length; i++) {
-            final int idx = i;
-            boolean sel = idx == sortKey;
-            Button b = actionButton((sel ? (sortDesc ? "v  " : "^  ") : "") + I18n.tr(SORT_NAMES[i]),
-                    sel ? AppTheme.accent() : AppTheme.textSecondary(), v -> {
-                        if (idx == sortKey) sortDesc = !sortDesc;
-                        else { sortKey = idx; sortDesc = idx != 0 && idx != 6; }
-                        d.dismiss();
-                        if (sortButton != null) sortButton.setText(sortLabel());
-                        fillRows();
-                    });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(36));
-            lp.topMargin = dp(6);
-            body.addView(b, lp);
-        }
-        d.show();
+        String[] items = new String[SORT_NAMES.length];
+        for (int i = 0; i < items.length; i++) items[i] = SORT_NAMES[i];
+        choose("Sort by", items, sortKey, idx -> {
+            if (idx == sortKey) sortDesc = !sortDesc;
+            else {
+                sortKey = idx;
+                sortDesc = idx != 0 && idx != 7;
+            }
+            if (sortButton != null) sortButton.setText(sortLabel());
+            fillRows();
+        });
     }
 
     private void fillRows() {
-        if (rowsBox == null || torrents == null) return;
+        if (rowsCard == null || torrents == null) return;
         int[] counts = new int[FILTER_NAMES.length];
         List<JSONObject> list = new ArrayList<>();
         String q = query.trim().toLowerCase(Locale.ROOT);
@@ -440,45 +649,100 @@ public final class TransmissionTabView {
             list.add(t);
         }
 
-        chipRow.removeAllViews();
-        for (int f = 0; f < FILTER_NAMES.length; f++) {
-            final int fi = f;
-            TextView chip = pill(FILTER_NAMES[f], false);
-            chip.setText(I18n.tr(FILTER_NAMES[f]) + " " + counts[f]);
-            boolean sel = f == filter;
-            chip.setTextColor(sel ? AppTheme.onAccent() : AppTheme.textSecondary());
-            chip.setBackground(rounded(sel ? AppTheme.accent() : AppTheme.card(), AppTheme.outline(), 17));
-            chip.setOnClickListener(v -> { filter = fi; fillRows(); });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(32));
-            lp.setMarginEnd(dp(6));
-            chipRow.addView(chip, lp);
+        if (filterChips != null) {
+            for (int f = 0; f < filterChips.length; f++) {
+                setText(filterChips[f], I18n.tr(FILTER_NAMES[f]) + "  " + counts[f]);
+            }
+            if (styledFilter != filter) {
+                for (int f = 0; f < filterChips.length; f++) UiKit.styleChip(act, filterChips[f], f == filter);
+                styledFilter = filter;
+            }
         }
 
         final int key = sortKey;
         final int dir = sortDesc ? -1 : 1;
-        Collections.sort(list, (a, b) -> dir * compare(a, b, key));
+        Collections.sort(list, (a, b) -> {
+            int c = dir * compare(a, b, key);
+            return c != 0 ? c : Integer.compare(a.optInt("id"), b.optInt("id"));
+        });
 
-        countView.setText(list.size() + " / " + torrents.length() + " " + I18n.tr("torrents"));
-        rowsBox.removeAllViews();
+        setText(countView, tf("{0} of {1} torrents", list.size(), torrents.length()));
+
         if (list.isEmpty()) {
-            TextView t = text(I18n.tr(torrents.length() == 0
-                    ? "No torrents yet. Open the ADD tab to add one." : "No matches."),
-                    12f, AppTheme.textSecondary(), false);
-            t.setPadding(0, dp(12), 0, 0);
-            rowsBox.addView(t);
+            String k = torrents.length() == 0 ? "none" : "nomatch";
+            if (k.equals(emptyKey) && rowOrder.isEmpty()) return;
+            rowsCard.removeAllViews();
+            rowHolders.clear();
+            rowOrder.clear();
+            emptyKey = k;
+            if (torrents.length() == 0) {
+                LinearLayout box = UiKit.column(act);
+                box.addView(UiKit.empty(act, I18n.tr("No torrents yet"),
+                        I18n.tr("Add a magnet link, a .torrent URL or an info hash.")));
+                Button add = UiKit.tonal(act, I18n.tr("Add Torrent"), v -> go(S_ADD));
+                LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-2, dp(42));
+                alp.gravity = Gravity.CENTER_HORIZONTAL;
+                alp.bottomMargin = dp(20);
+                box.addView(add, alp);
+                rowsCard.addView(box, new LinearLayout.LayoutParams(-1, -2));
+            } else {
+                rowsCard.addView(UiKit.empty(act, I18n.tr("No matches"),
+                        I18n.tr("Try another filter or search term.")), new LinearLayout.LayoutParams(-1, -2));
+            }
             return;
         }
-        for (JSONObject t : list) rowsBox.addView(torrentRow(t));
+        emptyKey = null;
+
+        List<Integer> ids = new ArrayList<>();
+        for (JSONObject t : list) ids.add(t.optInt("id"));
+        if (ids.equals(rowOrder)) {
+            for (JSONObject t : list) {
+                RowHolder h = rowHolders.get(t.optInt("id"));
+                if (h != null) h.bind(t);
+            }
+            return;
+        }
+
+        // Order or membership changed: re-attach (reusing existing rows) and keep the scroll position.
+        final int y = scroll.getScrollY();
+        Map<Integer, RowHolder> old = new HashMap<>(rowHolders);
+        rowsCard.removeAllViews();
+        rowHolders.clear();
+        rowOrder.clear();
+        for (int i = 0; i < list.size(); i++) {
+            JSONObject t = list.get(i);
+            int id = t.optInt("id");
+            RowHolder h = old.get(id);
+            if (h == null) h = new RowHolder();
+            if (i > 0) rowsCard.addView(listDivider());
+            h.bind(t);
+            rowsCard.addView(h.view, new LinearLayout.LayoutParams(-1, -2));
+            rowHolders.put(id, h);
+            rowOrder.add(id);
+        }
+        scroll.post(() -> scroll.scrollTo(0, y));
+    }
+
+    private View listDivider() {
+        View d = UiKit.divider(act);
+        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) d.getLayoutParams();
+        lp.topMargin = 0;
+        lp.bottomMargin = 0;
+        lp.setMarginStart(dp(12));
+        lp.setMarginEnd(dp(12));
+        d.setLayoutParams(lp);
+        return d;
     }
 
     private static int compare(JSONObject a, JSONObject b, int key) {
         switch (key) {
             case 0: return a.optString("name", "").compareToIgnoreCase(b.optString("name", ""));
             case 1: return Long.compare(a.optLong("addedDate"), b.optLong("addedDate"));
-            case 2: return Double.compare(a.optDouble("percentDone"), b.optDouble("percentDone"));
-            case 3: return Long.compare(a.optLong("totalSize"), b.optLong("totalSize"));
+            case 2: return Double.compare(progressOf(a), progressOf(b));
+            case 3: return Long.compare(a.optLong("sizeWhenDone"), b.optLong("sizeWhenDone"));
             case 4: return Long.compare(a.optLong("rateDownload"), b.optLong("rateDownload"));
-            case 5: return Double.compare(a.optDouble("uploadRatio"), b.optDouble("uploadRatio"));
+            case 5: return Long.compare(a.optLong("rateUpload"), b.optLong("rateUpload"));
+            case 6: return Double.compare(a.optDouble("uploadRatio", 0), b.optDouble("uploadRatio", 0));
             default: return Integer.compare(a.optInt("queuePosition"), b.optInt("queuePosition"));
         }
     }
@@ -488,704 +752,1053 @@ public final class TransmissionTabView {
                 || (t.optLong("sizeWhenDone") > 0 && t.optLong("leftUntilDone", 1) == 0);
     }
 
+    private static boolean hasError(JSONObject t) {
+        int e = t.optInt("error");
+        return e == TransmissionApi.ERR_TRACKER_ERROR || e == TransmissionApi.ERR_LOCAL;
+    }
+
     private static boolean matches(JSONObject t, int f) {
         int st = t.optInt("status");
         switch (f) {
-            case 1: return st == TransmissionApi.ST_DOWNLOADING || st == TransmissionApi.ST_DOWNLOAD_WAIT;
-            case 2: return st == TransmissionApi.ST_SEEDING || st == TransmissionApi.ST_SEED_WAIT;
-            case 3: return st == TransmissionApi.ST_STOPPED;
-            case 4: return t.optInt("error") != 0;
-            case 5: return isDone(t);
+            case F_DOWNLOADING: return st == TransmissionApi.ST_DOWNLOADING || st == TransmissionApi.ST_DOWNLOAD_WAIT;
+            case F_SEEDING: return st == TransmissionApi.ST_SEEDING || st == TransmissionApi.ST_SEED_WAIT;
+            case F_PAUSED: return st == TransmissionApi.ST_STOPPED && !isDone(t);
+            case F_COMPLETED: return isDone(t);
+            case F_ERROR: return hasError(t);
             default: return true;
         }
     }
 
+    /** 0..1: verification progress while checking, metadata progress for fresh magnets, else percentDone. */
+    private static double progressOf(JSONObject t) {
+        int st = t.optInt("status");
+        if (st == TransmissionApi.ST_CHECKING) return t.optDouble("recheckProgress", 0);
+        if (t.optDouble("metadataPercentComplete", 1) < 1.0) return t.optDouble("metadataPercentComplete", 0);
+        return t.optDouble("percentDone", 0);
+    }
+
     private static String statusLabel(JSONObject t) {
-        if (t.optInt("error") != 0) return "Error";
+        if (hasError(t)) return "Error";
         switch (t.optInt("status")) {
             case TransmissionApi.ST_STOPPED: return isDone(t) ? "Completed" : "Paused";
             case TransmissionApi.ST_CHECK_WAIT: return "Queued to verify";
             case TransmissionApi.ST_CHECKING: return "Verifying";
             case TransmissionApi.ST_DOWNLOAD_WAIT: return "Queued";
-            case TransmissionApi.ST_DOWNLOADING: return "Downloading";
+            case TransmissionApi.ST_DOWNLOADING:
+                return t.optDouble("metadataPercentComplete", 1) < 1.0 ? "Fetching metadata" : "Downloading";
             case TransmissionApi.ST_SEED_WAIT: return "Queued to seed";
             case TransmissionApi.ST_SEEDING: return "Seeding";
             default: return "Unknown";
         }
     }
 
-    private static int statusColor(JSONObject t) {
-        if (t.optInt("error") != 0) return AppTheme.danger();
+    /** Downloading = accent, seeding / completed = success, paused = muted, error = danger, waiting = warning. */
+    private static int stateColor(JSONObject t) {
+        if (hasError(t)) return AppTheme.danger();
         switch (t.optInt("status")) {
             case TransmissionApi.ST_STOPPED: return isDone(t) ? AppTheme.success() : AppTheme.textMuted();
             case TransmissionApi.ST_DOWNLOADING: return AppTheme.accent();
-            case TransmissionApi.ST_SEEDING: return AppTheme.success();
+            case TransmissionApi.ST_SEEDING:
+            case TransmissionApi.ST_SEED_WAIT: return AppTheme.success();
             default: return AppTheme.warning();
         }
     }
 
-    private View torrentRow(final JSONObject t) {
-        final int id = t.optInt("id");
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(dp(12), dp(10), dp(12), dp(10));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        row.setLayoutParams(lp);
-        row.setOnClickListener(v -> { detailId = id; detailTab = D_FILES; refresh(); });
-
-        LinearLayout top = new LinearLayout(act);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        TextView name = text(t.optString("name", "?"), 13f, AppTheme.text(), true);
-        name.setMaxLines(2);
-        name.setEllipsize(TextUtils.TruncateAt.END);
-        top.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        final boolean stopped = t.optInt("status") == TransmissionApi.ST_STOPPED;
-        Button quick = actionButton(stopped ? "START" : "PAUSE", stopped ? AppTheme.success() : AppTheme.warning(), v -> {
-            final int[] ids = new int[]{id};
-            if (stopped) action(api -> { api.torrentStart(ids); return null; }, null, afterAction);
-            else action(api -> { api.torrentStop(ids); return null; }, null, afterAction);
-        });
-        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(-2, dp(28));
-        qlp.setMarginStart(dp(8));
-        top.addView(quick, qlp);
-        row.addView(top);
-
-        double pct = t.optDouble("percentDone", 0);
-        if (t.optInt("status") == TransmissionApi.ST_CHECKING) pct = t.optDouble("recheckProgress", pct);
-        row.addView(progressBar(pct, statusColor(t)));
-
-        String l1 = I18n.tr(statusLabel(t)) + "  -  " + fmtPct(pct) + "  -  "
-                + fmtSize(t.optLong("sizeWhenDone")) + (t.optInt("status") == TransmissionApi.ST_SEEDING
-                ? "  -  " + I18n.tr("Ratio") + " " + fmtRatio(t.optDouble("uploadRatio")) : "");
-        TextView tl1 = text(l1, 10.5f, statusColor(t), false);
-        tl1.setPadding(0, dp(4), 0, 0);
-        row.addView(tl1);
-
-        StringBuilder l2 = new StringBuilder();
-        l2.append("DL ").append(fmtSpeed(t.optLong("rateDownload")))
-                .append("   UL ").append(fmtSpeed(t.optLong("rateUpload")));
-        if (t.optInt("status") == TransmissionApi.ST_DOWNLOADING) l2.append("   ETA ").append(fmtEta(t.optLong("eta", -1)));
-        l2.append("   ").append(I18n.tr("Peers")).append(" ")
-                .append(t.optInt("peersSendingToUs")).append("/").append(t.optInt("peersConnected"));
-        TextView tl2 = text(l2.toString(), 10.5f, AppTheme.textSecondary(), false);
-        tl2.setPadding(0, dp(2), 0, 0);
-        row.addView(tl2);
-
-        if (t.optInt("error") != 0 && !t.optString("errorString").isEmpty()) {
-            TextView er = text(t.optString("errorString"), 10.5f, AppTheme.danger(), false);
-            er.setMaxLines(2);
-            er.setEllipsize(TextUtils.TruncateAt.END);
-            er.setPadding(0, dp(2), 0, 0);
-            row.addView(er);
-        }
-        return row;
+    private static String sizeLine(JSONObject t, double pct) {
+        long want = t.optLong("sizeWhenDone");
+        long have = Math.max(0, want - t.optLong("leftUntilDone"));
+        String s = fmtPct(pct);
+        if (want > 0 && !isDone(t)) s += " · " + fmtSize(have) + " / " + fmtSize(want);
+        else if (want > 0) s += " · " + fmtSize(want);
+        return s;
     }
 
-    private View progressBar(double pct, int color) {
-        if (pct < 0) pct = 0;
-        if (pct > 1) pct = 1;
-        LinearLayout track = new LinearLayout(act);
-        track.setOrientation(LinearLayout.HORIZONTAL);
-        track.setWeightSum(1000f);
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(AppTheme.inner());
-        g.setCornerRadius(dp(3));
-        track.setBackground(g);
-        View fill = new View(act);
-        GradientDrawable fg = new GradientDrawable();
-        fg.setColor(color);
-        fg.setCornerRadius(dp(3));
-        fill.setBackground(fg);
-        track.addView(fill, new LinearLayout.LayoutParams(0, -1, (float) (pct * 1000.0)));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(6));
-        lp.topMargin = dp(8);
-        track.setLayoutParams(lp);
-        return track;
+    private static String rateLine(JSONObject t) {
+        int st = t.optInt("status");
+        StringBuilder sb = new StringBuilder();
+        sb.append("↓ ").append(fmtSpeed(t.optLong("rateDownload")))
+                .append(" · ↑ ").append(fmtSpeed(t.optLong("rateUpload")));
+        if (st == TransmissionApi.ST_DOWNLOADING) sb.append(" · ").append(I18n.tr("ETA")).append(' ').append(fmtEta(t.optLong("eta", -1)));
+        if (st == TransmissionApi.ST_DOWNLOADING || st == TransmissionApi.ST_SEEDING) {
+            sb.append(" · ").append(tf("Peers {0}/{1}", t.optInt("peersSendingToUs") + t.optInt("peersGettingFromUs"),
+                    t.optInt("peersConnected")));
+        }
+        sb.append(" · ").append(tf("Ratio {0}", fmtRatio(t.optDouble("uploadRatio", -1))));
+        return sb.toString();
+    }
+
+    /** One torrent row, updated in place on every poll. */
+    private final class RowHolder {
+        int id;
+        boolean stopped;
+        final LinearLayout view;
+        final TextView name;
+        final Button quick;
+        final LinearLayout metaRow;
+        String badgeKey = "";
+        final TextView meta;
+        final View progress;
+        int progressColor;
+        final TextView rates;
+        final TextView error;
+
+        RowHolder() {
+            view = UiKit.column(act);
+            view.setPadding(dp(12), dp(12), dp(12), dp(12));
+            view.setBackground(UiKit.rowRipple(act));
+            view.setClickable(true);
+            view.setFocusable(true);
+            view.setOnClickListener(v -> openDetail(id));
+
+            LinearLayout top = UiKit.row(act);
+            name = UiKit.singleLine(UiKit.text(act, "", 14f, AppTheme.text(), UiKit.MEDIUM));
+            top.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
+            quick = compact(UiKit.outline(act, "", null));
+            quick.setOnClickListener(v -> toggleTorrent(id, stopped, v));
+            LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(-2, dp(32));
+            qlp.setMarginStart(dp(10));
+            top.addView(quick, qlp);
+            view.addView(top);
+
+            metaRow = UiKit.row(act);
+            metaRow.setPadding(0, dp(6), 0, 0);
+            metaRow.addView(UiKit.badge(act, "", AppTheme.textMuted()));
+            meta = UiKit.singleLine(UiKit.caption(act, ""));
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+            mlp.setMarginStart(dp(8));
+            metaRow.addView(meta, mlp);
+            view.addView(metaRow);
+
+            progressColor = AppTheme.accent();
+            progress = UiKit.progress(act, 0, progressColor);
+            view.addView(progress);
+
+            rates = UiKit.singleLine(UiKit.caption(act, ""));
+            rates.setPadding(0, dp(6), 0, 0);
+            view.addView(rates);
+
+            error = UiKit.caption(act, "");
+            error.setMaxLines(2);
+            error.setEllipsize(TextUtils.TruncateAt.END);
+            error.setPadding(0, dp(4), 0, 0);
+            error.setVisibility(View.GONE);
+            view.addView(error);
+        }
+
+        void bind(JSONObject t) {
+            id = t.optInt("id");
+            stopped = t.optInt("status") == TransmissionApi.ST_STOPPED;
+            setText(name, t.optString("name", "?"));
+            setText(quick, I18n.tr(stopped ? "Resume" : "Pause"));
+            boolean busy = busyIds.contains(id);
+            if (quick.isEnabled() == busy) setBusy(quick, busy);
+
+            String label = statusLabel(t);
+            int color = stateColor(t);
+            String key = label + "|" + color;
+            if (!key.equals(badgeKey)) {
+                badgeKey = key;
+                metaRow.removeViewAt(0);
+                metaRow.addView(UiKit.badge(act, I18n.tr(label), color), 0);
+            }
+            double pct = progressOf(t);
+            setText(meta, sizeLine(t, pct));
+            progressColor = updateProgress(progress, pct * 100.0, color, progressColor);
+            setText(rates, rateLine(t));
+            bindError(error, t);
+        }
+    }
+
+    private void bindError(TextView error, JSONObject t) {
+        int e = t.optInt("error");
+        String es = t.optString("errorString", "");
+        if (e != TransmissionApi.ERR_NONE && !es.isEmpty()) {
+            setText(error, (e == TransmissionApi.ERR_TRACKER_WARNING ? I18n.tr("Tracker warning") + ": " : "") + es);
+            error.setTextColor(e == TransmissionApi.ERR_TRACKER_WARNING ? AppTheme.warning() : AppTheme.danger());
+            error.setVisibility(View.VISIBLE);
+        } else if (error.getVisibility() != View.GONE) {
+            error.setVisibility(View.GONE);
+        }
+    }
+
+    private void toggleTorrent(final int id, final boolean wasStopped, final View button) {
+        final int[] ids = new int[]{id};
+        busyIds.add(id);
+        setBusy(button, true);
+        async(io, api -> {
+            if (wasStopped) api.torrentStart(ids);
+            else api.torrentStop(ids);
+            return null;
+        }, v -> {
+            busyIds.remove(id);
+            setBusy(button, false);
+            requestSilent();
+        }, t -> {
+            busyIds.remove(id);
+            setBusy(button, false);
+            toast(msg(t));
+        });
+    }
+
+    /** Updates a {@link UiKit#progress} bar in place; returns the colour now applied. */
+    private int updateProgress(View track, double percent, int color, int currentColor) {
+        if (!(track instanceof LinearLayout)) return currentColor;
+        LinearLayout l = (LinearLayout) track;
+        if (l.getChildCount() < 2) return currentColor;
+        View fill = l.getChildAt(0);
+        View rest = l.getChildAt(1);
+        if (!(fill.getLayoutParams() instanceof LinearLayout.LayoutParams)
+                || !(rest.getLayoutParams() instanceof LinearLayout.LayoutParams)) return currentColor;
+        float p = (float) Math.max(0, Math.min(100, percent));
+        LinearLayout.LayoutParams a = (LinearLayout.LayoutParams) fill.getLayoutParams();
+        LinearLayout.LayoutParams b = (LinearLayout.LayoutParams) rest.getLayoutParams();
+        float wa = Math.max(p, 0.001f);
+        float wb = Math.max(100f - p, 0.001f);
+        if (Math.abs(a.weight - wa) > 0.01f || Math.abs(b.weight - wb) > 0.01f) {
+            a.weight = wa;
+            b.weight = wb;
+            fill.setLayoutParams(a);
+            rest.setLayoutParams(b);
+        }
+        if (color != currentColor) fill.setBackground(UiKit.shape(act, color, 0, UiKit.R_PILL));
+        return color;
+    }
+
+    private void openDetail(int id) {
+        if (id <= 0) return;
+        detailId = id;
+        detailTab = D_FILES;
+        detail = null;
+        scroll.scrollTo(0, 0);
+        refresh();
     }
 
     // ================================================================== torrent DETAIL
 
     private void loadDetail(final boolean silent) {
-        if (silent && polling) return;
+        final int g = gen;
         final int id = detailId;
-        final int req = silent ? requestCounter : ++requestCounter;
-        if (silent) polling = true;
-        else showMessage("Loading...");
-        async(api -> api.torrentDetails(id), t -> {
-            if (silent) polling = false;
-            if (req != requestCounter || id != detailId) return;
-            errorShown = false;
-            int y = scroll.getScrollY();
-            renderDetail(t);
-            if (silent) {
-                final int fy = y;
-                scroll.post(() -> scroll.scrollTo(0, fy));
-            }
+        if (silent) {
+            if (!beginPoll()) return;
+        } else {
+            showLoading("Loading torrent…");
+        }
+        async(io, api -> api.torrentDetails(id), t -> {
+            if (silent) pollDone();
+            if (g != gen || id != detailId) return;
+            if (detail != null && detail.id == id && detail.root.getParent() == content) detail.update(t);
+            else renderDetail(t);
         }, e -> {
-            if (silent) polling = false;
-            if (req != requestCounter || id != detailId) return;
-            String m = msg(e);
-            if (m.contains("not found")) {
+            if (silent) pollDone();
+            if (g != gen || id != detailId) return;
+            boolean shown = detail != null && detail.id == id && detail.root.getParent() == content;
+            if (msg(e).startsWith("Torrent not found")) {
+                toast("This torrent was removed.");
                 detailId = 0;
+                detail = null;
                 refresh();
-            } else if (!silent) {
-                showError(e);
+            } else if (shown) {
+                headerSub.setText(I18n.tr(TransmissionApi.isNotRunning(e) ? "Not running" : "Offline"));
+            } else if (!silent || !failureShown) {
+                showFailure(e, "Could not load the torrent");
             }
         });
     }
 
     private void renderDetail(final JSONObject t) {
-        final int id = t.optInt("id");
-        listContainer.removeAllViews();
+        content.removeAllViews();
+        clearScreenRefs();
+        detail = new DetailHolder(t);
+        content.addView(detail.root, new LinearLayout.LayoutParams(-1, -2));
+    }
 
-        LinearLayout head = new LinearLayout(act);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        head.setPadding(0, dp(10), 0, dp(4));
-        head.addView(actionButton("< BACK", AppTheme.accent(), v -> onBack()), new LinearLayout.LayoutParams(-2, dp(32)));
-        listContainer.addView(head);
+    /** The detail page; refreshed in place by the ticker. */
+    private final class DetailHolder {
+        final int id;
+        final LinearLayout root;
+        final TextView name;
+        final LinearLayout metaRow;
+        String badgeKey = "";
+        final TextView meta;
+        final View progress;
+        int progressColor;
+        final TextView rates;
+        final TextView error;
+        final Button toggle;
+        boolean stopped;
+        final TextView[] tabChips = new TextView[DETAIL_TABS.length];
+        final LinearLayout body;
+        JSONObject last;
+        String bodySignature = "";
+        final List<FileHolder> files = new ArrayList<>();
 
-        TextView name = text(t.optString("name", "?"), 14f, AppTheme.text(), true);
-        name.setPadding(0, dp(4), 0, dp(2));
-        listContainer.addView(name);
+        DetailHolder(JSONObject t) {
+            id = t.optInt("id");
+            last = t;
+            root = UiKit.column(act);
 
-        double pct = t.optDouble("percentDone", 0);
-        if (t.optInt("status") == TransmissionApi.ST_CHECKING) pct = t.optDouble("recheckProgress", pct);
-        listContainer.addView(progressBar(pct, statusColor(t)));
-        TextView st = text(I18n.tr(statusLabel(t)) + "  -  " + fmtPct(pct) + "  -  "
-                + fmtSize(t.optLong("sizeWhenDone") - t.optLong("leftUntilDone")) + " / " + fmtSize(t.optLong("sizeWhenDone")),
-                11.5f, statusColor(t), true);
-        st.setPadding(0, dp(6), 0, 0);
-        listContainer.addView(st);
-        if (t.optInt("error") != 0 && !t.optString("errorString").isEmpty()) {
-            TextView er = text(t.optString("errorString"), 11f, AppTheme.danger(), false);
-            er.setPadding(0, dp(2), 0, 0);
-            listContainer.addView(er);
+            Button back = compact(UiKit.outline(act, I18n.tr("Back"), v -> onBack()));
+            LinearLayout.LayoutParams bk = new LinearLayout.LayoutParams(-2, dp(34));
+            bk.bottomMargin = dp(12);
+            root.addView(back, bk);
+
+            LinearLayout card = UiKit.card(act);
+            name = UiKit.title(act, t.optString("name", "?"));
+            name.setMaxLines(3);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            name.setTextIsSelectable(true);
+            card.addView(name);
+            metaRow = UiKit.row(act);
+            metaRow.setPadding(0, dp(8), 0, 0);
+            metaRow.addView(UiKit.badge(act, "", AppTheme.textMuted()));
+            meta = UiKit.singleLine(UiKit.caption(act, ""));
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+            mlp.setMarginStart(dp(8));
+            metaRow.addView(meta, mlp);
+            card.addView(metaRow);
+            progressColor = AppTheme.accent();
+            progress = UiKit.progress(act, 0, progressColor);
+            card.addView(progress);
+            rates = UiKit.caption(act, "");
+            rates.setPadding(0, dp(8), 0, 0);
+            card.addView(rates);
+            error = UiKit.caption(act, "");
+            error.setPadding(0, dp(4), 0, 0);
+            error.setVisibility(View.GONE);
+            card.addView(error);
+
+            final int[] ids = new int[]{id};
+            toggle = UiKit.primary(act, "", v -> {
+                final boolean wasStopped = stopped;
+                runAction(v, api -> {
+                    if (wasStopped) api.torrentStart(ids);
+                    else api.torrentStop(ids);
+                    return null;
+                }, wasStopped ? "Resumed." : "Paused.");
+            });
+            Button verify = UiKit.outline(act, I18n.tr("Verify"), v ->
+                    runAction(v, api -> { api.torrentVerify(ids); return null; }, "Verifying local data…"));
+            Button announce = UiKit.outline(act, I18n.tr("Reannounce"), v ->
+                    runAction(v, api -> { api.torrentReannounce(ids); return null; }, "Reannounce requested."));
+            card.addView(UiKit.buttonRow(act, toggle, verify, announce));
+
+            Button move = UiKit.outline(act, I18n.tr("Move"), v -> showMoveDialog(id, last.optString("downloadDir", "")));
+            Button queue = UiKit.outline(act, I18n.tr("Queue"), v -> showQueueDialog(id));
+            Button remove = UiKit.danger(act, I18n.tr("Remove"), v -> showRemoveDialog(id, last.optString("name", "")));
+            LinearLayout r2 = UiKit.buttonRow(act, move, queue, remove);
+            card.addView(r2);
+            root.addView(card);
+
+            LinearLayout chips = UiKit.row(act);
+            chips.setPadding(0, dp(4), 0, dp(12));
+            for (int i = 0; i < DETAIL_TABS.length; i++) {
+                final int ti = i;
+                TextView c = UiKit.chip(act, I18n.tr(DETAIL_TABS[i]), i == detailTab);
+                c.setOnClickListener(v -> selectTab(ti));
+                tabChips[i] = c;
+                chips.addView(c, UiKit.chipLp(act));
+            }
+            root.addView(UiKit.chipScroller(act, chips), new LinearLayout.LayoutParams(-1, -2));
+
+            body = UiKit.column(act);
+            root.addView(body, new LinearLayout.LayoutParams(-1, -2));
+
+            bindSummary(t);
+            renderBody(t, true);
         }
-        StringBuilder l2 = new StringBuilder();
-        l2.append("DL ").append(fmtSpeed(t.optLong("rateDownload"))).append("   UL ").append(fmtSpeed(t.optLong("rateUpload")));
-        l2.append("   ETA ").append(fmtEta(t.optLong("eta", -1)));
-        l2.append("   ").append(I18n.tr("Ratio")).append(" ").append(fmtRatio(t.optDouble("uploadRatio")));
-        l2.append("   ").append(I18n.tr("Peers")).append(" ").append(t.optInt("peersConnected"));
-        TextView tl2 = text(l2.toString(), 11f, AppTheme.textSecondary(), false);
-        tl2.setPadding(0, dp(2), 0, dp(8));
-        listContainer.addView(tl2);
 
-        final int[] ids = new int[]{id};
-        LinearLayout a1 = buttonRow();
-        a1.addView(actionButton("START", AppTheme.success(), v ->
-                action(api -> { api.torrentStartNow(ids); return null; }, "Started.", afterAction)), weight());
-        a1.addView(actionButton("PAUSE", AppTheme.warning(), v ->
-                action(api -> { api.torrentStop(ids); return null; }, "Paused.", afterAction)), weight());
-        a1.addView(actionButton("VERIFY", AppTheme.accent(), v ->
-                action(api -> { api.torrentVerify(ids); return null; }, "Verifying...", afterAction)), weight());
-        a1.addView(actionButton("REANNOUNCE", AppTheme.accent(), v ->
-                action(api -> { api.torrentReannounce(ids); return null; }, "Reannounce requested.", afterAction)), weight());
-        listContainer.addView(a1);
-
-        LinearLayout a2 = buttonRow();
-        a2.addView(actionButton("MOVE", AppTheme.accent(), v -> showMoveDialog(id, t.optString("downloadDir", ""))), weight());
-        a2.addView(actionButton("REMOVE", AppTheme.danger(), v -> showRemoveDialog(id, t.optString("name", ""))), weight());
-        listContainer.addView(a2);
-
-        LinearLayout q = buttonRow();
-        q.addView(text(I18n.tr("Queue") + " #" + t.optInt("queuePosition"), 11f, AppTheme.textSecondary(), false),
-                new LinearLayout.LayoutParams(-2, dp(34)));
-        q.addView(actionButton("TOP", AppTheme.textSecondary(), v ->
-                action(api -> { api.queueMoveTop(ids); return null; }, null, afterAction)), weight());
-        q.addView(actionButton("UP", AppTheme.textSecondary(), v ->
-                action(api -> { api.queueMoveUp(ids); return null; }, null, afterAction)), weight());
-        q.addView(actionButton("DOWN", AppTheme.textSecondary(), v ->
-                action(api -> { api.queueMoveDown(ids); return null; }, null, afterAction)), weight());
-        q.addView(actionButton("BOTTOM", AppTheme.textSecondary(), v ->
-                action(api -> { api.queueMoveBottom(ids); return null; }, null, afterAction)), weight());
-        listContainer.addView(q);
-
-        HorizontalScrollView tabScroll = new HorizontalScrollView(act);
-        tabScroll.setHorizontalScrollBarEnabled(false);
-        LinearLayout tabs = new LinearLayout(act);
-        tabs.setOrientation(LinearLayout.HORIZONTAL);
-        tabs.setPadding(0, dp(12), 0, dp(6));
-        for (int i = 0; i < DETAIL_TABS.length; i++) {
-            final int ti = i;
-            TextView p = pill(DETAIL_TABS[i], ti == detailTab);
-            p.setOnClickListener(v -> { detailTab = ti; loadDetail(true); });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(32));
-            lp.setMarginEnd(dp(6));
-            tabs.addView(p, lp);
+        void selectTab(int ti) {
+            if (ti == detailTab) return;
+            detailTab = ti;
+            for (int i = 0; i < tabChips.length; i++) UiKit.styleChip(act, tabChips[i], i == detailTab);
+            renderBody(last, true);
+            requestSilent();
         }
-        tabScroll.addView(tabs);
-        listContainer.addView(tabScroll);
 
-        switch (detailTab) {
-            case D_FILES: renderFiles(t); break;
-            case D_PEERS: renderPeers(t); break;
-            case D_TRACKERS: renderTrackers(t); break;
-            default: renderInfo(t); break;
+        void update(JSONObject t) {
+            last = t;
+            bindSummary(t);
+            renderBody(t, false);
+        }
+
+        void bindSummary(JSONObject t) {
+            stopped = t.optInt("status") == TransmissionApi.ST_STOPPED;
+            setText(name, t.optString("name", "?"));
+            String label = statusLabel(t);
+            int color = stateColor(t);
+            String key = label + "|" + color;
+            if (!key.equals(badgeKey)) {
+                badgeKey = key;
+                metaRow.removeViewAt(0);
+                metaRow.addView(UiKit.badge(act, I18n.tr(label), color), 0);
+            }
+            double pct = progressOf(t);
+            setText(meta, sizeLine(t, pct));
+            progressColor = updateProgress(progress, pct * 100.0, color, progressColor);
+            String r = "↓ " + fmtSpeed(t.optLong("rateDownload")) + " · ↑ " + fmtSpeed(t.optLong("rateUpload"))
+                    + " · " + I18n.tr("ETA") + " " + fmtEta(t.optLong("eta", -1))
+                    + " · " + tf("Ratio {0}", fmtRatio(t.optDouble("uploadRatio", -1)))
+                    + " · " + tf("Peers {0}/{1}", t.optInt("peersSendingToUs") + t.optInt("peersGettingFromUs"),
+                    t.optInt("peersConnected"));
+            setText(rates, r);
+            bindError(error, t);
+            setText(toggle, I18n.tr(stopped ? "Resume" : "Pause"));
+        }
+
+        void renderBody(JSONObject t, boolean force) {
+            if (detailTab == D_FILES) {
+                JSONArray fl = t.optJSONArray("files");
+                JSONArray st = t.optJSONArray("fileStats");
+                int n = fl == null ? 0 : Math.min(fl.length(), MAX_FILE_ROWS);
+                if (!force && n > 0 && n == files.size() && body.getChildCount() > 0) {
+                    for (int i = 0; i < n; i++) {
+                        JSONObject f = fl.optJSONObject(i);
+                        if (f != null) files.get(i).bind(f, st == null ? null : st.optJSONObject(i));
+                    }
+                    return;
+                }
+                body.removeAllViews();
+                files.clear();
+                bodySignature = "";
+                renderFiles(this, t);
+                return;
+            }
+            String sig;
+            if (detailTab == D_PEERS) sig = String.valueOf(t.optJSONArray("peers"));
+            else if (detailTab == D_TRACKERS) sig = String.valueOf(t.optJSONArray("trackerStats"));
+            else sig = infoSignature(t);
+            if (!force && sig.equals(bodySignature)) return;
+            bodySignature = sig;
+            files.clear();
+            final int y = scroll.getScrollY();
+            body.removeAllViews();
+            if (detailTab == D_PEERS) renderPeers(body, t);
+            else if (detailTab == D_TRACKERS) renderTrackers(body, t);
+            else renderInfo(body, t);
+            if (!force) scroll.post(() -> scroll.scrollTo(0, y));
         }
     }
 
-    private void renderFiles(final JSONObject t) {
+    private static String infoSignature(JSONObject t) {
+        String[] keys = {"downloadDir", "labels", "bandwidthPriority", "downloadLimited", "downloadLimit",
+                "uploadLimited", "uploadLimit", "doneDate", "corruptEver", "isPrivate", "magnetLink"};
+        StringBuilder sb = new StringBuilder();
+        for (String k : keys) sb.append(k).append('=').append(t.opt(k)).append(';');
+        sb.append(t.optLong("downloadedEver") / (1024 * 1024)).append(';').append(t.optLong("uploadedEver") / (1024 * 1024));
+        return sb.toString();
+    }
+
+    private void renderFiles(final DetailHolder dh, JSONObject t) {
         final int id = t.optInt("id");
         final JSONArray files = t.optJSONArray("files");
         final JSONArray stats = t.optJSONArray("fileStats");
         if (files == null || files.length() == 0) {
-            listContainer.addView(text(I18n.tr("No file list yet (waiting for metadata)."), 12f, AppTheme.textSecondary(), false));
+            dh.body.addView(UiKit.empty(act, I18n.tr("No file list yet"),
+                    I18n.tr("Transmission is still fetching the torrent's metadata.")));
             return;
         }
         final int n = files.length();
-        LinearLayout bulk = buttonRow();
-        bulk.addView(actionButton("SELECT ALL", AppTheme.accent(), v -> bulkWanted(id, n, true)), weight());
-        bulk.addView(actionButton("SELECT NONE", AppTheme.textSecondary(), v -> bulkWanted(id, n, false)), weight());
-        listContainer.addView(bulk);
+        Button all = UiKit.outline(act, I18n.tr("Select All"), null);
+        Button none = UiKit.outline(act, I18n.tr("Select None"), null);
+        all.setOnClickListener(v -> bulkWanted(v, id, n, true));
+        none.setOnClickListener(v -> bulkWanted(v, id, n, false));
+        LinearLayout bulk = UiKit.buttonRow(act, all, none);
+        ((LinearLayout.LayoutParams) bulk.getLayoutParams()).topMargin = 0;
+        ((LinearLayout.LayoutParams) bulk.getLayoutParams()).bottomMargin = dp(12);
+        dh.body.addView(bulk);
 
-        for (int i = 0; i < n; i++) {
-            final int idx = i;
+        LinearLayout card = UiKit.card(act);
+        card.setPadding(dp(4), dp(4), dp(4), dp(4));
+        int shown = Math.min(n, MAX_FILE_ROWS);
+        for (int i = 0; i < shown; i++) {
             JSONObject f = files.optJSONObject(i);
-            JSONObject fs = stats == null ? null : stats.optJSONObject(i);
             if (f == null) continue;
+            FileHolder h = new FileHolder(id, i);
+            h.bind(f, stats == null ? null : stats.optJSONObject(i));
+            if (card.getChildCount() > 0) card.addView(listDivider());
+            card.addView(h.view, new LinearLayout.LayoutParams(-1, -2));
+            dh.files.add(h);
+        }
+        dh.body.addView(card);
+        if (n > shown) {
+            TextView more = UiKit.caption(act, tf("Showing the first {0} of {1} files.", shown, n));
+            more.setPadding(0, 0, 0, dp(8));
+            dh.body.addView(more);
+        }
+    }
+
+    /** One file row: wanted switch, name, progress and priority. */
+    private final class FileHolder {
+        final int index;
+        final LinearLayout view;
+        final Switch sw;
+        final TextView name;
+        final TextView info;
+        final Button prio;
+        int priority;
+        boolean binding;
+
+        FileHolder(final int torrentId, int index) {
+            this.index = index;
+            view = UiKit.row(act);
+            view.setPadding(dp(8), dp(10), dp(8), dp(10));
+
+            sw = new Switch(act);
+            UiStyle.styleSwitch(act, sw);
+            view.addView(sw);
+
+            LinearLayout tx = UiKit.column(act);
+            name = UiKit.text(act, "", 13.5f, AppTheme.text(), null);
+            name.setMaxLines(2);
+            name.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            tx.addView(name);
+            info = UiKit.singleLine(UiKit.caption(act, ""));
+            info.setPadding(0, dp(2), 0, 0);
+            tx.addView(info);
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+            tlp.setMarginStart(dp(10));
+            tlp.setMarginEnd(dp(8));
+            view.addView(tx, tlp);
+
+            prio = compact(UiKit.outline(act, "", null));
+            prio.setOnClickListener(v -> choose("File priority", new String[]{"Low", "Normal", "High"}, priority + 1, sel -> {
+                final int[] idx = new int[]{this.index};
+                runAction(v, api -> { api.setFilePriority(torrentId, idx, sel - 1); return null; }, null);
+            }));
+            view.addView(prio, new LinearLayout.LayoutParams(-2, dp(32)));
+
+            sw.setOnCheckedChangeListener((b, checked) -> {
+                if (binding) return;
+                final int[] idx = new int[]{this.index};
+                sw.setEnabled(false);
+                async(io, api -> { api.setFilesWanted(torrentId, idx, checked); return null; }, r -> {
+                    sw.setEnabled(true);
+                    name.setTextColor(checked ? AppTheme.text() : AppTheme.textMuted());
+                    requestSilent();
+                }, e -> {
+                    sw.setEnabled(true);
+                    binding = true;
+                    sw.setChecked(!checked);
+                    binding = false;
+                    toast(msg(e));
+                });
+            });
+        }
+
+        void bind(JSONObject f, JSONObject fs) {
             long len = f.optLong("length");
             long done = fs != null ? fs.optLong("bytesCompleted") : f.optLong("bytesCompleted");
             boolean wanted = fs == null || fs.optBoolean("wanted", true);
-            final int prio = fs == null ? 0 : fs.optInt("priority", 0);
-
-            LinearLayout row = new LinearLayout(act);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(10), dp(8), dp(8), dp(8));
-            row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
-            rlp.topMargin = dp(5);
-            row.setLayoutParams(rlp);
-
-            final Switch sw = new Switch(act);
-            sw.setChecked(wanted);
-            UiStyle.styleSwitch(act, sw);
-            sw.setOnCheckedChangeListener((b, checked) -> action(api -> {
-                api.setFilesWanted(id, new int[]{idx}, checked);
-                return null;
-            }, null, afterAction));
-            row.addView(sw);
-
-            LinearLayout tx = new LinearLayout(act);
-            tx.setOrientation(LinearLayout.VERTICAL);
-            tx.setPadding(dp(8), 0, dp(6), 0);
-            TextView fn = text(f.optString("name", "?"), 12f, wanted ? AppTheme.text() : AppTheme.textMuted(), false);
-            fn.setMaxLines(2);
-            fn.setEllipsize(TextUtils.TruncateAt.MIDDLE);
-            tx.addView(fn);
+            priority = fs == null ? 0 : Math.max(-1, Math.min(1, fs.optInt("priority", 0)));
+            setText(name, f.optString("name", "?"));
+            name.setTextColor(wanted ? AppTheme.text() : AppTheme.textMuted());
             double fp = len > 0 ? (double) done / (double) len : 0;
-            TextView info = text(fmtPct(fp) + "  -  " + fmtSize(done) + " / " + fmtSize(len),
-                    10.5f, AppTheme.textSecondary(), false);
-            info.setPadding(0, dp(2), 0, 0);
-            tx.addView(info);
-            row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-            String pl = prio > 0 ? "HIGH" : prio < 0 ? "LOW" : "NORMAL";
-            int pc = prio > 0 ? AppTheme.warning() : AppTheme.textSecondary();
-            row.addView(actionButton(pl, pc, v -> choose("File priority", new String[]{"Low", "Normal", "High"}, prio + 1,
-                    sel -> action(api -> { api.setFilePriority(id, new int[]{idx}, sel - 1); return null; }, null, afterAction))),
-                    new LinearLayout.LayoutParams(-2, dp(30)));
-            listContainer.addView(row);
+            setText(info, fmtPct(fp) + " · " + fmtSize(done) + " / " + fmtSize(len));
+            if (sw.isEnabled() && sw.isChecked() != wanted) {
+                binding = true;
+                sw.setChecked(wanted);
+                binding = false;
+            }
+            setText(prio, I18n.tr(priority > 0 ? "High" : priority < 0 ? "Low" : "Normal"));
+            prio.setTextColor(priority > 0 ? AppTheme.warning() : AppTheme.text());
         }
     }
 
-    private void bulkWanted(final int id, final int n, final boolean wanted) {
+    private void bulkWanted(View button, final int id, final int n, final boolean wanted) {
         final int[] all = new int[n];
         for (int i = 0; i < n; i++) all[i] = i;
-        action(api -> { api.setFilesWanted(id, all, wanted); return null; }, null, afterAction);
+        runAction(button, api -> { api.setFilesWanted(id, all, wanted); return null; },
+                wanted ? "All files selected." : "All files deselected.");
     }
 
-    private void renderPeers(JSONObject t) {
+    private void renderPeers(LinearLayout body, JSONObject t) {
         JSONArray peers = t.optJSONArray("peers");
         if (peers == null || peers.length() == 0) {
-            listContainer.addView(text(I18n.tr("No connected peers."), 12f, AppTheme.textSecondary(), false));
+            body.addView(UiKit.empty(act, I18n.tr("No connected peers"), null));
             return;
         }
+        LinearLayout card = UiKit.card(act);
+        card.setPadding(dp(4), dp(4), dp(4), dp(4));
         for (int i = 0; i < peers.length(); i++) {
             JSONObject p = peers.optJSONObject(i);
             if (p == null) continue;
-            LinearLayout row = card();
-            TextView a = text(p.optString("address", "?") + ":" + p.optInt("port"), 12.5f, AppTheme.text(), true);
-            row.addView(a);
+            if (card.getChildCount() > 0) card.addView(listDivider());
+            LinearLayout row = listRow();
+            row.addView(UiKit.singleLine(UiKit.text(act, p.optString("address", "?") + ":" + p.optInt("port"),
+                    14f, AppTheme.text(), UiKit.MEDIUM)));
             String client = p.optString("clientName", "");
-            TextView l1 = text((client.isEmpty() ? I18n.tr("Unknown client") : client) + "  -  "
-                    + fmtPct(p.optDouble("progress")) + "  -  " + p.optString("flagStr", ""), 10.5f, AppTheme.textMuted(), false);
+            TextView l1 = UiKit.singleLine(UiKit.caption(act, (client.isEmpty() ? I18n.tr("Unknown client") : client)
+                    + " · " + fmtPct(p.optDouble("progress", 0))
+                    + (p.optString("flagStr", "").isEmpty() ? "" : " · " + p.optString("flagStr", ""))));
             l1.setPadding(0, dp(2), 0, 0);
             row.addView(l1);
-            TextView l2 = text("DL " + fmtSpeed(p.optLong("rateToClient")) + "   UL " + fmtSpeed(p.optLong("rateToPeer")),
-                    10.5f, AppTheme.textSecondary(), false);
+            TextView l2 = UiKit.caption(act, "↓ " + fmtSpeed(p.optLong("rateToClient")) + " · ↑ " + fmtSpeed(p.optLong("rateToPeer")));
             l2.setPadding(0, dp(2), 0, 0);
             row.addView(l2);
-            listContainer.addView(row);
+            card.addView(row);
         }
+        body.addView(card);
     }
 
-    private void renderTrackers(JSONObject t) {
+    private void renderTrackers(LinearLayout body, JSONObject t) {
         JSONArray ts = t.optJSONArray("trackerStats");
         if (ts == null || ts.length() == 0) {
-            listContainer.addView(text(I18n.tr("No trackers."), 12f, AppTheme.textSecondary(), false));
+            body.addView(UiKit.empty(act, I18n.tr("No trackers"),
+                    I18n.tr("This torrent relies on DHT and peer exchange.")));
             return;
         }
+        LinearLayout card = UiKit.card(act);
+        card.setPadding(dp(4), dp(4), dp(4), dp(4));
         for (int i = 0; i < ts.length(); i++) {
             JSONObject k = ts.optJSONObject(i);
             if (k == null) continue;
-            LinearLayout row = card();
+            if (card.getChildCount() > 0) card.addView(listDivider());
+            LinearLayout row = listRow();
             String host = k.optString("host", "");
-            TextView a = text(host.isEmpty() ? k.optString("announce", "?") : host, 12.5f, AppTheme.text(), true);
-            row.addView(a);
+            row.addView(UiKit.singleLine(UiKit.text(act, host.isEmpty() ? k.optString("announce", "?") : host,
+                    14f, AppTheme.text(), UiKit.MEDIUM)));
             String res = k.optString("lastAnnounceResult", "");
             boolean ok = k.optBoolean("lastAnnounceSucceeded", false);
-            TextView l1 = text((res.isEmpty() ? I18n.tr("No announce yet") : res), 11f,
-                    ok || res.isEmpty() ? AppTheme.textSecondary() : AppTheme.danger(), false);
+            boolean announced = k.optBoolean("hasAnnounced", !res.isEmpty());
+            TextView l1 = UiKit.caption(act, res.isEmpty() || !announced ? I18n.tr("No announce yet") : res);
+            if (announced && !ok && !res.isEmpty()) l1.setTextColor(AppTheme.danger());
             l1.setPadding(0, dp(2), 0, 0);
             row.addView(l1);
-            long last = k.optLong("lastAnnounceTime");
-            long next = k.optLong("nextAnnounceTime");
-            TextView l2 = text(I18n.tr("Seeds") + " " + k.optInt("seederCount") + "   " + I18n.tr("Leechers") + " "
-                    + k.optInt("leecherCount") + (last > 0 ? "   " + I18n.tr("Last") + " " + fmtDate(last) : "")
-                    + (next > 0 ? "   " + I18n.tr("Next") + " " + fmtDate(next) : ""), 10.5f, AppTheme.textMuted(), false);
+            long lastT = k.optLong("lastAnnounceTime");
+            long nextT = k.optLong("nextAnnounceTime");
+            StringBuilder sb = new StringBuilder();
+            sb.append(tf("Seeds {0}", Math.max(0, k.optInt("seederCount"))))
+                    .append(" · ").append(tf("Leechers {0}", Math.max(0, k.optInt("leecherCount"))));
+            if (lastT > 0) sb.append(" · ").append(tf("Last {0}", fmtDate(lastT)));
+            if (nextT > 0) sb.append(" · ").append(tf("Next {0}", fmtDate(nextT)));
+            TextView l2 = UiKit.caption(act, sb.toString());
             l2.setPadding(0, dp(2), 0, 0);
             row.addView(l2);
-            listContainer.addView(row);
+            card.addView(row);
         }
+        body.addView(card);
     }
 
-    private void renderInfo(final JSONObject t) {
+    private void renderInfo(LinearLayout body, final JSONObject t) {
         final int id = t.optInt("id");
-        LinearLayout c = card();
-        c.addView(infoLine("Location", t.optString("downloadDir", "")));
-        c.addView(infoLine("Hash", t.optString("hashString", "")));
-        c.addView(infoLine("Added", fmtDate(t.optLong("addedDate"))));
+        LinearLayout c = UiKit.card(act);
+        c.addView(kvMono("Location", t.optString("downloadDir", "")));
+        c.addView(kvMono("Hash", t.optString("hashString", "")));
+        c.addView(kv("Added", fmtDate(t.optLong("addedDate"))));
         long done = t.optLong("doneDate");
-        c.addView(infoLine("Completed", done > 0 ? fmtDate(done) : "-"));
-        c.addView(infoLine("Total size", fmtSize(t.optLong("totalSize"))));
-        c.addView(infoLine("Downloaded", fmtSize(t.optLong("downloadedEver"))));
-        c.addView(infoLine("Uploaded", fmtSize(t.optLong("uploadedEver"))));
-        c.addView(infoLine("Corrupt", fmtSize(t.optLong("corruptEver"))));
-        c.addView(infoLine("Pieces", t.optInt("pieceCount") + " x " + fmtSize(t.optLong("pieceSize"))));
-        c.addView(infoLine("Private", t.optBoolean("isPrivate") ? "Yes" : "No"));
+        c.addView(kv("Completed", done > 0 ? fmtDate(done) : "—"));
+        c.addView(kv("Total size", fmtSize(t.optLong("totalSize"))));
+        c.addView(kv("Downloaded", fmtSize(t.optLong("downloadedEver"))));
+        c.addView(kv("Uploaded", fmtSize(t.optLong("uploadedEver"))));
+        c.addView(kv("Corrupt", fmtSize(t.optLong("corruptEver"))));
+        c.addView(kv("Pieces", t.optInt("pieceCount") + " × " + fmtSize(t.optLong("pieceSize"))));
+        c.addView(kv("Private", I18n.tr(t.optBoolean("isPrivate") ? "Yes" : "No")));
         String creator = t.optString("creator", "");
-        if (!creator.isEmpty()) c.addView(infoLine("Created by", creator));
+        if (!creator.isEmpty()) c.addView(kv("Created by", creator));
         String comment = t.optString("comment", "");
-        if (!comment.isEmpty()) c.addView(infoLine("Comment", comment));
+        if (!comment.isEmpty()) c.addView(kv("Comment", comment));
         JSONArray labels = t.optJSONArray("labels");
         StringBuilder lb = new StringBuilder();
         for (int i = 0; labels != null && i < labels.length(); i++) {
-            if (i > 0) lb.append(", ");
-            lb.append(labels.optString(i));
+            String s = labels.optString(i, "");
+            if (s.isEmpty()) continue;
+            if (lb.length() > 0) lb.append(", ");
+            lb.append(s);
         }
-        c.addView(infoLine("Labels", lb.length() == 0 ? "-" : lb.toString()));
-        int bp = t.optInt("bandwidthPriority");
-        c.addView(infoLine("Bandwidth priority", bp > 0 ? "High" : bp < 0 ? "Low" : "Normal"));
-        c.addView(infoLine("Speed limits",
-                (t.optBoolean("downloadLimited") ? "DL " + t.optInt("downloadLimit") + " KB/s" : "DL -") + "   "
-                        + (t.optBoolean("uploadLimited") ? "UL " + t.optInt("uploadLimit") + " KB/s" : "UL -")));
-        listContainer.addView(c);
+        final String labelText = lb.toString();
+        c.addView(kv("Labels", labelText.isEmpty() ? "—" : labelText));
+        c.addView(kv("Speed limits",
+                (t.optBoolean("downloadLimited") ? "↓ " + t.optInt("downloadLimit") + " kB/s" : "↓ " + I18n.tr("Unlimited")) + " · "
+                        + (t.optBoolean("uploadLimited") ? "↑ " + t.optInt("uploadLimit") + " kB/s" : "↑ " + I18n.tr("Unlimited"))));
 
-        LinearLayout r1 = buttonRow();
-        r1.addView(actionButton("LABELS", AppTheme.accent(), v -> showLabelsDialog(id, lb.toString())), weight());
-        r1.addView(actionButton("LIMITS", AppTheme.accent(), v -> showLimitsDialog(t)), weight());
         final String magnet = t.optString("magnetLink", "");
-        r1.addView(actionButton("COPY MAGNET", AppTheme.accent(), v -> {
-            if (magnet.isEmpty()) { toast("No magnet link available."); return; }
-            copyToClipboard(magnet);
+        Button labelsBtn = UiKit.outline(act, I18n.tr("Labels"), v -> showLabelsDialog(id, labelText));
+        Button limitsBtn = UiKit.outline(act, I18n.tr("Limits"), v -> showLimitsDialog(t));
+        Button magnetBtn = UiKit.outline(act, I18n.tr("Copy Magnet"), v -> {
+            if (magnet.isEmpty()) {
+                toast("No magnet link available.");
+                return;
+            }
+            copyToClipboard("magnet", magnet);
             toast("Magnet link copied.");
-        }), weight());
-        listContainer.addView(r1);
+        });
+        c.addView(UiKit.buttonRow(act, labelsBtn, limitsBtn, magnetBtn));
+        body.addView(c);
 
-        LinearLayout r2 = buttonRow();
-        r2.addView(text(I18n.tr("Priority"), 11.5f, AppTheme.textSecondary(), false), new LinearLayout.LayoutParams(-2, dp(34)));
+        LinearLayout pc = UiKit.card(act);
+        pc.addView(UiKit.overline(act, I18n.tr("Bandwidth priority")));
+        final int bp = Math.max(-1, Math.min(1, t.optInt("bandwidthPriority")));
+        LinearLayout chips = UiKit.row(act);
+        final String[] names = {"Low", "Normal", "High"};
         final int[] ids = new int[]{id};
-        r2.addView(actionButton("LOW", bp < 0 ? AppTheme.accent() : AppTheme.textSecondary(), v ->
-                action(api -> { api.setBandwidthPriority(ids, -1); return null; }, "Priority: low", afterAction)), weight());
-        r2.addView(actionButton("NORMAL", bp == 0 ? AppTheme.accent() : AppTheme.textSecondary(), v ->
-                action(api -> { api.setBandwidthPriority(ids, 0); return null; }, "Priority: normal", afterAction)), weight());
-        r2.addView(actionButton("HIGH", bp > 0 ? AppTheme.accent() : AppTheme.textSecondary(), v ->
-                action(api -> { api.setBandwidthPriority(ids, 1); return null; }, "Priority: high", afterAction)), weight());
-        listContainer.addView(r2);
-    }
-
-    private View infoLine(String label, String value) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, dp(3), 0, dp(3));
-        TextView l = text(I18n.tr(label), 11f, AppTheme.textMuted(), false);
-        row.addView(l, new LinearLayout.LayoutParams(dp(110), -2));
-        TextView v = text(value, 11.5f, AppTheme.text(), false);
-        v.setTextIsSelectable(true);
-        row.addView(v, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        return row;
+        for (int i = 0; i < 3; i++) {
+            final int value = i - 1;
+            TextView chip = UiKit.chip(act, I18n.tr(names[i]), value == bp);
+            chip.setOnClickListener(v -> {
+                if (value == bp) return;
+                runAction(v, api -> { api.setBandwidthPriority(ids, value); return null; }, "Priority updated.");
+            });
+            chips.addView(chip, UiKit.chipLp(act));
+        }
+        pc.addView(chips);
+        body.addView(pc);
     }
 
     private void showMoveDialog(final int id, String currentDir) {
-        final LinearLayout body = dialogBody(I18n.tr("Move torrent"));
-        final Dialog d = dialog(body);
-        final EditText dir = addNum(body, "New location", currentDir, false);
-        dir.setInputType(InputType.TYPE_CLASS_TEXT);
-        final Switch move = addSwitch(body, "Move existing data", null, true);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("MOVE", AppTheme.accent(), v -> {
+        final Sheet s = new Sheet("Move torrent");
+        final EditText dir = field(s.box, "New location", currentDir, true);
+        dir.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        final Switch move = switchRow(s.box, "Move existing data", "Off: only point Transmission at data that is already there.", true);
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        final Button ok = UiKit.primary(act, I18n.tr("Move"), null);
+        ok.setOnClickListener(v -> {
             final String loc = dir.getText().toString().trim();
-            if (loc.isEmpty()) { toast("Enter a folder path."); return; }
+            if (loc.isEmpty()) {
+                toast("Enter a folder path.");
+                return;
+            }
             final boolean mv = move.isChecked();
-            d.dismiss();
-            action(api -> { api.torrentSetLocation(new int[]{id}, loc, mv); return null; }, "Location updated.", afterAction);
-        }), weight());
-        body.addView(row);
-        d.show();
+            setBusy(ok, true);
+            async(slow, api -> { api.torrentSetLocation(new int[]{id}, loc, mv); return null; }, r -> {
+                s.dismiss();
+                toast("Location updated.");
+                requestSilent();
+            }, e -> {
+                setBusy(ok, false);
+                toast(msg(e));
+            });
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, ok));
+        s.show();
+    }
+
+    private void showQueueDialog(final int id) {
+        final int[] ids = new int[]{id};
+        choose("Queue", new String[]{"Start now (skip the queue)", "Move to top", "Move up", "Move down", "Move to bottom"}, -1, sel ->
+                runAction(null, api -> {
+                    switch (sel) {
+                        case 0: api.torrentStartNow(ids); break;
+                        case 1: api.queueMoveTop(ids); break;
+                        case 2: api.queueMoveUp(ids); break;
+                        case 3: api.queueMoveDown(ids); break;
+                        default: api.queueMoveBottom(ids); break;
+                    }
+                    return null;
+                }, sel == 0 ? "Started." : "Queue updated."));
     }
 
     private void showRemoveDialog(final int id, String name) {
-        final LinearLayout body = dialogBody(I18n.tr("Remove torrent"));
-        final Dialog d = dialog(body);
-        body.addView(text(name, 12.5f, AppTheme.textSecondary(), false));
-        LinearLayout r1 = buttonRow();
-        r1.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        r1.addView(actionButton("REMOVE", AppTheme.warning(), v -> {
-            d.dismiss();
+        final Sheet s = new Sheet("Remove torrent");
+        TextView n = UiKit.subtitle(act, name);
+        n.setMaxLines(3);
+        n.setEllipsize(TextUtils.TruncateAt.END);
+        s.box.addView(n);
+        TextView hint = UiKit.body(act, I18n.tr("Remove only the torrent and keep its files, or delete the downloaded files too."));
+        hint.setPadding(0, dp(6), 0, 0);
+        s.box.addView(hint);
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        Button keep = UiKit.outline(act, I18n.tr("Keep Files"), v -> {
+            s.dismiss();
             doRemove(id, false);
-        }), weight());
-        body.addView(r1);
-        LinearLayout r2 = new LinearLayout(act);
-        r2.setOrientation(LinearLayout.HORIZONTAL);
-        r2.setPadding(0, dp(6), 0, 0);
-        r2.addView(actionButton("REMOVE + DELETE DATA", AppTheme.danger(), v -> {
-            d.dismiss();
-            confirm("Permanently delete the downloaded files from disk?", "DELETE", AppTheme.danger(), () -> doRemove(id, true));
-        }), new LinearLayout.LayoutParams(-1, dp(34)));
-        body.addView(r2);
-        d.show();
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, keep));
+        Button wipe = UiKit.danger(act, I18n.tr("Delete Files"), v -> {
+            s.dismiss();
+            confirm("Delete files?", "Permanently delete the downloaded files from disk? This cannot be undone.",
+                    "Delete", true, () -> doRemove(id, true));
+        });
+        s.box.addView(UiKit.buttonRow(act, wipe));
+        s.show();
     }
 
     private void doRemove(final int id, final boolean deleteData) {
-        action(api -> { api.torrentRemove(new int[]{id}, deleteData); return null; },
-                deleteData ? "Torrent and data removed." : "Torrent removed.", () -> {
-                    detailId = 0;
-                    refresh();
-                });
+        async(io, api -> { api.torrentRemove(new int[]{id}, deleteData); return null; }, v -> {
+            toast(deleteData ? "Torrent and files removed." : "Torrent removed.");
+            if (detailId == id) {
+                detailId = 0;
+                detail = null;
+            }
+            refresh();
+        }, t -> toast(msg(t)));
     }
 
     private void showLabelsDialog(final int id, String current) {
-        final LinearLayout body = dialogBody(I18n.tr("Labels"));
-        final Dialog d = dialog(body);
-        final EditText in = addNum(body, "Comma separated labels", "-".equals(current) ? "" : current, false);
+        final Sheet s = new Sheet("Labels");
+        final EditText in = field(s.box, "Comma-separated labels", current, false);
         in.setInputType(InputType.TYPE_CLASS_TEXT);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("SAVE", AppTheme.accent(), v -> {
-            String[] parts = in.getText().toString().split(",");
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        Button save = UiKit.primary(act, I18n.tr("Save"), v -> {
             final List<String> out = new ArrayList<>();
-            for (String p : parts) if (!p.trim().isEmpty()) out.add(p.trim());
-            d.dismiss();
-            action(api -> { api.setLabels(new int[]{id}, out.toArray(new String[0])); return null; }, "Saved.", afterAction);
-        }), weight());
-        body.addView(row);
-        d.show();
+            for (String p : in.getText().toString().split(",")) {
+                String x = p.trim();
+                if (!x.isEmpty() && !out.contains(x)) out.add(x);
+            }
+            s.dismiss();
+            runAction(null, api -> { api.setLabels(new int[]{id}, out.toArray(new String[0])); return null; }, "Labels saved.");
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, save));
+        s.show();
     }
 
     private void showLimitsDialog(JSONObject t) {
         final int id = t.optInt("id");
-        final LinearLayout body = dialogBody(I18n.tr("Speed limits (KB/s)"));
-        final Dialog d = dialog(body);
-        final Switch dl = addSwitch(body, "Limit download", null, t.optBoolean("downloadLimited"));
-        final EditText dlv = addNum(body, "Download KB/s", String.valueOf(t.optInt("downloadLimit")), false);
-        final Switch ul = addSwitch(body, "Limit upload", null, t.optBoolean("uploadLimited"));
-        final EditText ulv = addNum(body, "Upload KB/s", String.valueOf(t.optInt("uploadLimit")), false);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("SAVE", AppTheme.accent(), v -> {
+        final Sheet s = new Sheet("Speed limits");
+        final Switch dl = switchRow(s.box, "Limit download", null, t.optBoolean("downloadLimited"));
+        final EditText dlv = numberField(s.box, "Download limit (kB/s)", String.valueOf(t.optInt("downloadLimit")), false);
+        final Switch ul = switchRow(s.box, "Limit upload", null, t.optBoolean("uploadLimited"));
+        final EditText ulv = numberField(s.box, "Upload limit (kB/s)", String.valueOf(t.optInt("uploadLimit")), false);
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        Button save = UiKit.primary(act, I18n.tr("Save"), v -> {
             final boolean dlOn = dl.isChecked();
             final boolean ulOn = ul.isChecked();
             final int dlK = parseInt(dlv, 0);
             final int ulK = parseInt(ulv, 0);
-            d.dismiss();
-            action(api -> { api.setTorrentSpeedLimits(id, dlOn, dlK, ulOn, ulK); return null; }, "Saved.", afterAction);
-        }), weight());
-        body.addView(row);
-        d.show();
+            s.dismiss();
+            runAction(null, api -> { api.setTorrentSpeedLimits(id, dlOn, dlK, ulOn, ulK); return null; }, "Limits saved.");
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, save));
+        s.show();
     }
 
     // ================================================================== ADD
 
     private void renderAdd() {
-        listContainer.removeAllViews();
-        LinearLayout c = card();
-        c.addView(text(I18n.tr("Add torrent"), 13.5f, AppTheme.text(), true));
-        TextView h = text(I18n.tr("Paste one or more magnet links, .torrent URLs or info hashes (one per line)."),
-                11f, AppTheme.textMuted(), false);
-        h.setPadding(0, dp(2), 0, dp(6));
+        content.removeAllViews();
+        clearScreenRefs();
+        LinearLayout c = UiKit.card(act);
+        c.addView(UiKit.overline(act, I18n.tr("Add torrent")));
+        TextView h = UiKit.body(act, I18n.tr("Paste magnet links, .torrent URLs or info hashes, one per line."));
+        h.setPadding(0, 0, 0, dp(10));
         c.addView(h);
 
-        final EditText links = new EditText(act);
-        links.setHint("magnet:?xt=urn:btih:...");
-        links.setHintTextColor(AppTheme.textMuted());
-        links.setTextColor(AppTheme.text());
-        links.setTextSize(12.5f);
-        links.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_VARIATION_URI);
+        final EditText links = UiKit.input(act, "magnet:?xt=urn:btih:…");
+        links.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        links.setSingleLine(false);
+        links.setHorizontallyScrolling(false);
         links.setMinLines(3);
         links.setMaxLines(8);
         links.setGravity(Gravity.TOP | Gravity.START);
+        links.setTypeface(Typeface.MONOSPACE);
+        links.setTextSize(13f);
         c.addView(links, new LinearLayout.LayoutParams(-1, -2));
 
-        final EditText dir = addNum(c, "Download directory (optional)", "", false);
-        dir.setInputType(InputType.TYPE_CLASS_TEXT);
-        final Switch paused = addSwitch(c, "Start paused", null, false);
+        final EditText dir = field(c, "Download folder (optional)", "", true);
+        dir.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        final Switch paused = switchRow(c, "Start paused", null, false);
 
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("PASTE", AppTheme.accent(), v -> {
+        Button paste = UiKit.outline(act, I18n.tr("Paste"), v -> {
             String clip = readClipboard();
-            if (clip.isEmpty()) { toast("Clipboard is empty."); return; }
-            String cur = links.getText().toString();
+            if (clip.isEmpty()) {
+                toast("Clipboard is empty.");
+                return;
+            }
+            String cur = links.getText().toString().trim();
             links.setText(cur.isEmpty() ? clip : cur + "\n" + clip);
             links.setSelection(links.getText().length());
-        }), weight());
-        row.addView(actionButton("ADD", AppTheme.success(), v -> doAdd(links, dir, paused)), weight());
-        c.addView(row);
-        listContainer.addView(c);
+        });
+        final Button add = UiKit.primary(act, I18n.tr("Add"), null);
+        add.setOnClickListener(v -> doAdd(add, links, dir, paused));
+        c.addView(UiKit.buttonRow(act, paste, add));
+        content.addView(c);
 
-        // Show the daemon's default download dir as a hint (best effort).
-        async(api -> api.sessionGet().optString("download-dir", ""), s -> {
-            if (!s.isEmpty() && dir.getParent() != null) dir.setHint(I18n.tr("Default") + ": " + s);
-        }, e -> {});
+        TextView note = UiKit.caption(act, I18n.tr("Torrents added here are not tracked by Sonarr or Radarr. Use their tabs to grab releases they should import."));
+        note.setPadding(dp(4), 0, dp(4), 0);
+        content.addView(note);
+
+        // Show the daemon's default download folder as the hint (best effort).
+        final int g = gen;
+        async(io, api -> {
+            String d = api.sessionGet().optString("download-dir", "");
+            return d;
+        }, s -> {
+            if (g == gen && s != null && !s.isEmpty() && dir.getParent() != null) dir.setHint(tf("Default: {0}", s));
+        }, e -> { });
     }
 
-    private void doAdd(final EditText links, final EditText dir, final Switch paused) {
+    private void doAdd(final Button add, final EditText links, final EditText dir, final Switch paused) {
         final List<String> items = new ArrayList<>();
         for (String line : links.getText().toString().split("[\\r\\n]+")) {
             String s = line.trim();
             if (s.isEmpty()) continue;
-            if (s.matches("(?i)[0-9a-f]{40}")) s = "magnet:?xt=urn:btih:" + s;
-            items.add(s);
+            if (s.matches("(?i)[0-9a-f]{40}") || s.matches("(?i)[a-z2-7]{32}")) s = "magnet:?xt=urn:btih:" + s;
+            if (!items.contains(s)) items.add(s);
         }
-        if (items.isEmpty()) { toast("Paste a magnet link or URL first."); return; }
+        if (items.isEmpty()) {
+            toast("Paste a magnet link or URL first.");
+            return;
+        }
         final String dd = dir.getText().toString().trim();
         final boolean pz = paused.isChecked();
-        async(api -> {
-            int added = 0, dup = 0;
+        setBusy(add, true);
+        async(slow, api -> {
+            int added = 0, dup = 0, failed = 0;
+            String lastError = null;
             for (String s : items) {
-                JSONObject r = api.torrentAdd(s, null, dd, pz);
-                if (r.has("torrent-duplicate")) dup++;
-                else added++;
+                try {
+                    JSONObject r = api.torrentAdd(s, null, dd, pz);
+                    if (r.has("torrent-duplicate")) dup++;
+                    else added++;
+                } catch (Exception e) {
+                    if (TransmissionApi.isNotRunning(e) || TransmissionApi.isAuthError(e)) throw e;
+                    failed++;
+                    lastError = msg(e);
+                }
             }
-            return new int[]{added, dup};
+            return new Object[]{added, dup, failed, lastError};
         }, r -> {
-            links.setText("");
-            toast(r[0] + " " + I18n.tr("added") + (r[1] > 0 ? ", " + r[1] + " " + I18n.tr("already present") : ""));
-            if (r[0] > 0) { section = S_TORRENTS; refresh(); }
-        }, e -> toast(msg(e)));
+            setBusy(add, false);
+            int added = (Integer) r[0], dup = (Integer) r[1], failed = (Integer) r[2];
+            StringBuilder sb = new StringBuilder(tf("{0} added", added));
+            if (dup > 0) sb.append(", ").append(tf("{0} already present", dup));
+            if (failed > 0) sb.append(", ").append(tf("{0} failed", failed)).append(": ").append(I18n.tr(String.valueOf(r[3])));
+            toast(sb.toString());
+            if (failed == 0) links.setText("");
+            if (added > 0 && failed == 0) go(S_TORRENTS);
+        }, e -> {
+            setBusy(add, false);
+            toast(msg(e));
+        });
     }
 
     // ================================================================== SPEED
 
     private void loadSpeed() {
-        final int req = ++requestCounter;
-        showMessage("Loading...");
-        async(api -> new JSONObject[]{api.sessionGet(), api.sessionStats()}, r -> {
-            if (req != requestCounter || section != S_SPEED || detailId > 0) return;
-            renderSpeed(r[0], r[1]);
-        }, e -> { if (req == requestCounter) showError(e); });
+        final int g = gen;
+        showLoading("Loading speed settings…");
+        async(io, api -> new Object[]{api.sessionGet(), api.sessionStats()}, r -> {
+            if (g != gen || section != S_SPEED || detailId > 0) return;
+            renderSpeed((JSONObject) r[0], (JSONObject) r[1]);
+        }, e -> {
+            if (g == gen) showFailure(e, "Could not load speed settings");
+        });
     }
 
     private void tickSpeed() {
-        if (liveDown == null || polling) return;
-        final int req = requestCounter;
-        polling = true;
-        async(api -> api.sessionStats(), st -> {
-            polling = false;
-            if (req != requestCounter || section != S_SPEED || liveDown == null) return;
-            liveDown.setText(fmtSpeed(st.optLong("downloadSpeed")));
-            liveUp.setText(fmtSpeed(st.optLong("uploadSpeed")));
-        }, e -> polling = false);
+        if (liveDown == null) return;
+        if (!beginPoll()) return;
+        final int g = gen;
+        async(io, api -> api.sessionStats(), st -> {
+            pollDone();
+            if (g != gen || section != S_SPEED || liveDown == null) return;
+            bindLive(st);
+        }, e -> pollDone());
+    }
+
+    private void bindLive(JSONObject st) {
+        long d = st.optLong("downloadSpeed");
+        long u = st.optLong("uploadSpeed");
+        setText(liveDown, fmtSpeed(d));
+        setText(liveUp, fmtSpeed(u));
+        setText(liveCounts, tf("{0} active · {1} paused · {2} total", st.optInt("activeTorrentCount"),
+                st.optInt("pausedTorrentCount"), st.optInt("torrentCount")));
+        setHeaderSpeeds(d, u, st.optInt("torrentCount", -1));
     }
 
     private void renderSpeed(final JSONObject s, JSONObject stats) {
-        listContainer.removeAllViews();
+        content.removeAllViews();
+        clearScreenRefs();
         final List<Collect> cols = new ArrayList<>();
 
-        LinearLayout live = card();
-        LinearLayout lrow = new LinearLayout(act);
-        lrow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout c1 = new LinearLayout(act);
-        c1.setOrientation(LinearLayout.VERTICAL);
-        c1.addView(text(I18n.tr("Download"), 11f, AppTheme.textMuted(), false));
-        liveDown = text(fmtSpeed(stats.optLong("downloadSpeed")), 20f, AppTheme.accent(), true);
+        LinearLayout live = UiKit.card(act);
+        live.addView(UiKit.overline(act, I18n.tr("Live")));
+        LinearLayout lrow = UiKit.row(act);
+        LinearLayout c1 = UiKit.column(act);
+        c1.addView(UiKit.caption(act, "↓ " + I18n.tr("Download")));
+        liveDown = UiKit.display(act, "");
+        liveDown.setTextColor(AppTheme.accent());
         c1.addView(liveDown);
-        LinearLayout c2 = new LinearLayout(act);
-        c2.setOrientation(LinearLayout.VERTICAL);
-        c2.addView(text(I18n.tr("Upload"), 11f, AppTheme.textMuted(), false));
-        liveUp = text(fmtSpeed(stats.optLong("uploadSpeed")), 20f, AppTheme.success(), true);
+        LinearLayout c2 = UiKit.column(act);
+        c2.addView(UiKit.caption(act, "↑ " + I18n.tr("Upload")));
+        liveUp = UiKit.display(act, "");
+        liveUp.setTextColor(AppTheme.success());
         c2.addView(liveUp);
         lrow.addView(c1, new LinearLayout.LayoutParams(0, -2, 1.0f));
         lrow.addView(c2, new LinearLayout.LayoutParams(0, -2, 1.0f));
         live.addView(lrow);
-        TextView cnt = text(stats.optInt("activeTorrentCount") + " " + I18n.tr("active") + "  -  "
-                + stats.optInt("pausedTorrentCount") + " " + I18n.tr("paused") + "  -  "
-                + stats.optInt("torrentCount") + " " + I18n.tr("total"), 11f, AppTheme.textSecondary(), false);
-        cnt.setPadding(0, dp(6), 0, 0);
-        live.addView(cnt);
-        listContainer.addView(live);
+        liveCounts = UiKit.caption(act, "");
+        liveCounts.setPadding(0, dp(8), 0, 0);
+        live.addView(liveCounts);
+        content.addView(live);
+        bindLive(stats);
 
-        // alt-speed (turtle): applied immediately
-        LinearLayout turtle = card();
-        final Switch alt = addSwitch(turtle, "Alternative speed limits (turtle)",
-                "Swap to the alternative limits below right now.", s.optBoolean("alt-speed-enabled"));
-        alt.setOnCheckedChangeListener((b, checked) -> action(api -> {
-            JSONObject a = new JSONObject();
-            a.put("alt-speed-enabled", checked);
-            api.sessionSet(a);
-            return null;
-        }, checked ? "Turtle mode on." : "Turtle mode off.", null));
-        final EditText altDown = addNum(turtle, "Alt download limit (KB/s)", String.valueOf(s.optInt("alt-speed-down", 50)), false);
-        final EditText altUp = addNum(turtle, "Alt upload limit (KB/s)", String.valueOf(s.optInt("alt-speed-up", 50)), false);
-        cols.add(o -> { o.put("alt-speed-down", parseInt(altDown, 50)); o.put("alt-speed-up", parseInt(altUp, 50)); });
-        listContainer.addView(turtle);
+        // alternative (turtle) limits: the switch applies immediately
+        LinearLayout turtle = UiKit.card(act);
+        turtle.addView(UiKit.overline(act, I18n.tr("Alternative speed limits")));
+        final Switch alt = switchRow(turtle, "Turtle mode", "Switch to the alternative limits below right now.",
+                s.optBoolean("alt-speed-enabled"));
+        final boolean[] altBinding = {false};
+        alt.setOnCheckedChangeListener((b, checked) -> {
+            if (altBinding[0]) return;
+            alt.setEnabled(false);
+            async(io, api -> {
+                JSONObject a = new JSONObject();
+                a.put("alt-speed-enabled", checked);
+                api.sessionSet(a);
+                return null;
+            }, r -> {
+                alt.setEnabled(true);
+                toast(checked ? "Turtle mode on." : "Turtle mode off.");
+            }, e -> {
+                alt.setEnabled(true);
+                altBinding[0] = true;
+                alt.setChecked(!checked);
+                altBinding[0] = false;
+                toast(msg(e));
+            });
+        });
+        final EditText altDown = numberField(turtle, "Alternative download limit (kB/s)", String.valueOf(s.optInt("alt-speed-down", 50)), false);
+        final EditText altUp = numberField(turtle, "Alternative upload limit (kB/s)", String.valueOf(s.optInt("alt-speed-up", 50)), false);
+        cols.add(o -> {
+            o.put("alt-speed-down", parseInt(altDown, 50));
+            o.put("alt-speed-up", parseInt(altUp, 50));
+        });
+        content.addView(turtle);
 
         // global limits
-        LinearLayout lim = card();
-        lim.addView(text(I18n.tr("Global speed limits"), 13.5f, AppTheme.text(), true));
-        final Switch dOn = addSwitch(lim, "Limit download speed", null, s.optBoolean("speed-limit-down-enabled"));
-        final EditText dv = addNum(lim, "Download limit (KB/s)", String.valueOf(s.optInt("speed-limit-down", 100)), false);
-        final Switch uOn = addSwitch(lim, "Limit upload speed", null, s.optBoolean("speed-limit-up-enabled"));
-        final EditText uv = addNum(lim, "Upload limit (KB/s)", String.valueOf(s.optInt("speed-limit-up", 100)), false);
+        LinearLayout lim = UiKit.card(act);
+        lim.addView(UiKit.overline(act, I18n.tr("Global speed limits")));
+        final Switch dOn = switchRow(lim, "Limit download speed", null, s.optBoolean("speed-limit-down-enabled"));
+        final EditText dv = numberField(lim, "Download limit (kB/s)", String.valueOf(s.optInt("speed-limit-down", 100)), false);
+        final Switch uOn = switchRow(lim, "Limit upload speed", null, s.optBoolean("speed-limit-up-enabled"));
+        final EditText uv = numberField(lim, "Upload limit (kB/s)", String.valueOf(s.optInt("speed-limit-up", 100)), false);
         cols.add(o -> {
             o.put("speed-limit-down-enabled", dOn.isChecked());
             o.put("speed-limit-down", parseInt(dv, 100));
             o.put("speed-limit-up-enabled", uOn.isChecked());
             o.put("speed-limit-up", parseInt(uv, 100));
         });
-        listContainer.addView(lim);
+        content.addView(lim);
 
-        listContainer.addView(actionButton("SAVE", AppTheme.accent(), v -> saveSession(cols, "Speed limits saved.")),
-                new LinearLayout.LayoutParams(-1, dp(40)));
+        final Button save = UiKit.primary(act, I18n.tr("Save Limits"), null);
+        save.setOnClickListener(v -> saveSession(save, cols, "Speed limits saved."));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, dp(44));
+        slp.bottomMargin = dp(12);
+        content.addView(save, slp);
 
-        // statistics
-        listContainer.addView(statsCard("This session", stats.optJSONObject("current-stats")));
-        listContainer.addView(statsCard("All time", stats.optJSONObject("cumulative-stats")));
+        content.addView(statsCard("This session", stats.optJSONObject("current-stats")));
+        content.addView(statsCard("All time", stats.optJSONObject("cumulative-stats")));
     }
 
     private View statsCard(String title, JSONObject cs) {
-        LinearLayout c = card();
-        c.addView(text(I18n.tr(title), 13.5f, AppTheme.text(), true));
+        LinearLayout c = UiKit.card(act);
+        c.addView(UiKit.overline(act, I18n.tr(title)));
         if (cs == null) {
-            c.addView(infoLine("Statistics", "-"));
+            c.addView(UiKit.caption(act, I18n.tr("No statistics yet.")));
             return c;
         }
-        c.addView(infoLine("Downloaded", fmtSize(cs.optLong("downloadedBytes"))));
-        c.addView(infoLine("Uploaded", fmtSize(cs.optLong("uploadedBytes"))));
         long dl = cs.optLong("downloadedBytes");
-        c.addView(infoLine("Ratio", dl > 0 ? fmtRatio((double) cs.optLong("uploadedBytes") / (double) dl) : "-"));
-        c.addView(infoLine("Files added", String.valueOf(cs.optLong("filesAdded"))));
-        c.addView(infoLine("Active time", fmtDuration(cs.optLong("secondsActive"))));
-        if (cs.has("sessionCount")) c.addView(infoLine("Sessions", String.valueOf(cs.optLong("sessionCount"))));
+        long ul = cs.optLong("uploadedBytes");
+        c.addView(kv("Downloaded", fmtSize(dl)));
+        c.addView(kv("Uploaded", fmtSize(ul)));
+        c.addView(kv("Ratio", dl > 0 ? fmtRatio((double) ul / (double) dl) : "—"));
+        c.addView(kv("Files added", String.valueOf(cs.optLong("filesAdded"))));
+        c.addView(kv("Active time", fmtDuration(cs.optLong("secondsActive"))));
+        if (cs.has("sessionCount")) c.addView(kv("Sessions", String.valueOf(cs.optLong("sessionCount"))));
         return c;
     }
 
-    private void saveSession(List<Collect> cols, final String okMsg) {
+    private void saveSession(final Button save, List<Collect> cols, final String okMsg) {
         final JSONObject args = new JSONObject();
         try {
             for (Collect c : cols) c.put(args);
@@ -1193,47 +1806,58 @@ public final class TransmissionTabView {
             toast(msg(e));
             return;
         }
-        action(api -> { api.sessionSet(args); return null; }, okMsg, this::refresh);
+        setBusy(save, true);
+        async(io, api -> { api.sessionSet(args); return null; }, v -> {
+            setBusy(save, false);
+            toast(okMsg);
+        }, t -> {
+            setBusy(save, false);
+            toast(msg(t));
+        });
     }
 
     // ================================================================== SETTINGS
 
     private void loadSettings() {
-        final int req = ++requestCounter;
-        showMessage("Loading...");
-        async(api -> {
+        final int g = gen;
+        showLoading("Loading settings…");
+        async(io, api -> {
             JSONObject s = api.sessionGet();
             try {
                 s.put("_free", api.freeSpace(s.optString("download-dir", "")));
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+                // free-space is optional
+            }
             return s;
         }, s -> {
-            if (req != requestCounter || section != S_SETTINGS || detailId > 0) return;
+            if (g != gen || section != S_SETTINGS || detailId > 0) return;
             renderSettings(s);
-        }, e -> { if (req == requestCounter) showError(e); });
+        }, e -> {
+            if (g == gen) showFailure(e, "Could not load settings");
+        });
     }
 
     private void renderSettings(final JSONObject s) {
-        listContainer.removeAllViews();
+        content.removeAllViews();
+        clearScreenRefs();
         final List<Collect> cols = new ArrayList<>();
 
-        LinearLayout info = card();
-        info.addView(text("Transmission " + s.optString("version", ""), 13.5f, AppTheme.text(), true));
+        LinearLayout info = UiKit.card(act);
+        info.addView(UiKit.overline(act, I18n.tr("Daemon")));
+        info.addView(kv("Version", s.optString("version", "—")));
+        info.addView(kv("RPC version", String.valueOf(s.optInt("rpc-version"))));
         long free = s.optLong("_free", -1);
-        TextView iv = text("RPC " + s.optInt("rpc-version") + (free >= 0 ? "   " + I18n.tr("Free space") + " " + fmtSize(free) : ""),
-                11f, AppTheme.textSecondary(), false);
-        iv.setPadding(0, dp(2), 0, 0);
-        info.addView(iv);
-        listContainer.addView(info);
+        if (free >= 0) info.addView(kv("Free space", fmtSize(free)));
+        content.addView(info);
 
-        LinearLayout dirs = card();
-        dirs.addView(text(I18n.tr("Folders"), 13.5f, AppTheme.text(), true));
-        final EditText dd = addNum(dirs, "Download directory", s.optString("download-dir", ""), false);
-        dd.setInputType(InputType.TYPE_CLASS_TEXT);
-        final Switch idOn = addSwitch(dirs, "Use incomplete directory", null, s.optBoolean("incomplete-dir-enabled"));
-        final EditText id = addNum(dirs, "Incomplete directory", s.optString("incomplete-dir", ""), false);
-        id.setInputType(InputType.TYPE_CLASS_TEXT);
-        final Switch startAdded = addSwitch(dirs, "Start added torrents", null, s.optBoolean("start-added-torrents", true));
+        LinearLayout dirs = UiKit.card(act);
+        dirs.addView(UiKit.overline(act, I18n.tr("Folders")));
+        final EditText dd = field(dirs, "Download folder", s.optString("download-dir", ""), true);
+        dd.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        final Switch idOn = switchRow(dirs, "Use a separate folder for incomplete files", null, s.optBoolean("incomplete-dir-enabled"));
+        final EditText id = field(dirs, "Incomplete folder", s.optString("incomplete-dir", ""), true);
+        id.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        final Switch startAdded = switchRow(dirs, "Start added torrents", null, s.optBoolean("start-added-torrents", true));
         cols.add(o -> {
             String a = dd.getText().toString().trim();
             if (!a.isEmpty()) o.put("download-dir", a);
@@ -1242,99 +1866,102 @@ public final class TransmissionTabView {
             if (!b.isEmpty()) o.put("incomplete-dir", b);
             o.put("start-added-torrents", startAdded.isChecked());
         });
-        listContainer.addView(dirs);
+        content.addView(dirs);
 
-        LinearLayout seed = card();
-        seed.addView(text(I18n.tr("Seeding"), 13.5f, AppTheme.text(), true));
-        final Switch ratioOn = addSwitch(seed, "Stop seeding at ratio", null,
-                s.has("seedRatioLimited") ? s.optBoolean("seedRatioLimited") : s.optBoolean("seed-ratio-limited"));
-        double rl = s.has("seedRatioLimit") ? s.optDouble("seedRatioLimit", 2.0) : s.optDouble("seed-ratio-limit", 2.0);
-        final EditText ratio = addNum(seed, "Ratio limit", fmtRatioPlain(rl), true);
+        LinearLayout seed = UiKit.card(act);
+        seed.addView(UiKit.overline(act, I18n.tr("Seeding")));
+        final Switch ratioOn = switchRow(seed, "Stop seeding at ratio", null, s.optBoolean("seedRatioLimited"));
+        final EditText ratio = numberField(seed, "Ratio limit", fmtRatioPlain(s.optDouble("seedRatioLimit", 2.0)), true);
         cols.add(o -> {
-            double r = parseDouble(ratio, 2.0);
             o.put("seedRatioLimited", ratioOn.isChecked());
-            o.put("seedRatioLimit", r);
-            o.put("seed-ratio-limited", ratioOn.isChecked());
-            o.put("seed-ratio-limit", r);
+            o.put("seedRatioLimit", Math.max(0, parseDouble(ratio, 2.0)));
         });
-        listContainer.addView(seed);
+        content.addView(seed);
 
-        LinearLayout peers = card();
-        peers.addView(text(I18n.tr("Peers and queues"), 13.5f, AppTheme.text(), true));
-        final EditText pg = addNum(peers, "Global peer limit", String.valueOf(s.optInt("peer-limit-global", 200)), false);
-        final EditText pt = addNum(peers, "Peer limit per torrent", String.valueOf(s.optInt("peer-limit-per-torrent", 50)), false);
-        final Switch dqOn = addSwitch(peers, "Limit active downloads", null, s.optBoolean("download-queue-enabled", true));
-        final EditText dq = addNum(peers, "Max active downloads", String.valueOf(s.optInt("download-queue-size", 5)), false);
-        final Switch sqOn = addSwitch(peers, "Limit active seeds", null, s.optBoolean("seed-queue-enabled"));
-        final EditText sq = addNum(peers, "Max active seeds", String.valueOf(s.optInt("seed-queue-size", 10)), false);
+        LinearLayout peers = UiKit.card(act);
+        peers.addView(UiKit.overline(act, I18n.tr("Peers and queues")));
+        final EditText pg = numberField(peers, "Global peer limit", String.valueOf(s.optInt("peer-limit-global", 200)), false);
+        final EditText pt = numberField(peers, "Peer limit per torrent", String.valueOf(s.optInt("peer-limit-per-torrent", 50)), false);
+        final Switch dqOn = switchRow(peers, "Limit active downloads", null, s.optBoolean("download-queue-enabled", true));
+        final EditText dq = numberField(peers, "Max active downloads", String.valueOf(s.optInt("download-queue-size", 5)), false);
+        final Switch sqOn = switchRow(peers, "Limit active seeds", null, s.optBoolean("seed-queue-enabled"));
+        final EditText sq = numberField(peers, "Max active seeds", String.valueOf(s.optInt("seed-queue-size", 10)), false);
         cols.add(o -> {
-            o.put("peer-limit-global", parseInt(pg, 200));
-            o.put("peer-limit-per-torrent", parseInt(pt, 50));
+            o.put("peer-limit-global", Math.max(1, parseInt(pg, 200)));
+            o.put("peer-limit-per-torrent", Math.max(1, parseInt(pt, 50)));
             o.put("download-queue-enabled", dqOn.isChecked());
-            o.put("download-queue-size", parseInt(dq, 5));
+            o.put("download-queue-size", Math.max(1, parseInt(dq, 5)));
             o.put("seed-queue-enabled", sqOn.isChecked());
-            o.put("seed-queue-size", parseInt(sq, 10));
+            o.put("seed-queue-size", Math.max(1, parseInt(sq, 10)));
         });
-        listContainer.addView(peers);
+        content.addView(peers);
 
-        LinearLayout net = card();
-        net.addView(text(I18n.tr("Network"), 13.5f, AppTheme.text(), true));
-        final Switch dht = addSwitch(net, "DHT", "Distributed hash table peer discovery.", s.optBoolean("dht-enabled", true));
-        final Switch pex = addSwitch(net, "PEX", "Peer exchange.", s.optBoolean("pex-enabled", true));
-        final Switch lpd = addSwitch(net, "LPD", "Local peer discovery.", s.optBoolean("lpd-enabled"));
+        LinearLayout net = UiKit.card(act);
+        net.addView(UiKit.overline(act, I18n.tr("Network")));
+        final Switch dht = switchRow(net, "DHT", "Distributed hash table peer discovery.", s.optBoolean("dht-enabled", true));
+        final Switch pex = switchRow(net, "PEX", "Peer exchange.", s.optBoolean("pex-enabled", true));
+        final Switch lpd = switchRow(net, "LPD", "Local peer discovery.", s.optBoolean("lpd-enabled"));
         cols.add(o -> {
             o.put("dht-enabled", dht.isChecked());
             o.put("pex-enabled", pex.isChecked());
             o.put("lpd-enabled", lpd.isChecked());
         });
-        net.addView(text(I18n.tr("Encryption"), 11.5f, AppTheme.textSecondary(), false));
+        TextView encLabel = UiKit.caption(act, I18n.tr("Encryption"));
+        encLabel.setPadding(0, dp(14), 0, dp(8));
+        net.addView(encLabel);
         final String[] enc = new String[]{s.optString("encryption", "preferred")};
-        final LinearLayout encRow = new LinearLayout(act);
-        encRow.setOrientation(LinearLayout.HORIZONTAL);
-        encRow.setPadding(0, dp(6), 0, dp(4));
+        final LinearLayout encRow = UiKit.row(act);
         drawEncryption(encRow, enc);
-        net.addView(encRow);
+        net.addView(UiKit.chipScroller(act, encRow), new LinearLayout.LayoutParams(-1, -2));
         cols.add(o -> o.put("encryption", enc[0]));
-        listContainer.addView(net);
+        content.addView(net);
 
-        LinearLayout bl = card();
-        bl.addView(text(I18n.tr("Blocklist"), 13.5f, AppTheme.text(), true));
-        final Switch blOn = addSwitch(bl, "Enable blocklist", null, s.optBoolean("blocklist-enabled"));
-        final EditText blUrl = addNum(bl, "Blocklist URL", s.optString("blocklist-url", ""), false);
+        LinearLayout bl = UiKit.card(act);
+        bl.addView(UiKit.overline(act, I18n.tr("Blocklist")));
+        final Switch blOn = switchRow(bl, "Enable blocklist", null, s.optBoolean("blocklist-enabled"));
+        final EditText blUrl = field(bl, "Blocklist URL", s.optString("blocklist-url", ""), true);
         blUrl.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         cols.add(o -> {
             o.put("blocklist-enabled", blOn.isChecked());
             String u = blUrl.getText().toString().trim();
             if (!u.isEmpty()) o.put("blocklist-url", u);
         });
-        TextView bs = text(I18n.tr("Rules loaded") + ": " + s.optInt("blocklist-size"), 11f, AppTheme.textSecondary(), false);
-        bs.setPadding(0, dp(4), 0, 0);
+        final TextView bs = UiKit.caption(act, tf("Rules loaded: {0}", s.optInt("blocklist-size")));
+        bs.setPadding(0, dp(8), 0, 0);
         bl.addView(bs);
-        LinearLayout blRow = buttonRow();
-        blRow.addView(actionButton("UPDATE BLOCKLIST", AppTheme.accent(), v -> {
-            toast("Updating blocklist...");
-            async(api -> api.blocklistUpdate(),
-                    n -> toast(I18n.tr("Blocklist updated") + ": " + n + " " + I18n.tr("rules")),
-                    e -> toast(msg(e)));
-        }), weight());
-        blRow.addView(actionButton("PORT TEST", AppTheme.accent(), v -> {
-            toast("Testing peer port...");
-            async(api -> api.portTest(),
-                    open -> toast(open ? "Peer port is open." : "Peer port is closed."),
-                    e -> toast(msg(e)));
-        }), weight());
-        bl.addView(blRow);
-        listContainer.addView(bl);
+        final Button upd = UiKit.outline(act, I18n.tr("Update Blocklist"), null);
+        upd.setOnClickListener(v -> {
+            setBusy(upd, true);
+            async(slow, api -> api.blocklistUpdate(), n -> {
+                setBusy(upd, false);
+                setText(bs, tf("Rules loaded: {0}", n));
+                toast(tf("Blocklist updated: {0} rules", n));
+            }, e -> {
+                setBusy(upd, false);
+                toast(msg(e));
+            });
+        });
+        final Button port = UiKit.outline(act, I18n.tr("Test Port"), null);
+        port.setOnClickListener(v -> {
+            setBusy(port, true);
+            async(slow, api -> api.portTest(), open -> {
+                setBusy(port, false);
+                toast(open ? "The peer port is open." : "The peer port is closed.");
+            }, e -> {
+                setBusy(port, false);
+                toast(msg(e));
+            });
+        });
+        bl.addView(UiKit.buttonRow(act, upd, port));
+        content.addView(bl);
 
-        Button save = actionButton("SAVE", AppTheme.accent(), v -> saveSession(cols, "Settings saved."));
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, dp(40));
-        slp.topMargin = dp(4);
-        listContainer.addView(save, slp);
+        final Button save = UiKit.primary(act, I18n.tr("Save Settings"), null);
+        save.setOnClickListener(v -> saveSession(save, cols, "Settings saved."));
+        content.addView(save, new LinearLayout.LayoutParams(-1, dp(44)));
 
-        TextView note = text(I18n.tr("Fishbowl may re-apply some of these (for example the seeding ratio) when Transmission is restarted."),
-                10.5f, AppTheme.textMuted(), false);
-        note.setPadding(0, dp(10), 0, 0);
-        listContainer.addView(note);
+        TextView note = UiKit.caption(act, I18n.tr("Jellyarr re-applies some of these (for example the seeding ratio and folders) when Transmission restarts."));
+        note.setPadding(dp(4), dp(12), dp(4), 0);
+        content.addView(note);
     }
 
     private void drawEncryption(final LinearLayout holder, final String[] cur) {
@@ -1343,114 +1970,198 @@ public final class TransmissionTabView {
         final String[] labels = {"Required", "Preferred", "Allowed"};
         for (int i = 0; i < values.length; i++) {
             final String val = values[i];
-            TextView p = pill(labels[i], val.equals(cur[0]));
-            p.setOnClickListener(v -> { cur[0] = val; drawEncryption(holder, cur); });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(32));
-            lp.setMarginEnd(dp(6));
-            holder.addView(p, lp);
+            TextView p = UiKit.chip(act, I18n.tr(labels[i]), val.equals(cur[0]));
+            p.setOnClickListener(v -> {
+                cur[0] = val;
+                drawEncryption(holder, cur);
+            });
+            holder.addView(p, UiKit.chipLp(act));
         }
+    }
+
+    // ================================================================== History & cleanup
+
+    private void renderCenter() {
+        content.removeAllViews();
+        clearScreenRefs();
+        TextView intro = UiKit.caption(act, I18n.tr("Finished downloads, history and cleanup tools. Live torrents are in the Torrents section."));
+        intro.setPadding(dp(4), 0, dp(4), 0);
+        content.addView(intro);
+        if (centerView == null) {
+            content.addView(UiKit.empty(act, I18n.tr("Nothing here yet"), null));
+            return;
+        }
+        if (centerView.getParent() instanceof ViewGroup) ((ViewGroup) centerView.getParent()).removeView(centerView);
+        content.addView(centerView);
+        if (centerRefresh != null) centerRefresh.run();
     }
 
     // ================================================================== dialogs & small UI helpers
 
-    private LinearLayout dialogBody(String title) {
-        LinearLayout body = new LinearLayout(act);
-        body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(dp(18), dp(16), dp(18), dp(14));
-        TextView t = text(title, 15f, AppTheme.text(), true);
-        t.setPadding(0, 0, 0, dp(6));
-        body.addView(t);
-        return body;
+    /** Themed dialog with a title and a vertical body; add views to {@link #box}. */
+    private final class Sheet {
+        final LinearLayout box;
+        final AlertDialog dialog;
+
+        Sheet(String title) {
+            box = UiKit.column(act);
+            box.setPadding(dp(20), dp(18), dp(20), dp(16));
+            if (title != null) {
+                TextView t = UiKit.title(act, I18n.tr(title));
+                t.setPadding(0, 0, 0, dp(10));
+                box.addView(t);
+            }
+            ScrollView sv = new ScrollView(act);
+            sv.addView(box, new ViewGroup.LayoutParams(-1, -2));
+            dialog = new AlertDialog.Builder(act).setView(I18n.attach(sv)).create();
+            if (dialog.getWindow() != null) {
+                dialog.getWindow().setBackgroundDrawable(UiKit.shape(act, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+            }
+        }
+
+        void show() {
+            if (dead()) return;
+            try { dialog.show(); } catch (Throwable ignored) { }
+        }
+
+        void dismiss() {
+            try { dialog.dismiss(); } catch (Throwable ignored) { }
+        }
     }
 
-    private Dialog dialog(View content) {
-        ScrollView wrap = new ScrollView(act);
-        wrap.addView(content, new ViewGroup.LayoutParams(-1, -2));
-        AlertDialog d = new AlertDialog.Builder(act).setView(wrap).create();
-        if (d.getWindow() != null) d.getWindow().setBackgroundDrawable(rounded(AppTheme.card(), AppTheme.outline(), 16));
-        return d;
+    private void confirm(String title, String message, String positive, boolean destructive, final Runnable onYes) {
+        final Sheet s = new Sheet(title);
+        s.box.addView(UiKit.body(act, I18n.tr(message)));
+        Button no = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        View.OnClickListener yesL = v -> {
+            s.dismiss();
+            onYes.run();
+        };
+        Button yes = destructive ? UiKit.danger(act, I18n.tr(positive), yesL) : UiKit.primary(act, I18n.tr(positive), yesL);
+        s.box.addView(UiKit.buttonRow(act, no, yes));
+        s.show();
     }
 
-    private LinearLayout buttonRow() {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, dp(12), 0, 0);
+    /** Single-choice list; selected < 0 marks nothing. */
+    private void choose(String title, String[] items, int selected, final IntDone cb) {
+        final Sheet s = new Sheet(title);
+        for (int i = 0; i < items.length; i++) {
+            final int idx = i;
+            boolean sel = i == selected;
+            TextView row = UiKit.text(act, (sel ? "✓  " : "") + I18n.tr(items[i]), 14f,
+                    sel ? AppTheme.accent() : AppTheme.text(), sel ? UiKit.BOLD : UiKit.MEDIUM);
+            row.setPadding(dp(12), dp(12), dp(12), dp(12));
+            row.setBackground(UiKit.rowRipple(act));
+            row.setClickable(true);
+            row.setFocusable(true);
+            row.setOnClickListener(v -> {
+                s.dismiss();
+                cb.run(idx);
+            });
+            s.box.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        }
+        s.show();
+    }
+
+    private LinearLayout listRow() {
+        LinearLayout row = UiKit.column(act);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
         return row;
     }
 
-    private void confirm(String message, String positive, int color, final Runnable onYes) {
-        final LinearLayout body = dialogBody(I18n.tr("Confirm"));
-        body.addView(text(I18n.tr(message), 12.5f, AppTheme.textSecondary(), false));
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton(positive, color, v -> { d.dismiss(); onYes.run(); }), weight());
-        body.addView(row);
-        d.show();
-    }
-
-    private void choose(String title, String[] items, int selected, final IntDone cb) {
-        final LinearLayout body = dialogBody(I18n.tr(title));
-        final Dialog d = dialog(body);
-        for (int i = 0; i < items.length; i++) {
-            final int idx = i;
-            Button b = actionButton(items[i], i == selected ? AppTheme.accent() : AppTheme.textSecondary(),
-                    v -> { d.dismiss(); cb.run(idx); });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(36));
-            lp.topMargin = dp(6);
-            body.addView(b, lp);
-        }
-        d.show();
-    }
-
-    private LinearLayout card() {
-        LinearLayout c = new LinearLayout(act);
-        c.setOrientation(LinearLayout.VERTICAL);
-        c.setPadding(dp(14), dp(12), dp(14), dp(12));
-        c.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(8);
-        c.setLayoutParams(lp);
-        return c;
-    }
-
-    /** Adds a labelled single-line EditText to parent and returns it. */
-    private EditText addNum(LinearLayout parent, String label, String value, boolean decimal) {
-        TextView l = text(I18n.tr(label), 11f, AppTheme.textMuted(), false);
-        l.setPadding(0, dp(8), 0, 0);
+    /** Label above an input; monospace for paths and URLs. */
+    private EditText field(LinearLayout parent, String label, String value, boolean mono) {
+        TextView l = UiKit.caption(act, I18n.tr(label));
+        l.setPadding(0, dp(12), 0, dp(6));
         parent.addView(l);
-        EditText e = new EditText(act);
-        e.setTextColor(AppTheme.text());
-        e.setHintTextColor(AppTheme.textMuted());
-        e.setTextSize(13f);
-        e.setSingleLine(true);
-        e.setInputType(decimal ? InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL : InputType.TYPE_CLASS_NUMBER);
-        e.setText(value);
+        EditText e = UiKit.input(act, "");
+        e.setText(value == null ? "" : value);
+        if (mono) e.setTypeface(Typeface.MONOSPACE);
         parent.addView(e, new LinearLayout.LayoutParams(-1, -2));
         return e;
     }
 
-    /** Adds a label (+ optional hint) with a themed Switch on the right and returns the Switch. */
-    private Switch addSwitch(LinearLayout parent, String label, String hint, boolean checked) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(8), 0, 0);
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.addView(text(I18n.tr(label), 12.5f, AppTheme.text(), false));
+    private EditText numberField(LinearLayout parent, String label, String value, boolean decimal) {
+        EditText e = field(parent, label, value, false);
+        e.setInputType(decimal ? InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL : InputType.TYPE_CLASS_NUMBER);
+        return e;
+    }
+
+    /** Label (+ optional hint) with a themed switch at the end; returns the switch. */
+    private Switch switchRow(LinearLayout parent, String label, String hint, boolean checked) {
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(0, dp(12), 0, 0);
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(UiKit.text(act, I18n.tr(label), 14f, AppTheme.text(), null));
         if (hint != null) {
-            TextView h = text(I18n.tr(hint), 10.5f, AppTheme.textMuted(), false);
-            h.setPadding(0, dp(2), dp(8), 0);
+            TextView h = UiKit.caption(act, I18n.tr(hint));
+            h.setPadding(0, dp(2), 0, 0);
             tx.addView(h);
         }
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginEnd(dp(12));
+        row.addView(tx, tlp);
         Switch sw = new Switch(act);
         sw.setChecked(checked);
         UiStyle.styleSwitch(act, sw);
         row.addView(sw);
-        parent.addView(row);
+        parent.addView(row, new LinearLayout.LayoutParams(-1, -2));
         return sw;
+    }
+
+    private View kv(String key, String value) {
+        return UiKit.kv(act, I18n.tr(key), value == null || value.isEmpty() ? "—" : value);
+    }
+
+    /** kv row whose value is monospace and selectable (paths, hashes). */
+    private View kvMono(String key, String value) {
+        View r = kv(key, value);
+        if (r instanceof ViewGroup && ((ViewGroup) r).getChildCount() > 1 && ((ViewGroup) r).getChildAt(1) instanceof TextView) {
+            TextView v = (TextView) ((ViewGroup) r).getChildAt(1);
+            v.setTypeface(Typeface.MONOSPACE);
+            v.setTextSize(12f);
+            v.setTextIsSelectable(true);
+        }
+        return r;
+    }
+
+    private Button compact(Button b) {
+        b.setTextSize(12.5f);
+        b.setMinHeight(dp(32));
+        b.setMinimumHeight(dp(32));
+        b.setPadding(dp(12), 0, dp(12), 0);
+        return b;
+    }
+
+    private LinearLayout.LayoutParams compactLp(boolean gap) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(34));
+        if (gap) lp.setMarginStart(dp(8));
+        return lp;
+    }
+
+    /** UiKit.header builds [column(title, subtitle)] + trailing; returns its subtitle TextView. */
+    private TextView findSubtitle(LinearLayout header) {
+        View col = header.getChildCount() > 0 ? header.getChildAt(0) : null;
+        if (col instanceof LinearLayout) {
+            LinearLayout c = (LinearLayout) col;
+            if (c.getChildCount() > 1 && c.getChildAt(1) instanceof TextView) return (TextView) c.getChildAt(1);
+            TextView t = UiKit.caption(act, "");
+            c.addView(t);
+            return t;
+        }
+        return UiKit.caption(act, "");
+    }
+
+    private static void setText(TextView v, CharSequence s) {
+        if (v == null) return;
+        String n = s == null ? "" : s.toString();
+        if (!n.contentEquals(v.getText())) v.setText(n);
+    }
+
+    private static String tf(String template, Object... args) {
+        String s = I18n.tr(template);
+        for (int i = 0; i < args.length; i++) s = s.replace("{" + i + "}", String.valueOf(args[i]));
+        return s;
     }
 
     private static int parseInt(EditText e, int def) {
@@ -1458,109 +2169,46 @@ public final class TransmissionTabView {
     }
 
     private static double parseDouble(EditText e, double def) {
-        try { return Double.parseDouble(e.getText().toString().trim()); } catch (Throwable t) { return def; }
+        try { return Double.parseDouble(e.getText().toString().trim().replace(',', '.')); } catch (Throwable t) { return def; }
     }
 
     private String readClipboard() {
         try {
             ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm == null || !cm.hasPrimaryClip() || cm.getPrimaryClip() == null || cm.getPrimaryClip().getItemCount() == 0) return "";
-            CharSequence cs = cm.getPrimaryClip().getItemAt(0).coerceToText(act);
+            if (cm == null || !cm.hasPrimaryClip()) return "";
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return "";
+            CharSequence cs = clip.getItemAt(0).coerceToText(act);
             return cs == null ? "" : cs.toString().trim();
         } catch (Throwable t) {
             return "";
         }
     }
 
-    private void copyToClipboard(String s) {
+    private void copyToClipboard(String label, String s) {
         try {
             ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("magnet", s));
-        } catch (Throwable ignored) {}
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText(label, s));
+        } catch (Throwable ignored) { }
     }
 
-    private void showMessage(String m) {
-        listContainer.removeAllViews();
-        rowsBox = null;
-        TextView t = text(I18n.tr(m), 12f, AppTheme.textSecondary(), false);
-        t.setPadding(0, dp(16), 0, 0);
-        listContainer.addView(t);
-    }
-
-    private void showError(Throwable err) {
-        listContainer.removeAllViews();
-        rowsBox = null;
-        errorShown = true;
-        summary.setText("");
-        TextView t = text(I18n.tr(msg(err)), 12f, AppTheme.danger(), false);
-        t.setPadding(0, dp(16), 0, dp(8));
-        listContainer.addView(t);
-        listContainer.addView(actionButton("RETRY", AppTheme.accent(), v -> refresh()), new LinearLayout.LayoutParams(-1, dp(40)));
-    }
-
-    private LinearLayout.LayoutParams weight() {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(34), 1.0f);
-        lp.setMarginEnd(dp(6));
-        return lp;
-    }
-
-    private TextView pill(String label, boolean selected) {
-        TextView t = text(I18n.tr(label), 10f, selected ? AppTheme.onAccent() : AppTheme.textSecondary(), true);
-        t.setGravity(Gravity.CENTER);
-        t.setSingleLine(true);
-        t.setPadding(dp(14), 0, dp(14), 0);
-        t.setBackground(rounded(selected ? AppTheme.accent() : AppTheme.card(), AppTheme.outline(), 17));
-        t.setClickable(true);
-        return t;
-    }
-
-    private Button actionButton(String label, int c, View.OnClickListener l) {
-        Button b = new Button(act);
-        b.setText(I18n.tr(label));
-        b.setAllCaps(false);
-        b.setTextSize(10.5f);
-        b.setMinHeight(0);
-        b.setMinimumHeight(0);
-        b.setTypeface(Typeface.DEFAULT_BOLD);
-        b.setTextColor(c);
-        b.setBackground(rounded(Color.argb(25, Color.red(c), Color.green(c), Color.blue(c)),
-                Color.argb(80, Color.red(c), Color.green(c), Color.blue(c)), 8));
-        if (l != null) b.setOnClickListener(l);
-        return b;
-    }
-
-    private TextView text(String s, float size, int color, boolean bold) {
-        TextView t = new TextView(act);
-        t.setText(s);
-        t.setTextSize(size);
-        t.setTextColor(color);
-        if (bold) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        return t;
-    }
-
-    private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(fill);
-        g.setStroke(dp(1), stroke);
-        g.setCornerRadius(dp(radiusDp));
-        return g;
-    }
-
-    private int dp(int v) {
-        return Math.round(v * act.getResources().getDisplayMetrics().density);
+    private int dp(float v) {
+        return UiKit.dp(act, v);
     }
 
     // ================================================================== formatting
 
     private static String fmtSize(long bytes) {
         if (bytes <= 0) return "0 B";
-        double gb = bytes / 1073741824.0;
-        if (gb >= 1) return String.format(Locale.US, "%.2f GB", gb);
-        double mb = bytes / 1048576.0;
-        if (mb >= 1) return String.format(Locale.US, "%.1f MB", mb);
-        double kb = bytes / 1024.0;
-        if (kb >= 1) return String.format(Locale.US, "%.0f KB", kb);
-        return bytes + " B";
+        if (bytes < 1024) return bytes + " B";
+        double v = bytes / 1024.0;
+        String[] u = {"KB", "MB", "GB", "TB"};
+        int i = 0;
+        while (v >= 1024 && i < u.length - 1) {
+            v /= 1024;
+            i++;
+        }
+        return String.format(Locale.US, v >= 100 ? "%.0f %s" : v >= 10 ? "%.1f %s" : "%.2f %s", v, u[i]);
     }
 
     private static String fmtSpeed(long bytesPerSec) {
@@ -1569,13 +2217,13 @@ public final class TransmissionTabView {
     }
 
     private static String fmtPct(double frac) {
-        if (frac < 0) frac = 0;
+        if (frac < 0 || Double.isNaN(frac)) frac = 0;
         if (frac > 1) frac = 1;
         return String.format(Locale.US, "%.1f%%", frac * 100.0);
     }
 
     private static String fmtRatio(double r) {
-        if (r < 0) return "-";
+        if (r < 0 || Double.isNaN(r)) return "—";
         return String.format(Locale.US, "%.2f", r);
     }
 
@@ -1583,8 +2231,9 @@ public final class TransmissionTabView {
         return String.format(Locale.US, "%.2f", r);
     }
 
+    /** Transmission uses -1 for "not available" and -2 for "unknown". */
     private static String fmtEta(long secs) {
-        if (secs < 0) return "--";
+        if (secs < 0) return "—";
         return fmtDuration(secs);
     }
 
@@ -1598,7 +2247,7 @@ public final class TransmissionTabView {
     }
 
     private static String fmtDate(long epochSec) {
-        if (epochSec <= 0) return "-";
+        if (epochSec <= 0) return "—";
         return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date(epochSec * 1000L));
     }
 }

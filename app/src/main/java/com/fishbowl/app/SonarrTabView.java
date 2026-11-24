@@ -2,11 +2,8 @@ package com.fishbowl.app;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.Dialog;
 import android.graphics.Bitmap;
-import android.graphics.Color;
 import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -21,7 +18,6 @@ import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -36,25 +32,32 @@ import org.json.JSONObject;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TimeZone;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
- * "Sonarr" tab: a native client for Sonarr's web UI (in the spirit of nzb360).
+ * "Sonarr" tab: a native client for the local Sonarr (v3 API, served by Sonarr v3 and v4).
  *
  * <ul>
- *   <li>SERIES - browse the library, open a series (seasons / episodes), monitor, search, interactive
- *       release search, refresh / rescan, delete episode files, add and delete series.</li>
- *   <li>CALENDAR - upcoming and recent episodes.</li>
- *   <li>QUEUE - live downloads with remove / blocklist.</li>
- *   <li>HISTORY - grabbed / imported / failed events.</li>
- *   <li>WANTED - monitored missing episodes, search one or all.</li>
- *   <li>SYSTEM - status, health, disk space, root folders, profiles, indexers, clients, tasks.</li>
- *   <li>AUTO - the periodic missing-episode search (replaces the old Tasker job).</li>
+ *   <li>Series - library with filters; a series page with seasons / episodes, monitoring, search,
+ *       interactive release search, refresh / rescan, file deletion; add and delete series.</li>
+ *   <li>Calendar - recent and upcoming episodes (UTC range, grouped by local day).</li>
+ *   <li>Queue - live downloads (polls only while on screen) with remove / blocklist.</li>
+ *   <li>History - grabbed / imported / failed events.</li>
+ *   <li>Wanted - monitored missing episodes, search one or all.</li>
+ *   <li>System - status, health, disk space, root folders, profiles, indexers, clients, tasks.</li>
+ *   <li>Auto Search - the periodic missing-episode search.</li>
  * </ul>
  */
 public final class SonarrTabView {
@@ -66,70 +69,138 @@ public final class SonarrTabView {
     private static final int S_WANTED = 4;
     private static final int S_SYSTEM = 5;
     private static final int S_AUTO = 6;
+    private static final String[] SECTION_NAMES = {"Series", "Calendar", "Queue", "History", "Wanted", "System", "Auto Search"};
 
-    private static final String[] SECTION_NAMES = {"SERIES", "CALENDAR", "QUEUE", "HISTORY", "WANTED", "SYSTEM", "AUTO"};
+    private static final String[] SERIES_FILTERS = {"All", "Monitored", "Missing", "Continuing", "Ended"};
+
     private static final int PAGE_SIZE = 40;
+    private static final int SERIES_BATCH = 60;
+    private static final long QUEUE_TICK_MS = 6000L;
 
     private interface Job<T> { T run(SonarrApi api) throws Exception; }
     private interface Done<T> { void run(T value); }
+    private interface IntDone { void run(int value); }
 
     private final Activity act;
     private final LinearLayout root;
-    private final LinearLayout navRow;
-    private final LinearLayout listContainer;
+    private final TextView headerSub;
+    private final TextView[] navChips = new TextView[SECTION_NAMES.length];
     private final ScrollView scroll;
-    private final ExecutorService bg = Executors.newFixedThreadPool(2);
+    private final LinearLayout content;
+    private final ExecutorService io = Executors.newFixedThreadPool(2);
+    /** Slow calls (interactive search, add, delete) so they never block the screen loads. */
+    private final ExecutorService slow = Executors.newSingleThreadExecutor();
     private final ExecutorService imgPool = Executors.newFixedThreadPool(3);
-    private final LruCache<String, Bitmap> imgCache = new LruCache<>(60);
+    private final LruCache<String, Bitmap> imgCache;
+    private final Map<String, List<ImageView>> imgPending = new HashMap<>();
+    private final Set<String> imgFailed = new HashSet<>();
 
     private int section = S_SERIES;
     private int page = 1;
+    private int gen = 0;
     private int detailSeriesId = 0;
-    private int requestCounter = 0;
-    private String seriesFilter = "";
+    private boolean tickerOn = false;
+    private boolean pollPending = false;
+    private boolean versionRequested = false;
+    private String version = "";
+
+    // series list
     private JSONArray seriesCache = null;
-    private final java.util.Set<Integer> expandedSeasons = new java.util.HashSet<>();
+    private String seriesQuery = "";
+    private int seriesFilter = 0;
+    private int seriesLimit = SERIES_BATCH;
+    private LinearLayout seriesShell = null;
+    private LinearLayout seriesRows = null;
+    private TextView seriesCount = null;
+    private TextView[] seriesChips = null;
+    private int styledSeriesFilter = -1;
+    private Button moreButton = null;
+
+    // series detail
+    private final Set<Integer> expandedSeasons = new HashSet<>();
+    private LinearLayout detailRoot = null;
+
+    // queue
+    private LinearLayout queueRows = null;
+    private TextView queueCount = null;
+    private final Map<Integer, QueueHolder> queueHolders = new HashMap<>();
+    private final List<Integer> queueOrder = new ArrayList<>();
+    private boolean failureShown = false;
 
     private final Runnable queueTicker = new Runnable() {
         @Override public void run() {
-            if (section == S_QUEUE && detailSeriesId == 0 && root.isShown()) {
-                loadQueue(true);
-                root.postDelayed(this, 6000);
+            if (!tickerOn) return;
+            if (!wantTicker()) {
+                stopTicker();
+                return;
             }
+            loadQueue(true);
+            root.postDelayed(this, QUEUE_TICK_MS);
         }
     };
 
     public SonarrTabView(Activity activity) {
         this.act = activity;
+        long maxKb = Runtime.getRuntime().maxMemory() / 1024L;
+        int cacheKb = (int) Math.max(4096L, Math.min(maxKb / 16L, 24L * 1024L));
+        imgCache = new LruCache<String, Bitmap>(cacheKb) {
+            @Override protected int sizeOf(String k, Bitmap b) {
+                return Math.max(1, b.getByteCount() / 1024);
+            }
+        };
 
-        root = new LinearLayout(act);
+        root = new LinearLayout(act) {
+            @Override protected void onAttachedToWindow() {
+                super.onAttachedToWindow();
+                syncTicker();
+            }
+
+            @Override protected void onDetachedFromWindow() {
+                stopTicker();
+                super.onDetachedFromWindow();
+            }
+
+            @Override protected void onVisibilityChanged(View changedView, int visibility) {
+                super.onVisibilityChanged(changedView, visibility);
+                syncTicker();
+            }
+
+            @Override protected void onWindowVisibilityChanged(int visibility) {
+                super.onWindowVisibilityChanged(visibility);
+                syncTicker();
+            }
+        };
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(AppTheme.bg());
 
-        LinearLayout header = new LinearLayout(act);
-        header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(dp(16), dp(12), dp(16), dp(4));
-        TextView title = text("SONARR", 14f, AppTheme.text(), true);
-        title.setLetterSpacing(0.14f);
-        header.addView(title);
-        TextView sub = text(I18n.tr("Manage your TV library from here"), 11f, AppTheme.textMuted(), false);
-        sub.setPadding(0, dp(2), 0, dp(6));
-        header.addView(sub);
-        root.addView(header);
+        Button addBtn = compact(UiKit.outline(act, I18n.tr("Add Series"), v -> showAddDialog()));
+        LinearLayout header = UiKit.header(act, "Sonarr", I18n.tr("TV series"), addBtn);
+        header.setPadding(dp(16), dp(12), dp(16), dp(10));
+        ViewGroup.LayoutParams alp = addBtn.getLayoutParams();
+        if (alp != null) {
+            alp.height = dp(34);
+            addBtn.setLayoutParams(alp);
+        }
+        headerSub = UiKit.singleLine(findSubtitle(header));
+        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
 
-        HorizontalScrollView navScroll = new HorizontalScrollView(act);
-        navScroll.setHorizontalScrollBarEnabled(false);
-        navRow = new LinearLayout(act);
-        navRow.setOrientation(LinearLayout.HORIZONTAL);
-        navRow.setPadding(dp(12), 0, dp(12), dp(6));
-        navScroll.addView(navRow);
-        root.addView(navScroll);
+        LinearLayout chips = UiKit.row(act);
+        chips.setPadding(dp(16), 0, dp(16), dp(10));
+        for (int i = 0; i < SECTION_NAMES.length; i++) {
+            final int idx = i;
+            TextView c = UiKit.chip(act, I18n.tr(SECTION_NAMES[i]), i == section);
+            c.setOnClickListener(v -> go(idx));
+            navChips[i] = c;
+            chips.addView(c, UiKit.chipLp(act));
+        }
+        HorizontalScrollView navScroll = UiKit.chipScroller(act, chips);
+        root.addView(navScroll, new LinearLayout.LayoutParams(-1, -2));
 
         scroll = new ScrollView(act);
-        listContainer = new LinearLayout(act);
-        listContainer.setOrientation(LinearLayout.VERTICAL);
-        listContainer.setPadding(dp(16), 0, dp(16), dp(24));
-        scroll.addView(listContainer, new ViewGroup.LayoutParams(-1, -2));
+        scroll.setFillViewport(true);
+        content = UiKit.column(act);
+        content.setPadding(dp(16), dp(2), dp(16), dp(24));
+        scroll.addView(content, new ViewGroup.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1.0f));
     }
 
@@ -139,210 +210,412 @@ public final class SonarrTabView {
     public boolean onBack() {
         if (detailSeriesId > 0) {
             detailSeriesId = 0;
+            detailRoot = null;
             refresh();
             return true;
         }
         if ((section == S_WANTED || section == S_HISTORY) && page > 1) {
             page--;
+            scroll.scrollTo(0, 0);
             refresh();
             return true;
         }
         if (section != S_SERIES) {
-            section = S_SERIES;
-            page = 1;
-            refresh();
+            go(S_SERIES);
             return true;
         }
         return false;
     }
 
     public void refresh() {
+        gen++;
         renderNav();
-        root.removeCallbacks(queueTicker);
-        if (detailSeriesId > 0) { loadDetail(); return; }
-        switch (section) {
-            case S_SERIES: loadSeries(); break;
-            case S_CALENDAR: loadCalendar(); break;
-            case S_QUEUE: loadQueue(false); root.postDelayed(queueTicker, 6000); break;
-            case S_HISTORY: loadHistory(); break;
-            case S_WANTED: loadWanted(); break;
-            case S_SYSTEM: loadSystem(); break;
-            default: renderAuto(); break;
+        requestVersion();
+        if (detailSeriesId > 0) {
+            loadDetail(detailRoot != null && detailRoot.getParent() == content);
+        } else {
+            switch (section) {
+                case S_SERIES: loadSeries(); break;
+                case S_CALENDAR: loadCalendar(); break;
+                case S_QUEUE: loadQueue(false); break;
+                case S_HISTORY: loadHistory(); break;
+                case S_WANTED: loadWanted(); break;
+                case S_SYSTEM: loadSystem(); break;
+                default: renderAuto(); break;
+            }
         }
+        syncTicker();
+    }
+
+    private void go(int s) {
+        section = s;
+        page = 1;
+        detailSeriesId = 0;
+        detailRoot = null;
+        scroll.scrollTo(0, 0);
+        refresh();
     }
 
     private void renderNav() {
-        navRow.removeAllViews();
-        for (int i = 0; i < SECTION_NAMES.length; i++) {
-            final int idx = i;
-            TextView p = pill(SECTION_NAMES[i], idx == section && detailSeriesId == 0);
-            p.setOnClickListener(v -> { section = idx; page = 1; detailSeriesId = 0; refresh(); });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(34));
-            lp.setMarginEnd(dp(6));
-            navRow.addView(p, lp);
+        for (int i = 0; i < navChips.length; i++) UiKit.styleChip(act, navChips[i], i == section);
+    }
+
+    // ================================================================== queue ticker
+
+    private boolean wantTicker() {
+        return root != null && section == S_QUEUE && detailSeriesId == 0 && root.isAttachedToWindow()
+                && root.getWindowVisibility() == View.VISIBLE && root.isShown();
+    }
+
+    private void syncTicker() {
+        if (root == null) return;
+        if (wantTicker()) {
+            if (!tickerOn) {
+                tickerOn = true;
+                root.removeCallbacks(queueTicker);
+                root.postDelayed(queueTicker, QUEUE_TICK_MS);
+            }
+        } else {
+            stopTicker();
         }
     }
 
-    // ================================================================== async helper
+    private void stopTicker() {
+        tickerOn = false;
+        if (root != null) root.removeCallbacks(queueTicker);
+    }
 
-    private <T> void async(final Job<T> job, final Done<T> ok, final Done<Throwable> err) {
-        bg.execute(() -> {
-            try {
-                final SonarrApi api = SonarrApi.get(act);
-                final T r = job.run(api);
-                act.runOnUiThread(() -> { if (ok != null) ok.run(r); });
-            } catch (final Throwable t) {
+    // ================================================================== async helpers
+
+    private boolean dead() {
+        return act.isFinishing() || act.isDestroyed();
+    }
+
+    private <T> void async(ExecutorService ex, final Job<T> job, final Done<T> ok, final Done<Throwable> err) {
+        try {
+            ex.execute(() -> {
+                T result = null;
+                Throwable failure = null;
+                try {
+                    result = job.run(SonarrApi.get(act));
+                } catch (Throwable t) {
+                    failure = t;
+                }
+                final T r = result;
+                final Throwable f = failure;
                 act.runOnUiThread(() -> {
-                    if (err != null) err.run(t);
-                    else toast(msg(t));
+                    if (dead()) return;
+                    if (f == null) {
+                        if (ok != null) ok.run(r);
+                    } else if (err != null) {
+                        err.run(f);
+                    } else {
+                        toast(msg(f));
+                    }
                 });
-            }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // shut down
+        }
+    }
+
+    /** Runs a command with its button disabled and toasts the outcome. */
+    private void runAction(final View button, final Job<Object> job, final String okMsg, final Runnable after) {
+        setBusy(button, true);
+        async(io, job, v -> {
+            setBusy(button, false);
+            if (okMsg != null) toast(okMsg);
+            if (after != null) after.run();
+        }, t -> {
+            setBusy(button, false);
+            toast(msg(t));
         });
     }
 
-    /** Runs a fire-and-forget action and toasts the outcome. */
-    private void action(final Job<Void> job, final String okMsg, final Runnable after) {
-        async(job, v -> {
-            toast(okMsg);
-            if (after != null) after.run();
-        }, t -> toast(msg(t)));
+    private static void setBusy(View b, boolean busy) {
+        if (b == null) return;
+        b.setEnabled(!busy);
+        b.setAlpha(busy ? 0.5f : 1f);
     }
 
     private static String msg(Throwable t) {
         String m = t == null ? null : t.getMessage();
-        return m == null ? "Unknown error (is Sonarr running?)" : m;
+        return m == null || m.trim().isEmpty() ? "Unknown error." : m;
     }
 
-    private void toast(String s) { Toast.makeText(act, I18n.tr(s), Toast.LENGTH_SHORT).show(); }
+    private void toast(String s) {
+        if (s == null || dead()) return;
+        Toast.makeText(act, I18n.tr(s), s.length() > 60 ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+    }
+
+    private void requestVersion() {
+        if (versionRequested) return;
+        versionRequested = true;
+        async(io, api -> {
+            String v = api.status().optString("version", "");
+            return v;
+        }, v -> {
+            version = v == null ? "" : v.trim();
+            updateHeader();
+        }, t -> versionRequested = false);
+    }
+
+    private void updateHeader() {
+        StringBuilder sb = new StringBuilder();
+        if (!version.isEmpty()) sb.append('v').append(version);
+        if (seriesCache != null) {
+            if (sb.length() > 0) sb.append(" · ");
+            int n = seriesCache.length();
+            sb.append(n == 1 ? I18n.tr("1 series") : tf("{0} series", n));
+        }
+        setText(headerSub, sb.length() == 0 ? I18n.tr("TV series") : sb.toString());
+    }
+
+    // ================================================================== screen states
+
+    private void clearRefs() {
+        seriesShell = null;
+        seriesRows = null;
+        seriesCount = null;
+        seriesChips = null;
+        styledSeriesFilter = -1;
+        moreButton = null;
+        queueRows = null;
+        queueCount = null;
+        queueHolders.clear();
+        queueOrder.clear();
+        failureShown = false;
+    }
+
+    private void showState(View v) {
+        content.removeAllViews();
+        clearRefs();
+        content.addView(v);
+    }
+
+    private void showLoading(String what) {
+        showState(UiKit.loading(act, I18n.tr(what)));
+    }
+
+    private View failureView(Throwable t, String what) {
+        if (SonarrApi.isNotRunning(t)) {
+            return UiKit.error(act, I18n.tr("Sonarr is not running"),
+                    I18n.tr("Start it from the Services tab, then retry."), I18n.tr("Retry"), x -> refresh());
+        }
+        if (SonarrApi.isNoKey(t)) {
+            return UiKit.error(act, I18n.tr("Sonarr is not set up yet"), I18n.tr(SonarrApi.NO_KEY), I18n.tr("Retry"), x -> refresh());
+        }
+        if (SonarrApi.isAuthError(t)) {
+            return UiKit.error(act, I18n.tr("Sonarr rejected the API key"), I18n.tr(msg(t)), I18n.tr("Retry"), x -> refresh());
+        }
+        return UiKit.error(act, I18n.tr(what), I18n.tr(msg(t)), I18n.tr("Retry"), x -> refresh());
+    }
+
+    private void showFailure(Throwable t, String what) {
+        showState(failureView(t, what));
+        failureShown = true;
+        if (SonarrApi.isNotRunning(t)) setText(headerSub, I18n.tr("Not running"));
+    }
 
     // ================================================================== SERIES list
 
     private void loadSeries() {
-        final int req = ++requestCounter;
-        listContainer.removeAllViews();
+        final int g = gen;
         if (seriesCache != null) {
-            renderSeriesList();
+            if (seriesShell == null || seriesShell.getParent() != content) renderSeriesList();
         } else {
-            showMessage("Loading...");
+            showLoading("Loading series…");
         }
-        async(api -> api.series(), arr -> {
-            if (req != requestCounter || detailSeriesId > 0 || section != S_SERIES) return;
+        async(io, api -> api.series(), arr -> {
+            if (g != gen || detailSeriesId > 0 || section != S_SERIES) return;
             seriesCache = arr;
-            renderSeriesList();
-        }, t -> { if (req == requestCounter && seriesCache == null) showError(t); });
+            updateHeader();
+            if (seriesShell == null || seriesShell.getParent() != content) renderSeriesList();
+            else fillSeriesRows();
+        }, t -> {
+            if (g != gen || detailSeriesId > 0 || section != S_SERIES) return;
+            if (seriesCache == null) showFailure(t, "Could not load series");
+            else toast(msg(t));
+        });
     }
 
     private void renderSeriesList() {
-        listContainer.removeAllViews();
-        LinearLayout bar = new LinearLayout(act);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(0, dp(8), 0, dp(4));
-        final EditText filter = new EditText(act);
-        filter.setHint(I18n.tr("Filter series"));
-        filter.setHintTextColor(AppTheme.textMuted());
-        filter.setTextColor(AppTheme.text());
-        filter.setTextSize(13f);
-        filter.setSingleLine(true);
-        filter.setText(seriesFilter);
-        filter.setSelection(filter.getText().length());
-        bar.addView(filter, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Button add = actionButton("+ ADD", AppTheme.accent(), v -> showAddDialog());
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-2, dp(36));
-        alp.setMarginStart(dp(8));
-        bar.addView(add, alp);
-        listContainer.addView(bar);
+        content.removeAllViews();
+        clearRefs();
+        seriesShell = UiKit.column(act);
 
-        final LinearLayout rows = new LinearLayout(act);
-        rows.setOrientation(LinearLayout.VERTICAL);
-        final TextView count = text("", 11f, AppTheme.textSecondary(), false);
-        count.setPadding(0, dp(2), 0, dp(2));
-        listContainer.addView(count);
-        listContainer.addView(rows);
-        fillSeriesRows(rows, count);
+        final EditText filter = UiKit.input(act, I18n.tr("Filter series"));
+        filter.setText(seriesQuery);
+        filter.setSelection(filter.getText().length());
+        seriesShell.addView(filter, new LinearLayout.LayoutParams(-1, dp(44)));
+
+        LinearLayout chips = UiKit.row(act);
+        chips.setPadding(0, dp(12), 0, dp(4));
+        seriesChips = new TextView[SERIES_FILTERS.length];
+        for (int i = 0; i < SERIES_FILTERS.length; i++) {
+            final int fi = i;
+            TextView c = UiKit.chip(act, I18n.tr(SERIES_FILTERS[i]), i == seriesFilter);
+            c.setOnClickListener(v -> {
+                seriesFilter = fi;
+                seriesLimit = SERIES_BATCH;
+                scroll.scrollTo(0, 0);
+                fillSeriesRows();
+            });
+            seriesChips[i] = c;
+            chips.addView(c, UiKit.chipLp(act));
+        }
+        styledSeriesFilter = seriesFilter;
+        seriesShell.addView(UiKit.chipScroller(act, chips), new LinearLayout.LayoutParams(-1, -2));
+
+        seriesCount = UiKit.overline(act, "");
+        seriesCount.setPadding(0, dp(12), 0, dp(8));
+        seriesShell.addView(seriesCount);
+
+        seriesRows = UiKit.card(act);
+        seriesRows.setPadding(dp(4), dp(4), dp(4), dp(4));
+        seriesShell.addView(seriesRows);
+
+        moreButton = UiKit.outline(act, I18n.tr("Show More"), v -> {
+            seriesLimit += SERIES_BATCH;
+            fillSeriesRows();
+        });
+        seriesShell.addView(moreButton, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        content.addView(seriesShell, new LinearLayout.LayoutParams(-1, -2));
+        fillSeriesRows();
+
         filter.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void afterTextChanged(Editable e) {
-                seriesFilter = e.toString();
-                fillSeriesRows(rows, count);
+                seriesQuery = e.toString();
+                seriesLimit = SERIES_BATCH;
+                fillSeriesRows();
             }
         });
     }
 
-    private void fillSeriesRows(LinearLayout rows, TextView count) {
-        rows.removeAllViews();
-        if (seriesCache == null) return;
+    private static int missingCount(JSONObject s) {
+        JSONObject st = s.optJSONObject("statistics");
+        if (st == null) return 0;
+        return Math.max(0, st.optInt("episodeCount") - st.optInt("episodeFileCount"));
+    }
+
+    private static boolean matchesSeries(JSONObject s, int f) {
+        String status = s.optString("status", "");
+        switch (f) {
+            case 1: return s.optBoolean("monitored");
+            case 2: return s.optBoolean("monitored") && missingCount(s) > 0;
+            case 3: return "continuing".equals(status) || "upcoming".equals(status);
+            case 4: return "ended".equals(status);
+            default: return true;
+        }
+    }
+
+    private void fillSeriesRows() {
+        if (seriesRows == null || seriesCache == null) return;
+        final int y = scroll.getScrollY();
+        int[] counts = new int[SERIES_FILTERS.length];
         List<JSONObject> list = new ArrayList<>();
-        String f = seriesFilter.trim().toLowerCase(Locale.ROOT);
+        String q = seriesQuery.trim().toLowerCase(Locale.ROOT);
         for (int i = 0; i < seriesCache.length(); i++) {
             JSONObject s = seriesCache.optJSONObject(i);
             if (s == null) continue;
-            if (!f.isEmpty() && !s.optString("title", "").toLowerCase(Locale.ROOT).contains(f)) continue;
+            for (int f = 0; f < counts.length; f++) if (matchesSeries(s, f)) counts[f]++;
+            if (!matchesSeries(s, seriesFilter)) continue;
+            if (!q.isEmpty() && !s.optString("title", "").toLowerCase(Locale.ROOT).contains(q)) continue;
             list.add(s);
         }
-        java.util.Collections.sort(list, (a, b) -> a.optString("sortTitle", a.optString("title"))
-                .compareToIgnoreCase(b.optString("sortTitle", b.optString("title"))));
-        count.setText(list.size() + " / " + seriesCache.length() + " " + I18n.tr("series"));
+        if (seriesChips != null) {
+            for (int f = 0; f < seriesChips.length; f++) setText(seriesChips[f], I18n.tr(SERIES_FILTERS[f]) + "  " + counts[f]);
+            if (styledSeriesFilter != seriesFilter) {
+                for (int f = 0; f < seriesChips.length; f++) UiKit.styleChip(act, seriesChips[f], f == seriesFilter);
+                styledSeriesFilter = seriesFilter;
+            }
+        }
+        Collections.sort(list, (a, b) -> a.optString("sortTitle", a.optString("title", ""))
+                .compareToIgnoreCase(b.optString("sortTitle", b.optString("title", ""))));
+        setText(seriesCount, tf("{0} of {1} series", list.size(), seriesCache.length()));
+
+        seriesRows.removeAllViews();
         if (list.isEmpty()) {
-            TextView t = text(I18n.tr(seriesCache.length() == 0 ? "No series yet. Tap + ADD to add one." : "No matches."),
-                    12f, AppTheme.textSecondary(), false);
-            t.setPadding(0, dp(12), 0, 0);
-            rows.addView(t);
+            if (seriesCache.length() == 0) {
+                LinearLayout box = UiKit.column(act);
+                box.addView(UiKit.empty(act, I18n.tr("No series yet"), I18n.tr("Add a show and Sonarr will find its episodes.")));
+                Button add = UiKit.tonal(act, I18n.tr("Add Series"), v -> showAddDialog());
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(42));
+                lp.gravity = Gravity.CENTER_HORIZONTAL;
+                lp.bottomMargin = dp(20);
+                box.addView(add, lp);
+                seriesRows.addView(box, new LinearLayout.LayoutParams(-1, -2));
+            } else {
+                seriesRows.addView(UiKit.empty(act, I18n.tr("No matches"), I18n.tr("Try another filter or search term.")),
+                        new LinearLayout.LayoutParams(-1, -2));
+            }
+            if (moreButton != null) moreButton.setVisibility(View.GONE);
             return;
         }
-        for (JSONObject s : list) rows.addView(seriesRow(s));
+        int shown = Math.min(list.size(), seriesLimit);
+        for (int i = 0; i < shown; i++) {
+            if (i > 0) seriesRows.addView(listDivider());
+            seriesRows.addView(seriesRow(list.get(i)), new LinearLayout.LayoutParams(-1, -2));
+        }
+        if (moreButton != null) {
+            moreButton.setVisibility(shown < list.size() ? View.VISIBLE : View.GONE);
+            setText(moreButton, tf("Show More ({0} left)", list.size() - shown));
+        }
+        scroll.post(() -> scroll.scrollTo(0, y));
     }
 
     private View seriesRow(final JSONObject s) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(8), dp(8), dp(10), dp(8));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        row.setLayoutParams(lp);
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(dp(8), dp(10), dp(12), dp(10));
+        row.setBackground(UiKit.rowRipple(act));
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.addView(poster(s, 40, 60), new LinearLayout.LayoutParams(dp(40), dp(60)));
 
-        ImageView poster = poster(s, 46, 68);
-        row.addView(poster, new LinearLayout.LayoutParams(dp(46), dp(68)));
+        LinearLayout tx = UiKit.column(act);
+        LinearLayout top = UiKit.row(act);
+        TextView t = UiKit.singleLine(UiKit.text(act, s.optString("title", "?"), 14f, AppTheme.text(), UiKit.MEDIUM));
+        top.addView(t, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        boolean monitored = s.optBoolean("monitored");
+        int missing = missingCount(s);
+        View badge = null;
+        if (!monitored) badge = UiKit.badge(act, I18n.tr("Unmonitored"), AppTheme.textMuted());
+        else if (missing > 0) badge = UiKit.badge(act, tf("{0} missing", missing), AppTheme.warning());
+        if (badge != null) {
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+            blp.setMarginStart(dp(8));
+            top.addView(badge, blp);
+        }
+        tx.addView(top);
 
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.setPadding(dp(10), 0, dp(6), 0);
-        TextView t = text(s.optString("title", "?") + (s.optInt("year") > 0 ? "  (" + s.optInt("year") + ")" : ""),
-                13f, AppTheme.text(), true);
-        t.setMaxLines(2);
-        t.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(t);
         JSONObject st = s.optJSONObject("statistics");
         int files = st == null ? 0 : st.optInt("episodeFileCount");
         int eps = st == null ? 0 : st.optInt("episodeCount");
-        int seasons = st == null ? s.optJSONArray("seasons") == null ? 0 : s.optJSONArray("seasons").length() : st.optInt("seasonCount");
+        int seasons = st != null ? st.optInt("seasonCount") : (s.optJSONArray("seasons") == null ? 0 : s.optJSONArray("seasons").length());
         long size = st == null ? 0 : st.optLong("sizeOnDisk");
-        String line = capitalize(s.optString("status", "")) + (s.optString("network").isEmpty() ? "" : " - " + s.optString("network"));
-        TextView l1 = text(line, 10.5f, AppTheme.textMuted(), false);
-        l1.setPadding(0, dp(2), 0, 0);
-        tx.addView(l1);
-        TextView l2 = text(seasons + " " + I18n.tr("seasons") + "  -  " + files + "/" + eps + " " + I18n.tr("episodes")
-                + (size > 0 ? "  -  " + fmtSize(size) : ""), 10.5f, AppTheme.textSecondary(), false);
-        l2.setPadding(0, dp(2), 0, 0);
-        tx.addView(l2);
+        StringBuilder l1 = new StringBuilder();
+        if (s.optInt("year") > 0) l1.append(s.optInt("year"));
+        appendDot(l1, I18n.tr(capitalize(s.optString("status", ""))));
+        appendDot(l1, s.optString("network", ""));
+        TextView c1 = UiKit.singleLine(UiKit.caption(act, l1.toString()));
+        c1.setPadding(0, dp(2), 0, 0);
+        tx.addView(c1);
+        String l2 = (seasons == 1 ? I18n.tr("1 season") : tf("{0} seasons", seasons))
+                + " · " + tf("{0}/{1} episodes", files, eps) + (size > 0 ? " · " + fmtSize(size) : "");
+        TextView c2 = UiKit.singleLine(UiKit.caption(act, l2));
+        tx.addView(c2);
         if (eps > 0) {
-            ProgressBar pb = new ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal);
-            pb.setMax(eps);
-            pb.setProgress(files);
-            LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, dp(3));
-            plp.topMargin = dp(5);
-            tx.addView(pb, plp);
+            int pct = (int) Math.round(files * 100.0 / eps);
+            int color = !monitored ? AppTheme.textMuted() : files >= eps ? AppTheme.success() : AppTheme.accent();
+            tx.addView(UiKit.progress(act, pct, color));
         }
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginStart(dp(12));
+        row.addView(tx, tlp);
 
-        TextView mon = text(s.optBoolean("monitored") ? "●" : "○", 16f,
-                s.optBoolean("monitored") ? AppTheme.accent() : AppTheme.textMuted(), false);
-        row.addView(mon);
-
-        row.setClickable(true);
         row.setOnClickListener(v -> openSeries(s.optInt("id")));
         return row;
     }
@@ -350,1238 +623,1843 @@ public final class SonarrTabView {
     private void openSeries(int id) {
         if (id <= 0) return;
         detailSeriesId = id;
+        detailRoot = null;
         expandedSeasons.clear();
-        refresh();
         scroll.scrollTo(0, 0);
+        refresh();
     }
 
     // ================================================================== SERIES detail
 
-    private void loadDetail() {
-        final int req = ++requestCounter;
+    private void loadDetail(final boolean keepScroll) {
+        final int g = gen;
         final int id = detailSeriesId;
-        listContainer.removeAllViews();
-        showMessage("Loading...");
-        async(api -> {
-            JSONObject[] out = new JSONObject[1];
-            JSONObject series = api.series(id);
-            JSONArray eps = api.episodes(id);
+        if (!keepScroll) showLoading("Loading series…");
+        async(io, api -> {
             JSONObject pack = new JSONObject();
-            pack.put("series", series);
-            pack.put("episodes", eps);
+            pack.put("series", api.series(id));
+            pack.put("episodes", api.episodes(id));
             return pack;
         }, pack -> {
-            if (req != requestCounter || detailSeriesId != id) return;
-            renderDetail(pack.optJSONObject("series"), pack.optJSONArray("episodes"));
-        }, t -> { if (req == requestCounter) showError(t); });
+            if (g != gen || detailSeriesId != id) return;
+            JSONObject series = pack.optJSONObject("series");
+            JSONArray eps = pack.optJSONArray("episodes");
+            if (series == null) {
+                showFailure(new Exception("Series not found."), "Could not load the series");
+                return;
+            }
+            final int y = scroll.getScrollY();
+            renderDetail(series, eps == null ? new JSONArray() : eps);
+            if (keepScroll) scroll.post(() -> scroll.scrollTo(0, y));
+        }, t -> {
+            if (g != gen || detailSeriesId != id) return;
+            if (keepScroll && detailRoot != null && detailRoot.getParent() == content) toast(msg(t));
+            else showFailure(t, "Could not load the series");
+        });
+    }
+
+    /** Reloads the open series in place (after monitor changes, deletions...). */
+    private void reloadDetail() {
+        if (detailSeriesId <= 0) return;
+        gen++;
+        loadDetail(detailRoot != null && detailRoot.getParent() == content);
     }
 
     private void renderDetail(final JSONObject series, final JSONArray episodes) {
-        listContainer.removeAllViews();
+        content.removeAllViews();
+        clearRefs();
         final int id = series.optInt("id");
+        detailRoot = UiKit.column(act);
 
-        LinearLayout back = new LinearLayout(act);
-        back.setOrientation(LinearLayout.HORIZONTAL);
-        back.setPadding(0, dp(8), 0, dp(4));
-        back.addView(actionButton("< BACK", AppTheme.textSecondary(), v -> onBack()), new LinearLayout.LayoutParams(-2, dp(34)));
-        listContainer.addView(back);
+        Button back = compact(UiKit.outline(act, I18n.tr("Back"), v -> onBack()));
+        LinearLayout.LayoutParams bk = new LinearLayout.LayoutParams(-2, dp(34));
+        bk.bottomMargin = dp(12);
+        detailRoot.addView(back, bk);
 
-        LinearLayout head = new LinearLayout(act);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setPadding(dp(10), dp(10), dp(10), dp(10));
-        head.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 14));
-        head.addView(poster(series, 90, 132), new LinearLayout.LayoutParams(dp(90), dp(132)));
-        LinearLayout info = new LinearLayout(act);
-        info.setOrientation(LinearLayout.VERTICAL);
-        info.setPadding(dp(12), 0, 0, 0);
-        TextView title = text(series.optString("title") + (series.optInt("year") > 0 ? " (" + series.optInt("year") + ")" : ""),
-                15f, AppTheme.text(), true);
+        LinearLayout card = UiKit.card(act);
+        LinearLayout head = UiKit.row(act);
+        head.setGravity(Gravity.TOP);
+        head.addView(poster(series, 92, 138), new LinearLayout.LayoutParams(dp(92), dp(138)));
+        LinearLayout info = UiKit.column(act);
+        TextView title = UiKit.title(act, series.optString("title", "?"));
+        title.setMaxLines(3);
+        title.setEllipsize(TextUtils.TruncateAt.END);
         info.addView(title);
-        JSONObject st = series.optJSONObject("statistics");
-        String meta = capitalize(series.optString("status", ""))
-                + (series.optString("network").isEmpty() ? "" : " - " + series.optString("network"))
-                + (series.optInt("runtime") > 0 ? " - " + series.optInt("runtime") + " min" : "");
-        TextView m = text(meta, 11f, AppTheme.textSecondary(), false);
-        m.setPadding(0, dp(3), 0, 0);
+        StringBuilder meta = new StringBuilder();
+        if (series.optInt("year") > 0) meta.append(series.optInt("year"));
+        appendDot(meta, I18n.tr(capitalize(series.optString("status", ""))));
+        appendDot(meta, series.optString("network", ""));
+        if (series.optInt("runtime") > 0) appendDot(meta, tf("{0} min", series.optInt("runtime")));
+        TextView m = UiKit.caption(act, meta.toString());
+        m.setPadding(0, dp(4), 0, 0);
         info.addView(m);
+        JSONObject st = series.optJSONObject("statistics");
         if (st != null) {
-            TextView s2 = text(st.optInt("episodeFileCount") + "/" + st.optInt("episodeCount") + " " + I18n.tr("episodes")
-                    + (st.optLong("sizeOnDisk") > 0 ? " - " + fmtSize(st.optLong("sizeOnDisk")) : ""), 11f, AppTheme.textSecondary(), false);
+            TextView s2 = UiKit.caption(act, tf("{0}/{1} episodes", st.optInt("episodeFileCount"), st.optInt("episodeCount"))
+                    + (st.optLong("sizeOnDisk") > 0 ? " · " + fmtSize(st.optLong("sizeOnDisk")) : ""));
             s2.setPadding(0, dp(2), 0, 0);
             info.addView(s2);
         }
-        TextView path = text(series.optString("path", ""), 10f, AppTheme.textMuted(), false);
-        path.setPadding(0, dp(2), 0, 0);
-        info.addView(path);
+        int missing = missingCount(series);
+        if (!series.optBoolean("monitored")) {
+            info.addView(spaced(UiKit.badge(act, I18n.tr("Unmonitored"), AppTheme.textMuted())));
+        } else if (missing > 0) {
+            info.addView(spaced(UiKit.badge(act, tf("{0} missing", missing), AppTheme.warning())));
+        } else if (st != null && st.optInt("episodeCount") > 0) {
+            info.addView(spaced(UiKit.badge(act, I18n.tr("Complete"), AppTheme.success())));
+        }
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        ilp.setMarginStart(dp(14));
+        head.addView(info, ilp);
+        card.addView(head);
+
         String ov = series.optString("overview", "");
         if (!ov.isEmpty()) {
-            final TextView o = text(ov, 11f, AppTheme.textSecondary(), false);
+            final TextView o = UiKit.body(act, ov);
             o.setMaxLines(4);
             o.setEllipsize(TextUtils.TruncateAt.END);
-            o.setPadding(0, dp(6), 0, 0);
+            o.setPadding(0, dp(12), 0, 0);
             o.setOnClickListener(v -> {
                 boolean collapsed = o.getMaxLines() == 4;
-                o.setMaxLines(collapsed ? 100 : 4);
+                o.setMaxLines(collapsed ? Integer.MAX_VALUE : 4);
             });
-            info.addView(o);
+            card.addView(o);
         }
-        head.addView(info, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        listContainer.addView(head);
+        String path = series.optString("path", "");
+        if (!path.isEmpty()) {
+            TextView p = UiKit.mono(act, path);
+            p.setTextSize(11.5f);
+            p.setTextColor(AppTheme.textMuted());
+            p.setPadding(0, dp(10), 0, 0);
+            card.addView(p);
+        }
 
-        // monitored switch
-        LinearLayout monRow = new LinearLayout(act);
-        monRow.setOrientation(LinearLayout.HORIZONTAL);
-        monRow.setGravity(Gravity.CENTER_VERTICAL);
-        monRow.setPadding(dp(4), dp(10), dp(4), dp(2));
-        monRow.addView(text(I18n.tr("Monitored"), 12.5f, AppTheme.text(), false), new LinearLayout.LayoutParams(0, -2, 1.0f));
-        final Switch monSw = new Switch(act);
-        monSw.setChecked(series.optBoolean("monitored"));
-        UiStyle.styleSwitch(act, monSw);
+        final Switch monSw = switchRow(card, "Monitored", "Sonarr searches for and grabs monitored episodes.", series.optBoolean("monitored"));
+        final boolean[] binding = {false};
         monSw.setOnCheckedChangeListener((b, checked) -> {
+            if (binding[0]) return;
+            final JSONObject copy;
             try {
-                series.put("monitored", checked);
-                final JSONObject copy = new JSONObject(series.toString());
-                action(api -> { api.putSeries(copy); return null; }, checked ? "Monitoring enabled." : "Monitoring disabled.", () -> seriesCache = null);
-            } catch (Throwable t) { toast(msg(t)); }
+                copy = new JSONObject(series.toString());
+                copy.put("monitored", checked);
+            } catch (Exception e) {
+                toast(msg(e));
+                return;
+            }
+            monSw.setEnabled(false);
+            async(io, api -> { api.putSeries(copy); return null; }, r -> {
+                monSw.setEnabled(true);
+                seriesCache = null;
+                toast(checked ? "Monitoring on." : "Monitoring off.");
+                reloadDetail();
+            }, e -> {
+                monSw.setEnabled(true);
+                binding[0] = true;
+                monSw.setChecked(!checked);
+                binding[0] = false;
+                toast(msg(e));
+            });
         });
-        monRow.addView(monSw);
-        listContainer.addView(monRow);
 
-        // actions
-        LinearLayout acts = new LinearLayout(act);
-        acts.setOrientation(LinearLayout.HORIZONTAL);
-        acts.addView(actionButton("SEARCH", AppTheme.success(), v ->
-                action(api -> { api.searchSeries(id); return null; }, "Search queued.", null)), weight());
-        acts.addView(actionButton("REFRESH", AppTheme.accent(), v ->
-                action(api -> { api.refreshSeries(id); return null; }, "Refresh queued.", null)), weight());
-        acts.addView(actionButton("RESCAN", AppTheme.accent(), v ->
-                action(api -> { api.rescanSeries(id); return null; }, "Rescan queued.", null)), weight());
-        acts.addView(actionButton("DELETE", AppTheme.danger(), v -> confirmDeleteSeries(series)), weight());
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-1, -2);
-        alp.topMargin = dp(6);
-        listContainer.addView(acts, alp);
+        Button search = UiKit.primary(act, I18n.tr("Search"), v ->
+                runAction(v, api -> { api.searchSeries(id); return null; }, "Search started for monitored episodes.", null));
+        Button refreshBtn = UiKit.outline(act, I18n.tr("Refresh"), v ->
+                runAction(v, api -> { api.refreshSeries(id); return null; }, "Refresh queued.", null));
+        Button rescan = UiKit.outline(act, I18n.tr("Rescan"), v ->
+                runAction(v, api -> { api.rescanSeries(id); return null; }, "Disk rescan queued.", null));
+        card.addView(UiKit.buttonRow(act, search, refreshBtn, rescan));
+        Button del = UiKit.danger(act, I18n.tr("Delete Series"), v -> confirmDeleteSeries(series));
+        card.addView(UiKit.buttonRow(act, del));
+        detailRoot.addView(card);
 
-        // seasons
+        // seasons, newest first
         JSONArray seasons = series.optJSONArray("seasons");
-        TreeMap<Integer, JSONObject> seasonMap = new TreeMap<>(java.util.Collections.<Integer>reverseOrder());
-        if (seasons != null) for (int i = 0; i < seasons.length(); i++) {
+        TreeMap<Integer, JSONObject> seasonMap = new TreeMap<>(Collections.<Integer>reverseOrder());
+        for (int i = 0; seasons != null && i < seasons.length(); i++) {
             JSONObject s = seasons.optJSONObject(i);
             if (s != null) seasonMap.put(s.optInt("seasonNumber"), s);
         }
-        TreeMap<Integer, List<JSONObject>> byseason = new TreeMap<>();
+        Map<Integer, List<JSONObject>> bySeason = new HashMap<>();
         for (int i = 0; i < episodes.length(); i++) {
             JSONObject e = episodes.optJSONObject(i);
             if (e == null) continue;
             int sn = e.optInt("seasonNumber");
-            List<JSONObject> l = byseason.get(sn);
-            if (l == null) { l = new ArrayList<>(); byseason.put(sn, l); }
+            List<JSONObject> l = bySeason.get(sn);
+            if (l == null) {
+                l = new ArrayList<>();
+                bySeason.put(sn, l);
+            }
             l.add(e);
             if (!seasonMap.containsKey(sn)) seasonMap.put(sn, new JSONObject());
         }
-        for (java.util.Map.Entry<Integer, JSONObject> en : seasonMap.entrySet()) {
-            List<JSONObject> eps = byseason.get(en.getKey());
-            listContainer.addView(seasonCard(series, en.getKey(), en.getValue(), eps == null ? new ArrayList<JSONObject>() : eps));
+        if (!seasonMap.isEmpty()) {
+            TextView ol = UiKit.overline(act, I18n.tr("Seasons"));
+            ol.setPadding(dp(4), dp(4), 0, dp(8));
+            detailRoot.addView(ol);
         }
+        for (Map.Entry<Integer, JSONObject> en : seasonMap.entrySet()) {
+            List<JSONObject> eps = bySeason.get(en.getKey());
+            detailRoot.addView(seasonCard(series, en.getKey(), en.getValue(), eps == null ? new ArrayList<JSONObject>() : eps));
+        }
+        content.addView(detailRoot, new LinearLayout.LayoutParams(-1, -2));
+    }
+
+    private View spaced(View v) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+        lp.topMargin = dp(8);
+        v.setLayoutParams(lp);
+        return v;
     }
 
     private View seasonCard(final JSONObject series, final int seasonNo, final JSONObject seasonObj, final List<JSONObject> eps) {
         final int id = series.optInt("id");
-        final LinearLayout card = new LinearLayout(act);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, -2);
-        clp.topMargin = dp(8);
-        card.setLayoutParams(clp);
-
+        final LinearLayout card = UiKit.card(act);
         int have = 0;
-        for (JSONObject e : eps) if (e.optBoolean("hasFile")) have++;
-        LinearLayout top = new LinearLayout(act);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(dp(12), dp(10), dp(10), dp(10));
-        TextView name = text((seasonNo == 0 ? I18n.tr("Specials") : I18n.tr("Season") + " " + seasonNo)
-                + "   " + have + "/" + eps.size(), 13f, AppTheme.text(), true);
-        top.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        long bytes = 0;
+        int aired = 0;
+        long now = System.currentTimeMillis();
+        for (JSONObject e : eps) {
+            if (e.optBoolean("hasFile")) have++;
+            JSONObject f = e.optJSONObject("episodeFile");
+            if (f != null) bytes += f.optLong("size");
+            long air = parseUtc(e.optString("airDateUtc", ""));
+            if (e.optBoolean("hasFile") || (air > 0 && air <= now)) aired++;
+        }
+        final String label = seasonNo == 0 ? I18n.tr("Specials") : tf("Season {0}", seasonNo);
+
+        LinearLayout top = UiKit.row(act);
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(UiKit.subtitle(act, label));
+        TextView cap = UiKit.caption(act, tf("{0} of {1} episodes", have, eps.size()) + (bytes > 0 ? " · " + fmtSize(bytes) : ""));
+        cap.setPadding(0, dp(2), 0, 0);
+        tx.addView(cap);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginEnd(dp(12));
+        top.addView(tx, tlp);
         final Switch sw = new Switch(act);
         sw.setChecked(seasonObj.optBoolean("monitored"));
         UiStyle.styleSwitch(act, sw);
-        sw.setOnCheckedChangeListener((b, checked) -> {
-            try {
-                JSONArray ss = series.optJSONArray("seasons");
-                for (int i = 0; ss != null && i < ss.length(); i++) {
-                    JSONObject so = ss.getJSONObject(i);
-                    if (so.optInt("seasonNumber") == seasonNo) so.put("monitored", checked);
-                }
-                final JSONObject copy = new JSONObject(series.toString());
-                action(api -> { api.putSeries(copy); return null; }, checked ? "Season monitored." : "Season unmonitored.", () -> seriesCache = null);
-            } catch (Throwable t) { toast(msg(t)); }
-        });
         top.addView(sw);
         card.addView(top);
+        if (aired > 0) {
+            int pct = (int) Math.round(have * 100.0 / aired);
+            card.addView(UiKit.progress(act, pct, !seasonObj.optBoolean("monitored") ? AppTheme.textMuted()
+                    : have >= aired ? AppTheme.success() : AppTheme.accent()));
+        }
 
-        LinearLayout btns = new LinearLayout(act);
-        btns.setOrientation(LinearLayout.HORIZONTAL);
-        btns.setPadding(dp(8), 0, dp(4), dp(8));
-        btns.addView(actionButton("SEARCH", AppTheme.success(), v ->
-                action(api -> { api.searchSeason(id, seasonNo); return null; }, "Season search queued.", null)), weight());
-        btns.addView(actionButton("RELEASES", AppTheme.accent(), v -> showReleases(seasonNo, 0, id,
-                (seasonNo == 0 ? "Specials" : "Season " + seasonNo))), weight());
-        final TextView[] toggle = new TextView[1];
-        toggle[0] = actionButton(expandedSeasons.contains(seasonNo) ? "HIDE" : "EPISODES", AppTheme.textSecondary(), null);
-        btns.addView(toggle[0], weight());
-        card.addView(btns);
+        final boolean[] binding = {false};
+        sw.setOnCheckedChangeListener((b, checked) -> {
+            if (binding[0]) return;
+            final JSONObject copy;
+            try {
+                copy = new JSONObject(series.toString());
+                JSONArray ss = copy.optJSONArray("seasons");
+                for (int i = 0; ss != null && i < ss.length(); i++) {
+                    JSONObject so = ss.optJSONObject(i);
+                    if (so != null && so.optInt("seasonNumber") == seasonNo) so.put("monitored", checked);
+                }
+            } catch (Exception e) {
+                toast(msg(e));
+                return;
+            }
+            sw.setEnabled(false);
+            async(io, api -> { api.putSeries(copy); return null; }, r -> {
+                sw.setEnabled(true);
+                seriesCache = null;
+                toast(checked ? "Season monitored." : "Season unmonitored.");
+                reloadDetail();
+            }, e -> {
+                sw.setEnabled(true);
+                binding[0] = true;
+                sw.setChecked(!checked);
+                binding[0] = false;
+                toast(msg(e));
+            });
+        });
 
-        final LinearLayout list = new LinearLayout(act);
-        list.setOrientation(LinearLayout.VERTICAL);
-        list.setPadding(dp(8), 0, dp(8), dp(8));
-        card.addView(list);
+        Button search = UiKit.outline(act, I18n.tr("Search"), v ->
+                runAction(v, api -> { api.searchSeason(id, seasonNo); return null; }, "Season search started.", null));
+        Button releases = UiKit.outline(act, I18n.tr("Releases"), v ->
+                showReleases(seasonNo, 0, id, series.optString("title", "") + " · " + label));
+        final Button toggle = UiKit.tonal(act, I18n.tr(expandedSeasons.contains(seasonNo) ? "Hide" : "Episodes"), null);
+        card.addView(UiKit.buttonRow(act, search, releases, toggle));
+
+        final LinearLayout list = UiKit.column(act);
+        card.addView(list, new LinearLayout.LayoutParams(-1, -2));
         final Runnable fill = () -> {
             list.removeAllViews();
             if (!expandedSeasons.contains(seasonNo)) return;
             List<JSONObject> sorted = new ArrayList<>(eps);
-            java.util.Collections.sort(sorted, (a, b) -> b.optInt("episodeNumber") - a.optInt("episodeNumber"));
-            for (JSONObject e : sorted) list.addView(episodeRow(e, id));
+            Collections.sort(sorted, (a, b) -> Integer.compare(b.optInt("episodeNumber"), a.optInt("episodeNumber")));
+            list.addView(UiKit.space(act, 8));
+            for (int i = 0; i < sorted.size(); i++) {
+                if (i > 0) list.addView(listDivider());
+                list.addView(episodeRow(series, sorted.get(i)), new LinearLayout.LayoutParams(-1, -2));
+            }
         };
-        toggle[0].setOnClickListener(v -> {
-            if (expandedSeasons.contains(seasonNo)) expandedSeasons.remove(seasonNo); else expandedSeasons.add(seasonNo);
-            ((Button) toggle[0]).setText(I18n.tr(expandedSeasons.contains(seasonNo) ? "HIDE" : "EPISODES"));
+        toggle.setOnClickListener(v -> {
+            if (expandedSeasons.contains(seasonNo)) expandedSeasons.remove(seasonNo);
+            else expandedSeasons.add(seasonNo);
+            toggle.setText(I18n.tr(expandedSeasons.contains(seasonNo) ? "Hide" : "Episodes"));
             fill.run();
         });
         fill.run();
         return card;
     }
 
-    private View episodeRow(final JSONObject e, final int seriesId) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(8), dp(8), dp(8), dp(8));
-        box.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        box.setLayoutParams(lp);
+    private static String episodeCode(JSONObject e) {
+        return String.format(Locale.US, "S%02dE%02d", e.optInt("seasonNumber"), e.optInt("episodeNumber"));
+    }
 
-        LinearLayout top = new LinearLayout(act);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        TextView t = text(String.format(Locale.US, "E%02d  %s", e.optInt("episodeNumber"), e.optString("title", "")),
-                12f, AppTheme.text(), true);
-        t.setMaxLines(2);
-        t.setEllipsize(TextUtils.TruncateAt.END);
-        top.addView(t, new LinearLayout.LayoutParams(0, -2, 1.0f));
+    private View episodeRow(final JSONObject series, final JSONObject e) {
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(dp(8), dp(10), dp(4), dp(10));
+        row.setBackground(UiKit.rowRipple(act));
+        row.setClickable(true);
+        row.setFocusable(true);
+
+        LinearLayout tx = UiKit.column(act);
+        String et = e.optString("title", "");
+        tx.addView(UiKit.singleLine(UiKit.text(act, e.optInt("episodeNumber") + " · " + (et.isEmpty() ? I18n.tr("TBA") : et),
+                14f, AppTheme.text(), UiKit.MEDIUM)));
+        TextView status = UiKit.singleLine(UiKit.caption(act, ""));
+        status.setPadding(0, dp(2), 0, 0);
+        bindEpisodeStatus(status, e);
+        tx.addView(status);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginEnd(dp(8));
+        row.addView(tx, tlp);
+
         final Switch sw = new Switch(act);
         sw.setChecked(e.optBoolean("monitored"));
         UiStyle.styleSwitch(act, sw);
+        row.addView(sw);
+        final int epId = e.optInt("id");
+        final boolean[] binding = {false};
         sw.setOnCheckedChangeListener((b, checked) -> {
-            try {
-                e.put("monitored", checked);
-                final JSONObject copy = new JSONObject(e.toString());
-                copy.remove("episodeFile");
-                action(api -> { api.putEpisode(copy); return null; }, checked ? "Episode monitored." : "Episode unmonitored.", null);
-            } catch (Throwable ex) { toast(msg(ex)); }
+            if (binding[0]) return;
+            sw.setEnabled(false);
+            async(io, api -> { api.monitorEpisodes(new int[]{epId}, checked); return null; }, r -> {
+                sw.setEnabled(true);
+                try { e.put("monitored", checked); } catch (Exception ignored) { }
+            }, ex -> {
+                sw.setEnabled(true);
+                binding[0] = true;
+                sw.setChecked(!checked);
+                binding[0] = false;
+                toast(msg(ex));
+            });
         });
-        top.addView(sw);
-        box.addView(top);
+        row.setOnClickListener(v -> showEpisodeActions(series, e));
+        return row;
+    }
 
+    private void bindEpisodeStatus(TextView status, JSONObject e) {
         boolean hasFile = e.optBoolean("hasFile");
-        String air = e.optString("airDate", "");
-        String status;
-        int color;
+        long air = parseUtc(e.optString("airDateUtc", ""));
         JSONObject file = e.optJSONObject("episodeFile");
-        if (hasFile && file != null) {
-            JSONObject q = file.optJSONObject("quality");
-            JSONObject qq = q == null ? null : q.optJSONObject("quality");
-            status = "✔ " + (qq == null ? "" : qq.optString("name", "") + "  ") + fmtSize(file.optLong("size"));
+        String s;
+        int color;
+        if (hasFile) {
+            String q = qualityName(file == null ? null : file.optJSONObject("quality"));
+            s = I18n.tr("Downloaded") + (q.isEmpty() ? "" : " · " + q) + (file != null && file.optLong("size") > 0 ? " · " + fmtSize(file.optLong("size")) : "");
             color = AppTheme.success();
-        } else if (!air.isEmpty() && air.compareTo(today()) > 0) {
-            status = I18n.tr("Not aired yet");
+        } else if (air > System.currentTimeMillis()) {
+            s = tf("Airs {0}", fmtLocal(air));
+            color = AppTheme.textMuted();
+        } else if (air <= 0 && e.optString("airDate", "").isEmpty()) {
+            s = I18n.tr("Air date unknown");
+            color = AppTheme.textMuted();
+        } else if (!e.optBoolean("monitored")) {
+            s = I18n.tr("Unmonitored") + (air > 0 ? " · " + tf("Aired {0}", fmtLocalDate(air)) : "");
             color = AppTheme.textMuted();
         } else {
-            status = I18n.tr("Missing");
+            s = I18n.tr("Missing") + (air > 0 ? " · " + tf("Aired {0}", fmtLocalDate(air)) : "");
             color = AppTheme.warning();
         }
-        TextView s = text(status + (air.isEmpty() ? "" : "   " + air), 10.5f, color, false);
-        s.setPadding(0, dp(2), 0, dp(4));
-        box.addView(s);
+        status.setText(s);
+        status.setTextColor(color);
+    }
 
-        LinearLayout b = new LinearLayout(act);
-        b.setOrientation(LinearLayout.HORIZONTAL);
+    private void showEpisodeActions(final JSONObject series, final JSONObject e) {
+        final int seriesId = series.optInt("id");
         final int epId = e.optInt("id");
-        b.addView(actionButton("SEARCH", AppTheme.success(), v ->
-                action(api -> { api.searchEpisode(epId); return null; }, "Search queued.", null)), weight());
-        b.addView(actionButton("RELEASES", AppTheme.accent(), v -> showReleases(-1, epId, seriesId,
-                String.format(Locale.US, "S%02dE%02d %s", e.optInt("seasonNumber"), e.optInt("episodeNumber"), e.optString("title")))), weight());
-        if (hasFile && file != null) {
-            final int fileId = file.optInt("id");
-            b.addView(actionButton("DELETE FILE", AppTheme.danger(), v ->
-                    confirm(I18n.tr("Delete the downloaded file of this episode?"), I18n.tr("DELETE"), AppTheme.danger(), () ->
-                            action(api -> { api.deleteEpisodeFile(fileId); return null; }, "File deleted.", this::refresh))), weight());
+        final String code = episodeCode(e);
+        final Sheet s = new Sheet(code + " · " + e.optString("title", ""));
+        TextView cap = UiKit.caption(act, "");
+        bindEpisodeStatus(cap, e);
+        s.box.addView(cap);
+        String ov = e.optString("overview", "");
+        if (!ov.isEmpty()) {
+            TextView o = UiKit.body(act, ov);
+            o.setPadding(0, dp(8), 0, 0);
+            s.box.addView(o);
         }
-        box.addView(b);
-        return box;
+        Button search = UiKit.primary(act, I18n.tr("Search"), v ->
+                runAction(v, api -> { api.searchEpisode(epId); return null; }, "Episode search started.", s::dismiss));
+        Button releases = UiKit.outline(act, I18n.tr("Releases"), v -> {
+            s.dismiss();
+            showReleases(-1, epId, seriesId, series.optString("title", "") + " · " + code);
+        });
+        s.box.addView(UiKit.buttonRow(act, search, releases));
+        final JSONObject file = e.optJSONObject("episodeFile");
+        if (e.optBoolean("hasFile") && file != null && file.optInt("id") > 0) {
+            final int fileId = file.optInt("id");
+            String rel = file.optString("relativePath", "");
+            if (!rel.isEmpty()) {
+                TextView p = UiKit.mono(act, rel);
+                p.setTextSize(11.5f);
+                p.setTextColor(AppTheme.textMuted());
+                p.setPadding(0, dp(12), 0, 0);
+                s.box.addView(p);
+            }
+            Button del = UiKit.danger(act, I18n.tr("Delete File"), v -> {
+                s.dismiss();
+                confirm("Delete file?", "Delete the downloaded file of this episode from disk? This cannot be undone.", "Delete", true, () ->
+                        runAction(null, api -> { api.deleteEpisodeFile(fileId); return null; }, "File deleted.", this::reloadDetail));
+            });
+            s.box.addView(UiKit.buttonRow(act, del));
+        }
+        s.show();
     }
 
     private void confirmDeleteSeries(final JSONObject series) {
-        final LinearLayout body = dialogBody(I18n.tr("Delete series"));
-        body.addView(text(series.optString("title"), 13f, AppTheme.text(), true));
-        final Switch files = new Switch(act);
-        files.setText(I18n.tr("Also delete files from disk"));
-        files.setTextColor(AppTheme.text());
-        UiStyle.styleSwitch(act, files);
-        files.setPadding(0, dp(12), 0, dp(4));
-        body.addView(files);
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("DELETE", AppTheme.danger(), v -> {
-            d.dismiss();
+        final Sheet s = new Sheet("Delete series");
+        s.box.addView(UiKit.subtitle(act, series.optString("title", "")));
+        TextView hint = UiKit.body(act, I18n.tr("The series is removed from Sonarr. Its files stay on disk unless you choose to delete them."));
+        hint.setPadding(0, dp(6), 0, 0);
+        s.box.addView(hint);
+        final Switch files = switchRow(s.box, "Also delete the files on disk", null, false);
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        Button del = UiKit.danger(act, I18n.tr("Delete"), v -> {
             final int id = series.optInt("id");
             final boolean df = files.isChecked();
-            action(api -> { api.deleteSeries(id, df); return null; }, "Series deleted.", () -> {
+            s.dismiss();
+            Runnable go = () -> async(slow, api -> { api.deleteSeries(id, df); return null; }, r -> {
+                toast("Series deleted.");
                 seriesCache = null;
                 detailSeriesId = 0;
+                detailRoot = null;
                 refresh();
-            });
-        }), weight());
-        body.addView(row);
-        d.show();
+            }, t -> toast(msg(t)));
+            if (df) confirm("Delete files?", "Permanently delete every file of this series from disk? This cannot be undone.", "Delete", true, go);
+            else go.run();
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, del));
+        s.show();
     }
 
     // ================================================================== interactive search
 
     /** seasonNo >= 0 with episodeId == 0 searches a season pack; otherwise one episode. */
     private void showReleases(final int seasonNo, final int episodeId, final int seriesId, String title) {
-        final LinearLayout body = dialogBody(I18n.tr("Interactive search"));
-        body.addView(text(title, 12f, AppTheme.textSecondary(), false));
-        final LinearLayout list = new LinearLayout(act);
-        list.setOrientation(LinearLayout.VERTICAL);
-        final TextView loading = text(I18n.tr("Searching indexers... this can take up to a minute."), 12f, AppTheme.textSecondary(), false);
-        loading.setPadding(0, dp(12), 0, 0);
-        list.addView(loading);
-        ScrollView sv = new ScrollView(act);
-        sv.addView(list);
-        body.addView(sv, new LinearLayout.LayoutParams(-1, dp(380)));
-        final Dialog d = dialog(body);
-        d.show();
-        async(api -> episodeId > 0 ? api.releasesForEpisode(episodeId) : api.releasesForSeason(seriesId, seasonNo),
-                arr -> {
-                    list.removeAllViews();
-                    if (arr.length() == 0) {
-                        list.addView(text(I18n.tr("No releases found."), 12f, AppTheme.textSecondary(), false));
-                        return;
-                    }
-                    List<JSONObject> rel = new ArrayList<>();
-                    for (int i = 0; i < arr.length(); i++) rel.add(arr.optJSONObject(i));
-                    java.util.Collections.sort(rel, (a, b) -> {
-                        boolean ra = a.optJSONArray("rejections") != null && a.optJSONArray("rejections").length() > 0;
-                        boolean rb = b.optJSONArray("rejections") != null && b.optJSONArray("rejections").length() > 0;
-                        if (ra != rb) return ra ? 1 : -1;
-                        return b.optInt("seeders") - a.optInt("seeders");
-                    });
-                    int n = 0;
-                    for (JSONObject r : rel) {
-                        if (r == null) continue;
-                        if (++n > 60) break;
-                        list.addView(releaseRow(r, d));
-                    }
-                }, t -> { list.removeAllViews(); list.addView(text(msg(t), 12f, AppTheme.danger(), false)); });
+        final Sheet s = new Sheet("Interactive search");
+        TextView sub = UiKit.caption(act, title);
+        sub.setPadding(0, 0, 0, dp(8));
+        s.box.addView(sub);
+        final LinearLayout list = UiKit.column(act);
+        list.addView(UiKit.loading(act, I18n.tr("Searching indexers… this can take a minute.")));
+        s.box.addView(list, new LinearLayout.LayoutParams(-1, -2));
+        s.show();
+        async(slow, api -> episodeId > 0 ? api.releasesForEpisode(episodeId) : api.releasesForSeason(seriesId, seasonNo), arr -> {
+            if (!s.dialog.isShowing()) return;
+            list.removeAllViews();
+            List<JSONObject> rel = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject r = arr.optJSONObject(i);
+                if (r != null) rel.add(r);
+            }
+            if (rel.isEmpty()) {
+                list.addView(UiKit.empty(act, I18n.tr("No releases found"), I18n.tr("Check that Prowlarr has working indexers.")));
+                return;
+            }
+            Collections.sort(rel, (a, b) -> {
+                boolean ra = isRejected(a);
+                boolean rb = isRejected(b);
+                if (ra != rb) return ra ? 1 : -1;
+                int wa = a.optInt("releaseWeight", Integer.MAX_VALUE);
+                int wb = b.optInt("releaseWeight", Integer.MAX_VALUE);
+                if (wa != wb) return Integer.compare(wa, wb);
+                return Integer.compare(b.optInt("seeders"), a.optInt("seeders"));
+            });
+            TextView count = UiKit.overline(act, rel.size() == 1 ? I18n.tr("1 release") : tf("{0} releases", rel.size()));
+            list.addView(count);
+            int n = 0;
+            for (JSONObject r : rel) {
+                if (++n > 80) break;
+                if (n > 1) list.addView(listDivider());
+                list.addView(releaseRow(r, s), new LinearLayout.LayoutParams(-1, -2));
+            }
+        }, t -> {
+            if (!s.dialog.isShowing()) return;
+            list.removeAllViews();
+            list.addView(failureViewInline(t));
+        });
     }
 
-    private View releaseRow(final JSONObject r, final Dialog d) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(10), dp(8), dp(10), dp(8));
-        box.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        box.setLayoutParams(lp);
-        TextView t = text(r.optString("title"), 11.5f, AppTheme.text(), true);
+    private View failureViewInline(Throwable t) {
+        LinearLayout box = UiKit.column(act);
+        box.setPadding(dp(12), dp(10), dp(12), dp(10));
+        box.setBackground(UiKit.shape(act, AppTheme.dangerContainer(), 0, UiKit.R_INNER));
+        TextView m = UiKit.body(act, I18n.tr(msg(t)));
+        m.setTextColor(AppTheme.text());
+        box.addView(m);
+        return box;
+    }
+
+    private static boolean isRejected(JSONObject r) {
+        if (r.has("approved")) return !r.optBoolean("approved", true);
+        JSONArray rej = r.optJSONArray("rejections");
+        return rej != null && rej.length() > 0;
+    }
+
+    private static String qualityName(JSONObject q) {
+        JSONObject qq = q == null ? null : q.optJSONObject("quality");
+        return qq == null ? "" : qq.optString("name", "");
+    }
+
+    private View releaseRow(final JSONObject r, final Sheet sheet) {
+        LinearLayout box = UiKit.column(act);
+        box.setPadding(dp(4), dp(10), dp(4), dp(10));
+        TextView t = UiKit.text(act, r.optString("title", "?"), 13.5f, AppTheme.text(), UiKit.MEDIUM);
         t.setMaxLines(3);
         t.setEllipsize(TextUtils.TruncateAt.END);
         box.addView(t);
-        JSONObject q = r.optJSONObject("quality");
-        JSONObject qq = q == null ? null : q.optJSONObject("quality");
         String proto = r.optString("protocol", "");
-        String line = (qq == null ? "" : qq.optString("name") + "  -  ") + fmtSize(r.optLong("size"))
-                + "  -  " + r.optString("indexer", "")
-                + ("torrent".equalsIgnoreCase(proto) ? "  -  S:" + r.optInt("seeders") + " L:" + r.optInt("leechers") : "")
-                + "  -  " + fmtAge(r.optDouble("ageMinutes", 0));
-        TextView l = text(line, 10f, AppTheme.textSecondary(), false);
-        l.setPadding(0, dp(2), 0, dp(2));
+        StringBuilder line = new StringBuilder();
+        String q = qualityName(r.optJSONObject("quality"));
+        if (!q.isEmpty()) line.append(q);
+        appendDot(line, fmtSize(r.optLong("size")));
+        appendDot(line, r.optString("indexer", ""));
+        if ("torrent".equalsIgnoreCase(proto)) appendDot(line, tf("S {0} / L {1}", r.optInt("seeders"), r.optInt("leechers")));
+        appendDot(line, fmtAge(r.optDouble("ageMinutes", r.optInt("age") * 1440.0)));
+        TextView l = UiKit.caption(act, line.toString());
+        l.setPadding(0, dp(4), 0, 0);
         box.addView(l);
         JSONArray rej = r.optJSONArray("rejections");
-        final boolean rejected = rej != null && rej.length() > 0;
-        if (rejected) {
-            TextView rt = text("⚠ " + rej.optString(0), 10f, AppTheme.warning(), false);
+        final boolean rejected = isRejected(r);
+        for (int i = 0; rej != null && i < Math.min(2, rej.length()); i++) {
+            Object o = rej.opt(i);
+            String reason = o instanceof JSONObject ? ((JSONObject) o).optString("reason", "") : String.valueOf(o);
+            if (reason.isEmpty()) continue;
+            TextView rt = UiKit.caption(act, reason);
+            rt.setTextColor(AppTheme.warning());
+            rt.setPadding(0, dp(2), 0, 0);
             box.addView(rt);
         }
-        box.addView(actionButton("GRAB", rejected ? AppTheme.warning() : AppTheme.success(), v -> {
-            Runnable go = () -> action(api -> { api.grabRelease(r); return null; }, "Sent to the download client.", d::dismiss);
-            if (rejected) confirm(I18n.tr("This release was rejected by Sonarr. Download anyway?"), I18n.tr("GRAB"), AppTheme.warning(), go);
+        final Button grab = rejected ? UiKit.outline(act, I18n.tr("Grab Anyway"), null) : UiKit.primary(act, I18n.tr("Grab"), null);
+        grab.setOnClickListener(v -> {
+            Runnable go = () -> {
+                setBusy(grab, true);
+                async(slow, api -> { api.grabRelease(r); return null; }, x -> {
+                    toast("Sent to the download client.");
+                    sheet.dismiss();
+                }, e -> {
+                    setBusy(grab, false);
+                    toast(msg(e));
+                });
+            };
+            if (rejected) confirm("Grab rejected release?", "Sonarr rejected this release for the reasons shown. Download it anyway?", "Grab", false, go);
             else go.run();
-        }), new LinearLayout.LayoutParams(-1, dp(34)));
+        });
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-2, dp(36));
+        glp.topMargin = dp(8);
+        compact(grab);
+        box.addView(grab, glp);
         return box;
     }
 
     // ================================================================== ADD series
 
     private void showAddDialog() {
-        final LinearLayout body = dialogBody(I18n.tr("Add series"));
-        final EditText term = new EditText(act);
-        term.setHint(I18n.tr("Search TheTVDB by title"));
-        term.setHintTextColor(AppTheme.textMuted());
-        term.setTextColor(AppTheme.text());
-        term.setTextSize(13f);
-        term.setSingleLine(true);
+        final Sheet s = new Sheet("Add series");
+        final EditText term = UiKit.input(act, I18n.tr("Search by title or tvdb:12345"));
         term.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        body.addView(term);
-        final LinearLayout results = new LinearLayout(act);
-        results.setOrientation(LinearLayout.VERTICAL);
-        ScrollView sv = new ScrollView(act);
-        sv.addView(results);
-        final Dialog d = dialog(body);
-        final Runnable[] go = new Runnable[1];
-        go[0] = () -> {
-            String q = term.getText().toString().trim();
+        term.setInputType(InputType.TYPE_CLASS_TEXT);
+        s.box.addView(term, new LinearLayout.LayoutParams(-1, dp(44)));
+        final Button go = UiKit.primary(act, I18n.tr("Search"), null);
+        LinearLayout row = UiKit.buttonRow(act, go);
+        s.box.addView(row);
+        final LinearLayout results = UiKit.column(act);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+        rlp.topMargin = dp(8);
+        s.box.addView(results, rlp);
+        final Runnable search = () -> {
+            final String q = term.getText().toString().trim();
             if (q.isEmpty()) return;
+            setBusy(go, true);
             results.removeAllViews();
-            results.addView(text(I18n.tr("Searching..."), 12f, AppTheme.textSecondary(), false));
-            async(api -> api.lookup(q), arr -> {
+            results.addView(UiKit.loading(act, I18n.tr("Searching…")));
+            async(slow, api -> api.lookup(q), arr -> {
+                setBusy(go, false);
+                if (!s.dialog.isShowing()) return;
                 results.removeAllViews();
                 if (arr.length() == 0) {
-                    results.addView(text(I18n.tr("No results."), 12f, AppTheme.textSecondary(), false));
+                    results.addView(UiKit.empty(act, I18n.tr("No results"), I18n.tr("Try the original title or a TVDB id.")));
                     return;
                 }
-                for (int i = 0; i < Math.min(arr.length(), 25); i++) {
-                    final JSONObject r = arr.optJSONObject(i);
-                    if (r != null) results.addView(lookupRow(r, d));
+                int n = 0;
+                for (int i = 0; i < arr.length() && n < 25; i++) {
+                    JSONObject r = arr.optJSONObject(i);
+                    if (r == null) continue;
+                    if (n++ > 0) results.addView(listDivider());
+                    results.addView(lookupRow(r, s), new LinearLayout.LayoutParams(-1, -2));
                 }
-            }, t -> { results.removeAllViews(); results.addView(text(msg(t), 12f, AppTheme.danger(), false)); });
+            }, t -> {
+                setBusy(go, false);
+                if (!s.dialog.isShowing()) return;
+                results.removeAllViews();
+                results.addView(failureViewInline(t));
+            });
         };
-        term.setOnEditorActionListener((v, actionId, ev) -> { go[0].run(); return true; });
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, dp(34));
-        blp.topMargin = dp(8);
-        body.addView(actionButton("SEARCH", AppTheme.accent(), v -> go[0].run()), blp);
-        body.addView(sv, new LinearLayout.LayoutParams(-1, dp(360)));
-        d.show();
+        go.setOnClickListener(v -> search.run());
+        term.setOnEditorActionListener((v, actionId, ev) -> {
+            search.run();
+            return true;
+        });
+        s.show();
     }
 
-    private View lookupRow(final JSONObject r, final Dialog parent) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(6), dp(6), dp(6), dp(6));
-        row.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        row.setLayoutParams(lp);
-        row.addView(poster(r, 40, 58), new LinearLayout.LayoutParams(dp(40), dp(58)));
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.setPadding(dp(8), 0, 0, 0);
-        TextView t = text(r.optString("title") + (r.optInt("year") > 0 ? " (" + r.optInt("year") + ")" : ""), 12.5f, AppTheme.text(), true);
+    private View lookupRow(final JSONObject r, final Sheet parent) {
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(dp(4), dp(10), dp(4), dp(10));
+        row.setBackground(UiKit.rowRipple(act));
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.addView(poster(r, 40, 60), new LinearLayout.LayoutParams(dp(40), dp(60)));
+        LinearLayout tx = UiKit.column(act);
+        TextView t = UiKit.text(act, r.optString("title", "?"), 14f, AppTheme.text(), UiKit.MEDIUM);
         t.setMaxLines(2);
         t.setEllipsize(TextUtils.TruncateAt.END);
         tx.addView(t);
-        boolean exists = r.optInt("id") > 0;
-        TextView s = text((exists ? "✔ " + I18n.tr("Already added") + " - " : "") + r.optString("network", "") + " - "
-                + (r.optJSONArray("seasons") == null ? 0 : r.optJSONArray("seasons").length()) + " " + I18n.tr("seasons"),
-                10.5f, exists ? AppTheme.success() : AppTheme.textMuted(), false);
-        tx.addView(s);
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        row.setClickable(true);
+        StringBuilder sb = new StringBuilder();
+        if (r.optInt("year") > 0) sb.append(r.optInt("year"));
+        appendDot(sb, r.optString("network", ""));
+        int seasons = r.optJSONArray("seasons") == null ? 0 : r.optJSONArray("seasons").length();
+        if (seasons > 0) appendDot(sb, seasons == 1 ? I18n.tr("1 season") : tf("{0} seasons", seasons));
+        TextView c = UiKit.singleLine(UiKit.caption(act, sb.toString()));
+        c.setPadding(0, dp(2), 0, 0);
+        tx.addView(c);
+        final boolean exists = r.optInt("id") > 0;
+        if (exists) tx.addView(spaced(UiKit.badge(act, I18n.tr("In library"), AppTheme.success())));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginStart(dp(12));
+        row.addView(tx, tlp);
         row.setOnClickListener(v -> {
-            if (exists) { parent.dismiss(); openSeries(r.optInt("id")); }
-            else showAddOptions(r, parent);
+            if (exists) {
+                parent.dismiss();
+                openSeries(r.optInt("id"));
+            } else {
+                showAddOptions(r, parent);
+            }
         });
         return row;
     }
 
-    private void showAddOptions(final JSONObject lookup, final Dialog parent) {
-        final LinearLayout body = dialogBody(I18n.tr("Add") + " " + lookup.optString("title"));
-        final TextView loading = text(I18n.tr("Loading options..."), 12f, AppTheme.textSecondary(), false);
-        body.addView(loading);
-        final Dialog d = dialog(body);
-        d.show();
-        async(api -> {
+    private void showAddOptions(final JSONObject lookup, final Sheet parent) {
+        final Sheet s = new Sheet("Add series");
+        s.box.addView(UiKit.subtitle(act, lookup.optString("title", "") + (lookup.optInt("year") > 0 ? " (" + lookup.optInt("year") + ")" : "")));
+        final LinearLayout body = UiKit.column(act);
+        body.addView(UiKit.loading(act, I18n.tr("Loading options…")));
+        s.box.addView(body, new LinearLayout.LayoutParams(-1, -2));
+        s.show();
+        async(io, api -> {
             JSONObject o = new JSONObject();
             o.put("roots", api.rootFolders());
             o.put("profiles", api.qualityProfiles());
             return o;
         }, o -> {
-            body.removeView(loading);
+            if (!s.dialog.isShowing()) return;
+            body.removeAllViews();
             final JSONArray roots = o.optJSONArray("roots");
             final JSONArray profiles = o.optJSONArray("profiles");
             if (roots == null || roots.length() == 0) {
-                body.addView(text(I18n.tr("No root folder is configured. Add one in the SYSTEM section first."), 12f, AppTheme.danger(), false));
+                body.addView(failureViewInline(new Exception("No root folder is configured. Add one in the System section first.")));
                 return;
             }
             if (profiles == null || profiles.length() == 0) {
-                body.addView(text(I18n.tr("No quality profile found in Sonarr."), 12f, AppTheme.danger(), false));
+                body.addView(failureViewInline(new Exception("No quality profile found in Sonarr.")));
                 return;
             }
-            final String[] rootNames = new String[roots.length()];
-            for (int i = 0; i < roots.length(); i++) rootNames[i] = roots.optJSONObject(i).optString("path");
-            final String[] profNames = new String[profiles.length()];
-            final int[] profIds = new int[profiles.length()];
+            final List<String> rootNames = new ArrayList<>();
+            for (int i = 0; i < roots.length(); i++) {
+                JSONObject rf = roots.optJSONObject(i);
+                if (rf != null && !rf.optString("path", "").isEmpty()) rootNames.add(rf.optString("path", ""));
+            }
+            final List<String> profNames = new ArrayList<>();
+            final List<Integer> profIds = new ArrayList<>();
             for (int i = 0; i < profiles.length(); i++) {
-                profNames[i] = profiles.optJSONObject(i).optString("name");
-                profIds[i] = profiles.optJSONObject(i).optInt("id");
+                JSONObject p = profiles.optJSONObject(i);
+                if (p == null) continue;
+                profNames.add(p.optString("name", "?"));
+                profIds.add(p.optInt("id"));
+            }
+            if (rootNames.isEmpty() || profIds.isEmpty()) {
+                body.addView(failureViewInline(new Exception("Sonarr returned no usable root folder or quality profile.")));
+                return;
             }
             final String[] monitorLabels = {"All episodes", "Future episodes", "Missing episodes", "Existing episodes",
-                    "First season only", "Last season only", "None"};
-            final String[] monitorVals = {"all", "future", "missing", "existing", "firstSeason", "lastSeason", "none"};
+                    "Pilot episode", "First season", "Last season", "None"};
+            final String[] monitorVals = {"all", "future", "missing", "existing", "pilot", "firstSeason", "lastSeason", "none"};
             final String[] typeLabels = {"Standard", "Anime", "Daily"};
             final String[] typeVals = {"standard", "anime", "daily"};
             final int[] selRoot = {0}, selProf = {0}, selMon = {0}, selType = {0};
-            body.addView(choiceField("Root folder", rootNames, selRoot));
-            body.addView(choiceField("Quality profile", profNames, selProf));
-            body.addView(choiceField("Monitor", monitorLabels, selMon));
-            body.addView(choiceField("Series type", typeLabels, selType));
-            final Switch folders = new Switch(act);
-            folders.setText(I18n.tr("Season folders"));
-            folders.setTextColor(AppTheme.text());
-            folders.setChecked(true);
-            UiStyle.styleSwitch(act, folders);
-            folders.setPadding(0, dp(10), 0, dp(2));
-            body.addView(folders);
-            final Switch search = new Switch(act);
-            search.setText(I18n.tr("Start search for missing episodes"));
-            search.setTextColor(AppTheme.text());
-            search.setChecked(true);
-            UiStyle.styleSwitch(act, search);
-            search.setPadding(0, dp(6), 0, dp(6));
-            body.addView(search);
-            LinearLayout row = buttonRow();
-            row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-            row.addView(actionButton("ADD", AppTheme.success(), v -> {
-                d.dismiss();
-                action(api -> {
-                    api.addSeries(lookup, rootNames[selRoot[0]], profIds[selProf[0]], monitorVals[selMon[0]],
-                            folders.isChecked(), typeVals[selType[0]], search.isChecked());
+            String lt = lookup.optString("seriesType", "standard");
+            for (int i = 0; i < typeVals.length; i++) if (typeVals[i].equals(lt)) selType[0] = i;
+            body.addView(choiceField("Root folder", rootNames.toArray(new String[0]), selRoot, true));
+            body.addView(choiceField("Quality profile", profNames.toArray(new String[0]), selProf, false));
+            body.addView(choiceField("Monitor", monitorLabels, selMon, false));
+            body.addView(choiceField("Series type", typeLabels, selType, false));
+            final Switch folders = switchRow(body, "Season folders", null, true);
+            final Switch search = switchRow(body, "Start searching for missing episodes", null, true);
+            Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+            final Button add = UiKit.primary(act, I18n.tr("Add Series"), null);
+            add.setOnClickListener(v -> {
+                final String root = rootNames.get(selRoot[0]);
+                final int prof = profIds.get(selProf[0]);
+                final String mon = monitorVals[selMon[0]];
+                final boolean sf = folders.isChecked();
+                final String type = typeVals[selType[0]];
+                final boolean sm = search.isChecked();
+                setBusy(add, true);
+                async(slow, api -> {
+                    api.addSeries(lookup, root, prof, mon, sf, type, sm);
                     return null;
-                }, "Series added.", () -> {
-                    seriesCache = null;
+                }, r -> {
+                    toast("Series added.");
+                    s.dismiss();
                     parent.dismiss();
-                    refresh();
+                    seriesCache = null;
+                    go(S_SERIES);
+                }, e -> {
+                    setBusy(add, false);
+                    toast(msg(e));
                 });
-            }), weight());
-            body.addView(row);
-        }, t -> { loading.setText(msg(t)); loading.setTextColor(AppTheme.danger()); });
+            });
+            body.addView(UiKit.buttonRow(act, cancel, add));
+        }, t -> {
+            if (!s.dialog.isShowing()) return;
+            body.removeAllViews();
+            body.addView(failureViewInline(t));
+        });
     }
 
-    private View choiceField(final String label, final String[] options, final int[] selected) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(0, dp(8), 0, 0);
-        box.addView(text(I18n.tr(label), 10.5f, AppTheme.textMuted(), false));
-        final TextView value = text(I18n.tr(options[selected[0]]), 13f, AppTheme.text(), false);
-        value.setPadding(dp(10), dp(9), dp(10), dp(9));
-        value.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
-        value.setSingleLine(true);
+    /** Label + tappable value that opens a single-choice sheet. */
+    private View choiceField(final String label, final String[] options, final int[] selected, boolean mono) {
+        LinearLayout box = UiKit.column(act);
+        TextView l = UiKit.caption(act, I18n.tr(label));
+        l.setPadding(0, dp(12), 0, dp(6));
+        box.addView(l);
+        LinearLayout valueRow = UiKit.row(act);
+        valueRow.setPadding(dp(14), dp(11), dp(14), dp(11));
+        valueRow.setBackground(UiKit.pressable(act, AppTheme.inner(), AppTheme.outline(), UiKit.R_INNER));
+        valueRow.setClickable(true);
+        valueRow.setFocusable(true);
+        final TextView value = UiKit.singleLine(UiKit.text(act, I18n.tr(options[selected[0]]), 14f, AppTheme.text(), null));
         value.setEllipsize(TextUtils.TruncateAt.MIDDLE);
-        value.setOnClickListener(v -> {
-            String[] shown = new String[options.length];
-            for (int i = 0; i < options.length; i++) shown[i] = I18n.tr(options[i]);
-            new AlertDialog.Builder(act).setItems(shown, (dd, which) -> {
-                selected[0] = which;
-                value.setText(shown[which]);
-            }).show();
-        });
-        box.addView(value);
+        if (mono) value.setTypeface(Typeface.MONOSPACE);
+        valueRow.addView(value, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        valueRow.addView(UiKit.caption(act, "▾"));
+        valueRow.setOnClickListener(v -> choose(label, options, selected[0], idx -> {
+            selected[0] = idx;
+            value.setText(I18n.tr(options[idx]));
+        }));
+        box.addView(valueRow, new LinearLayout.LayoutParams(-1, -2));
         return box;
     }
 
     // ================================================================== CALENDAR
 
     private void loadCalendar() {
-        final int req = ++requestCounter;
-        showMessage("Loading...");
-        final SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
+        final int g = gen;
+        showLoading("Loading calendar…");
         Calendar c = Calendar.getInstance();
+        c.set(Calendar.HOUR_OF_DAY, 0);
+        c.set(Calendar.MINUTE, 0);
+        c.set(Calendar.SECOND, 0);
+        c.set(Calendar.MILLISECOND, 0);
         c.add(Calendar.DAY_OF_YEAR, -3);
-        final String start = f.format(c.getTime());
+        final String start = SonarrApi.isoUtc(c.getTimeInMillis());
         c.add(Calendar.DAY_OF_YEAR, 24);
-        final String end = f.format(c.getTime());
-        async(api -> api.calendar(start, end), arr -> {
-            if (req != requestCounter) return;
-            listContainer.removeAllViews();
-            if (arr.length() == 0) { showMessage("Nothing scheduled in this period."); return; }
-            TreeMap<String, List<JSONObject>> byDate = new TreeMap<>();
+        final String end = SonarrApi.isoUtc(c.getTimeInMillis());
+        async(io, api -> api.calendar(start, end), arr -> {
+            if (g != gen || section != S_CALENDAR || detailSeriesId > 0) return;
+            content.removeAllViews();
+            clearRefs();
+            if (arr.length() == 0) {
+                content.addView(UiKit.empty(act, I18n.tr("Nothing scheduled"), I18n.tr("No monitored episodes air in the next three weeks.")));
+                return;
+            }
+            TreeMap<String, List<JSONObject>> byDay = new TreeMap<>();
+            Map<JSONObject, Long> airs = new HashMap<>();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject e = arr.optJSONObject(i);
                 if (e == null) continue;
-                String d = e.optString("airDate", "");
-                List<JSONObject> l = byDate.get(d);
-                if (l == null) { l = new ArrayList<>(); byDate.put(d, l); }
+                long air = parseUtc(e.optString("airDateUtc", ""));
+                airs.put(e, air);
+                String day = air > 0 ? fmtLocalDate(air) : e.optString("airDate", "?");
+                List<JSONObject> l = byDay.get(day);
+                if (l == null) {
+                    l = new ArrayList<>();
+                    byDay.put(day, l);
+                }
                 l.add(e);
             }
-            String today = today();
-            for (java.util.Map.Entry<String, List<JSONObject>> en : byDate.entrySet()) {
+            String today = fmtLocalDate(System.currentTimeMillis());
+            for (Map.Entry<String, List<JSONObject>> en : byDay.entrySet()) {
                 boolean isToday = en.getKey().equals(today);
-                TextView h = text(en.getKey() + (isToday ? "   - " + I18n.tr("TODAY") : ""), 11f,
-                        isToday ? AppTheme.accent() : AppTheme.textMuted(), true);
-                h.setPadding(dp(2), dp(14), 0, dp(2));
-                listContainer.addView(h);
-                for (JSONObject e : en.getValue()) listContainer.addView(calendarRow(e));
+                TextView h = UiKit.overline(act, dayLabel(en.getKey()));
+                if (isToday) h.setTextColor(AppTheme.accent());
+                h.setPadding(dp(4), dp(4), 0, dp(8));
+                content.addView(h);
+                LinearLayout card = UiKit.card(act);
+                card.setPadding(dp(4), dp(4), dp(4), dp(4));
+                List<JSONObject> eps = en.getValue();
+                final Map<JSONObject, Long> fa = airs;
+                Collections.sort(eps, (a, b) -> Long.compare(fa.get(a) == null ? 0 : fa.get(a), fa.get(b) == null ? 0 : fa.get(b)));
+                for (int i = 0; i < eps.size(); i++) {
+                    if (i > 0) card.addView(listDivider());
+                    Long air = airs.get(eps.get(i));
+                    card.addView(calendarRow(eps.get(i), air == null ? 0 : air), new LinearLayout.LayoutParams(-1, -2));
+                }
+                content.addView(card);
             }
-        }, t -> { if (req == requestCounter) showError(t); });
+        }, t -> {
+            if (g == gen) showFailure(t, "Could not load the calendar");
+        });
     }
 
-    private View calendarRow(final JSONObject e) {
+    private String dayLabel(String isoDay) {
+        Calendar c = Calendar.getInstance();
+        String today = fmtLocalDate(c.getTimeInMillis());
+        c.add(Calendar.DAY_OF_YEAR, 1);
+        String tomorrow = fmtLocalDate(c.getTimeInMillis());
+        c.add(Calendar.DAY_OF_YEAR, -2);
+        String yesterday = fmtLocalDate(c.getTimeInMillis());
+        if (isoDay.equals(today)) return I18n.tr("Today");
+        if (isoDay.equals(tomorrow)) return I18n.tr("Tomorrow");
+        if (isoDay.equals(yesterday)) return I18n.tr("Yesterday");
+        try {
+            Date d = new SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(isoDay);
+            if (d != null) return new SimpleDateFormat("EEEE, d MMM", Locale.getDefault()).format(d);
+        } catch (Throwable ignored) {
+            // fall back to the ISO day
+        }
+        return isoDay;
+    }
+
+    private View calendarRow(final JSONObject e, long air) {
         JSONObject s = e.optJSONObject("series");
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(dp(12), dp(8), dp(12), dp(8));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        row.setLayoutParams(lp);
-        row.addView(text(s == null ? "?" : s.optString("title"), 12.5f, AppTheme.text(), true));
+        LinearLayout row = UiKit.column(act);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
+        LinearLayout top = UiKit.row(act);
+        top.addView(UiKit.singleLine(UiKit.text(act, s == null ? "?" : s.optString("title", "?"), 14f, AppTheme.text(), UiKit.MEDIUM)),
+                new LinearLayout.LayoutParams(0, -2, 1.0f));
         boolean has = e.optBoolean("hasFile");
-        TextView t = text(String.format(Locale.US, "S%02dE%02d  %s", e.optInt("seasonNumber"), e.optInt("episodeNumber"), e.optString("title"))
-                + (has ? "   ✔" : ""), 11f, has ? AppTheme.success() : AppTheme.textSecondary(), false);
+        boolean aired = air > 0 && air <= System.currentTimeMillis();
+        View badge;
+        if (has) badge = UiKit.badge(act, I18n.tr("Downloaded"), AppTheme.success());
+        else if (aired) badge = UiKit.badge(act, I18n.tr("Missing"), AppTheme.warning());
+        else badge = UiKit.badge(act, air > 0 ? fmtLocalTime(air) : I18n.tr("Upcoming"), AppTheme.accent());
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+        blp.setMarginStart(dp(8));
+        top.addView(badge, blp);
+        row.addView(top);
+        String et = e.optString("title", "");
+        TextView t = UiKit.singleLine(UiKit.caption(act, episodeCode(e) + " · " + (et.isEmpty() ? I18n.tr("TBA") : et)
+                + (air > 0 && (has || aired) ? " · " + fmtLocalTime(air) : "")));
+        t.setPadding(0, dp(4), 0, 0);
         row.addView(t);
         if (s != null && s.optInt("id") > 0) {
-            row.setClickable(true);
             final int sid = s.optInt("id");
+            row.setBackground(UiKit.rowRipple(act));
+            row.setClickable(true);
+            row.setFocusable(true);
             row.setOnClickListener(v -> openSeries(sid));
         }
         return row;
     }
 
-    // ================================================================== QUEUE
+    // ================================================================== QUEUE (live)
 
     private void loadQueue(final boolean silent) {
-        final int req = ++requestCounter;
-        if (!silent) showMessage("Loading...");
-        async(api -> api.queue(1, 100), o -> {
-            if (req != requestCounter || section != S_QUEUE || detailSeriesId > 0) return;
-            int y = scroll.getScrollY();
-            listContainer.removeAllViews();
-            JSONArray recs = o.optJSONArray("records");
-            if (recs == null || recs.length() == 0) { showMessage("The queue is empty."); return; }
-            TextView c = text(recs.length() + " " + I18n.tr("items downloading"), 11f, AppTheme.textSecondary(), false);
-            c.setPadding(0, dp(8), 0, dp(2));
-            listContainer.addView(c);
-            for (int i = 0; i < recs.length(); i++) {
-                JSONObject r = recs.optJSONObject(i);
-                if (r != null) listContainer.addView(queueRow(r));
+        final int g = gen;
+        boolean shell = queueRows != null && queueRows.getParent() != null && content.getChildCount() > 0;
+        if (silent) {
+            if (pollPending) return;
+            pollPending = true;
+        } else if (!shell) {
+            showLoading("Loading queue…");
+        }
+        async(io, api -> api.queue(1, 100), o -> {
+            if (silent) pollPending = false;
+            if (g != gen || section != S_QUEUE || detailSeriesId > 0) return;
+            fillQueue(o);
+        }, t -> {
+            if (silent) pollPending = false;
+            if (g != gen || section != S_QUEUE || detailSeriesId > 0) return;
+            if (queueRows != null && queueRows.getParent() != null) {
+                if (!silent) toast(msg(t));
+            } else if (!silent || !failureShown) {
+                showFailure(t, "Could not load the queue");
             }
-            scroll.post(() -> scroll.scrollTo(0, y));
-        }, t -> { if (req == requestCounter && !silent) showError(t); });
+        });
     }
 
-    private View queueRow(final JSONObject r) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(12), dp(10), dp(12), dp(10));
-        box.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        box.setLayoutParams(lp);
-        JSONObject s = r.optJSONObject("series");
-        JSONObject e = r.optJSONObject("episode");
-        box.addView(text(s == null ? r.optString("title") : s.optString("title"), 12.5f, AppTheme.text(), true));
-        if (e != null) {
-            TextView ep = text(String.format(Locale.US, "S%02dE%02d  %s", e.optInt("seasonNumber"), e.optInt("episodeNumber"), e.optString("title")),
-                    11f, AppTheme.textSecondary(), false);
-            box.addView(ep);
+    private void fillQueue(JSONObject o) {
+        JSONArray recs = o.optJSONArray("records");
+        int total = o.optInt("totalRecords", recs == null ? 0 : recs.length());
+        List<JSONObject> list = new ArrayList<>();
+        for (int i = 0; recs != null && i < recs.length(); i++) {
+            JSONObject r = recs.optJSONObject(i);
+            if (r != null) list.add(r);
         }
-        TextView rel = text(r.optString("title"), 10f, AppTheme.textMuted(), false);
-        rel.setMaxLines(2);
-        rel.setEllipsize(TextUtils.TruncateAt.END);
-        rel.setPadding(0, dp(2), 0, dp(4));
-        box.addView(rel);
-        double size = r.optDouble("size", 0), left = r.optDouble("sizeleft", 0);
-        int pct = size > 0 ? (int) Math.max(0, Math.min(100, (size - left) * 100.0 / size)) : 0;
-        ProgressBar pb = new ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal);
-        pb.setMax(100);
-        pb.setProgress(pct);
-        box.addView(pb, new LinearLayout.LayoutParams(-1, dp(4)));
-        String status = r.optString("status", "") + ("warning".equals(r.optString("trackedDownloadStatus")) ? " ⚠" : "")
-                + "  -  " + pct + "%  -  " + fmtSize((long) size)
-                + (r.optString("timeleft").isEmpty() ? "" : "  -  " + r.optString("timeleft"))
-                + (r.optString("downloadClient").isEmpty() ? "" : "  -  " + r.optString("downloadClient"));
-        TextView st = text(status, 10.5f, AppTheme.textSecondary(), false);
-        st.setPadding(0, dp(4), 0, dp(4));
-        box.addView(st);
+        if (list.isEmpty()) {
+            if (queueRows == null && content.getChildCount() == 1 && "queue-empty".equals(content.getChildAt(0).getTag())) return;
+            content.removeAllViews();
+            clearRefs();
+            View empty = UiKit.empty(act, I18n.tr("The queue is empty"), I18n.tr("Grabbed releases appear here while they download."));
+            empty.setTag("queue-empty");
+            content.addView(empty);
+            return;
+        }
+        if (queueRows == null || queueRows.getParent() == null) {
+            content.removeAllViews();
+            clearRefs();
+            queueCount = UiKit.overline(act, "");
+            queueCount.setPadding(dp(4), dp(4), 0, dp(8));
+            content.addView(queueCount);
+            queueRows = UiKit.card(act);
+            queueRows.setPadding(dp(4), dp(4), dp(4), dp(4));
+            content.addView(queueRows);
+        }
+        setText(queueCount, total > list.size() ? tf("Showing {0} of {1} items", list.size(), total)
+                : (list.size() == 1 ? I18n.tr("1 item") : tf("{0} items", list.size())));
+
+        List<Integer> ids = new ArrayList<>();
+        for (JSONObject r : list) ids.add(r.optInt("id"));
+        if (ids.equals(queueOrder)) {
+            for (JSONObject r : list) {
+                QueueHolder h = queueHolders.get(r.optInt("id"));
+                if (h != null) h.bind(r);
+            }
+            return;
+        }
+        final int y = scroll.getScrollY();
+        Map<Integer, QueueHolder> old = new HashMap<>(queueHolders);
+        queueRows.removeAllViews();
+        queueHolders.clear();
+        queueOrder.clear();
+        for (int i = 0; i < list.size(); i++) {
+            JSONObject r = list.get(i);
+            int id = r.optInt("id");
+            QueueHolder h = old.get(id);
+            if (h == null) h = new QueueHolder();
+            if (i > 0) queueRows.addView(listDivider());
+            h.bind(r);
+            queueRows.addView(h.view, new LinearLayout.LayoutParams(-1, -2));
+            queueHolders.put(id, h);
+            queueOrder.add(id);
+        }
+        scroll.post(() -> scroll.scrollTo(0, y));
+    }
+
+    /** Badge label + colour for a queue record (status / trackedDownloadStatus / trackedDownloadState). */
+    private static Object[] queueState(JSONObject r) {
+        String status = r.optString("status", "").toLowerCase(Locale.ROOT);
+        String tds = r.optString("trackedDownloadStatus", "").toLowerCase(Locale.ROOT);
+        String tstate = r.optString("trackedDownloadState", "").toLowerCase(Locale.ROOT);
+        if ("error".equals(tds) || "failed".equals(status) || "failed".equals(tstate) || "failedpending".equals(tstate)) {
+            return new Object[]{"Failed", AppTheme.danger()};
+        }
+        if ("downloadclientunavailable".equals(status)) return new Object[]{"Client unavailable", AppTheme.danger()};
+        if ("importpending".equals(tstate)) return new Object[]{"Import pending", AppTheme.warning()};
+        if ("importing".equals(tstate)) return new Object[]{"Importing", AppTheme.success()};
+        if ("imported".equals(tstate)) return new Object[]{"Imported", AppTheme.success()};
+        if ("warning".equals(tds) || "warning".equals(status)) return new Object[]{"Warning", AppTheme.warning()};
+        if ("downloading".equals(status)) return new Object[]{"Downloading", AppTheme.accent()};
+        if ("paused".equals(status)) return new Object[]{"Paused", AppTheme.textMuted()};
+        if ("queued".equals(status)) return new Object[]{"Queued", AppTheme.textMuted()};
+        if ("delay".equals(status)) return new Object[]{"Delayed", AppTheme.textMuted()};
+        if ("completed".equals(status)) return new Object[]{"Completed", AppTheme.success()};
+        return new Object[]{status.isEmpty() ? "Unknown" : capitalize(status), AppTheme.textMuted()};
+    }
+
+    /** One queue row, updated in place by the ticker. */
+    private final class QueueHolder {
+        int id;
+        String title = "";
+        final LinearLayout view;
+        final TextView name;
+        final LinearLayout metaRow;
+        String badgeKey = "";
+        final TextView episode;
+        final TextView release;
+        final View progress;
+        int progressColor;
+        final TextView meta;
+        final TextView warn;
+
+        QueueHolder() {
+            view = UiKit.column(act);
+            view.setPadding(dp(12), dp(12), dp(12), dp(12));
+
+            LinearLayout top = UiKit.row(act);
+            name = UiKit.singleLine(UiKit.text(act, "", 14f, AppTheme.text(), UiKit.MEDIUM));
+            top.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
+            Button remove = compact(UiKit.danger(act, I18n.tr("Remove"), v -> showRemoveQueue(id, title)));
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, dp(32));
+            rlp.setMarginStart(dp(10));
+            top.addView(remove, rlp);
+            view.addView(top);
+
+            metaRow = UiKit.row(act);
+            metaRow.setPadding(0, dp(6), 0, 0);
+            metaRow.addView(UiKit.badge(act, "", AppTheme.textMuted()));
+            episode = UiKit.singleLine(UiKit.caption(act, ""));
+            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+            elp.setMarginStart(dp(8));
+            metaRow.addView(episode, elp);
+            view.addView(metaRow);
+
+            release = UiKit.singleLine(UiKit.caption(act, ""));
+            release.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            release.setPadding(0, dp(4), 0, 0);
+            view.addView(release);
+
+            progressColor = AppTheme.accent();
+            progress = UiKit.progress(act, 0, progressColor);
+            view.addView(progress);
+
+            meta = UiKit.singleLine(UiKit.caption(act, ""));
+            meta.setPadding(0, dp(6), 0, 0);
+            view.addView(meta);
+
+            warn = UiKit.caption(act, "");
+            warn.setTextColor(AppTheme.warning());
+            warn.setMaxLines(3);
+            warn.setEllipsize(TextUtils.TruncateAt.END);
+            warn.setPadding(0, dp(4), 0, 0);
+            warn.setVisibility(View.GONE);
+            view.addView(warn);
+        }
+
+        void bind(JSONObject r) {
+            id = r.optInt("id");
+            JSONObject s = r.optJSONObject("series");
+            JSONObject e = r.optJSONObject("episode");
+            title = s != null ? s.optString("title", "") : r.optString("title", "");
+            setText(name, title.isEmpty() ? r.optString("title", "?") : title);
+            Object[] st = queueState(r);
+            String label = (String) st[0];
+            int color = (Integer) st[1];
+            String key = label + "|" + color;
+            if (!key.equals(badgeKey)) {
+                badgeKey = key;
+                metaRow.removeViewAt(0);
+                metaRow.addView(UiKit.badge(act, I18n.tr(label), color), 0);
+            }
+            setText(episode, e == null ? "" : episodeCode(e) + " · " + e.optString("title", ""));
+            setText(release, r.optString("title", ""));
+            double size = r.optDouble("size", 0);
+            double left = r.optDouble("sizeleft", 0);
+            double pct = size > 0 ? Math.max(0, Math.min(100, (size - left) * 100.0 / size)) : 0;
+            progressColor = updateProgress(progress, pct, color, progressColor);
+            StringBuilder m = new StringBuilder(String.format(Locale.US, "%.0f%%", pct));
+            if (size > 0) appendDot(m, fmtSize((long) size));
+            String tl = r.optString("timeleft", "");
+            if (!tl.isEmpty() && "downloading".equalsIgnoreCase(r.optString("status", ""))) appendDot(m, tf("{0} left", tl));
+            appendDot(m, r.optString("downloadClient", ""));
+            appendDot(m, r.optString("protocol", "").isEmpty() ? "" : capitalize(r.optString("protocol", "")));
+            setText(meta, m.toString());
+            String w = firstStatusMessage(r);
+            if (!w.isEmpty()) {
+                setText(warn, w);
+                warn.setVisibility(View.VISIBLE);
+            } else if (warn.getVisibility() != View.GONE) {
+                warn.setVisibility(View.GONE);
+            }
+        }
+    }
+
+    private static String firstStatusMessage(JSONObject r) {
+        String em = r.optString("errorMessage", "");
+        if (!em.isEmpty()) return em;
         JSONArray msgs = r.optJSONArray("statusMessages");
-        if (msgs != null && msgs.length() > 0) {
-            JSONObject m0 = msgs.optJSONObject(0);
-            JSONArray mm = m0 == null ? null : m0.optJSONArray("messages");
-            String warn = mm != null && mm.length() > 0 ? mm.optString(0) : (m0 == null ? "" : m0.optString("title"));
-            if (!warn.isEmpty()) box.addView(text("⚠ " + warn, 10f, AppTheme.warning(), false));
+        for (int i = 0; msgs != null && i < msgs.length(); i++) {
+            JSONObject m0 = msgs.optJSONObject(i);
+            if (m0 == null) continue;
+            JSONArray mm = m0.optJSONArray("messages");
+            if (mm != null && mm.length() > 0 && !mm.optString(0, "").isEmpty()) return mm.optString(0, "");
+            if (!m0.optString("title", "").isEmpty()) return m0.optString("title", "");
         }
-        final int qid = r.optInt("id");
-        box.addView(actionButton("REMOVE", AppTheme.danger(), v -> showRemoveQueue(qid)), new LinearLayout.LayoutParams(-1, dp(32)));
-        return box;
+        return "";
     }
 
-    private void showRemoveQueue(final int id) {
-        final LinearLayout body = dialogBody(I18n.tr("Remove from queue"));
-        final Switch client = new Switch(act);
-        client.setText(I18n.tr("Also remove from the download client"));
-        client.setTextColor(AppTheme.text());
-        client.setChecked(true);
-        UiStyle.styleSwitch(act, client);
-        body.addView(client);
-        final Switch block = new Switch(act);
-        block.setText(I18n.tr("Add the release to the blocklist"));
-        block.setTextColor(AppTheme.text());
-        UiStyle.styleSwitch(act, block);
-        block.setPadding(0, dp(10), 0, dp(10));
-        body.addView(block);
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("REMOVE", AppTheme.danger(), v -> {
-            d.dismiss();
-            final boolean rc = client.isChecked(), bl = block.isChecked();
-            action(api -> { api.removeQueueItem(id, rc, bl); return null; }, "Removed.", this::refresh);
-        }), weight());
-        body.addView(row);
-        d.show();
+    private void showRemoveQueue(final int id, String title) {
+        final Sheet s = new Sheet("Remove from queue");
+        if (title != null && !title.isEmpty()) s.box.addView(UiKit.subtitle(act, title));
+        final Switch client = switchRow(s.box, "Remove from the download client", "Also deletes the partial download.", true);
+        final Switch block = switchRow(s.box, "Add the release to the blocklist", "Sonarr will not grab this release again.", false);
+        final Switch replace = switchRow(s.box, "Search for a replacement", "Only applies when blocklisting.", true);
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        final Button remove = UiKit.danger(act, I18n.tr("Remove"), null);
+        remove.setOnClickListener(v -> {
+            final boolean rc = client.isChecked();
+            final boolean bl = block.isChecked();
+            final boolean skip = !replace.isChecked();
+            setBusy(remove, true);
+            async(io, api -> { api.removeQueueItem(id, rc, bl, skip); return null; }, r -> {
+                s.dismiss();
+                toast("Removed from the queue.");
+                loadQueue(true);
+            }, e -> {
+                setBusy(remove, false);
+                toast(msg(e));
+            });
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, remove));
+        s.show();
     }
 
     // ================================================================== HISTORY
 
     private void loadHistory() {
-        final int req = ++requestCounter;
+        final int g = gen;
         final int pg = page;
-        showMessage("Loading...");
-        async(api -> api.history(pg, PAGE_SIZE), o -> {
-            if (req != requestCounter) return;
-            listContainer.removeAllViews();
+        showLoading("Loading history…");
+        async(io, api -> api.history(pg, PAGE_SIZE), o -> {
+            if (g != gen || section != S_HISTORY || detailSeriesId > 0) return;
+            content.removeAllViews();
+            clearRefs();
             JSONArray recs = o.optJSONArray("records");
-            if (recs == null || recs.length() == 0) { showMessage("No history yet."); return; }
+            int total = o.optInt("totalRecords");
+            if (recs == null || recs.length() == 0) {
+                content.addView(UiKit.empty(act, I18n.tr("No history yet"), I18n.tr("Grabs, imports and failures show up here.")));
+                return;
+            }
+            TextView count = UiKit.overline(act, tf("{0} events", total));
+            count.setPadding(dp(4), dp(4), 0, dp(8));
+            content.addView(count);
+            LinearLayout card = UiKit.card(act);
+            card.setPadding(dp(4), dp(4), dp(4), dp(4));
             for (int i = 0; i < recs.length(); i++) {
                 JSONObject r = recs.optJSONObject(i);
-                if (r != null) listContainer.addView(historyRow(r));
+                if (r == null) continue;
+                if (card.getChildCount() > 0) card.addView(listDivider());
+                card.addView(historyRow(r), new LinearLayout.LayoutParams(-1, -2));
             }
-            addPager(pg, o.optInt("totalRecords"));
-        }, t -> { if (req == requestCounter) showError(t); });
+            content.addView(card);
+            addPager(pg, total);
+        }, t -> {
+            if (g == gen) showFailure(t, "Could not load history");
+        });
     }
 
     private View historyRow(final JSONObject r) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(12), dp(8), dp(12), dp(8));
-        box.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        box.setLayoutParams(lp);
+        LinearLayout row = UiKit.column(act);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
         JSONObject s = r.optJSONObject("series");
         JSONObject e = r.optJSONObject("episode");
-        box.addView(text(s == null ? "?" : s.optString("title"), 12.5f, AppTheme.text(), true));
+        LinearLayout top = UiKit.row(act);
+        top.addView(UiKit.singleLine(UiKit.text(act, s == null ? "?" : s.optString("title", "?"), 14f, AppTheme.text(), UiKit.MEDIUM)),
+                new LinearLayout.LayoutParams(0, -2, 1.0f));
         String ev = r.optString("eventType", "");
-        int color = AppTheme.textSecondary();
-        String label = ev;
+        int color = AppTheme.textMuted();
+        String label = capitalize(ev);
         if (ev.equals("grabbed")) { label = "Grabbed"; color = AppTheme.accent(); }
         else if (ev.equals("downloadFolderImported")) { label = "Imported"; color = AppTheme.success(); }
         else if (ev.equals("downloadFailed")) { label = "Download failed"; color = AppTheme.danger(); }
         else if (ev.equals("episodeFileDeleted")) { label = "File deleted"; color = AppTheme.warning(); }
         else if (ev.equals("episodeFileRenamed")) label = "Renamed";
-        TextView t = text(I18n.tr(label) + (e == null ? "" : String.format(Locale.US, "  -  S%02dE%02d", e.optInt("seasonNumber"), e.optInt("episodeNumber"))), 11f, color, true);
-        box.addView(t);
-        TextView src = text(r.optString("sourceTitle"), 10f, AppTheme.textMuted(), false);
-        src.setMaxLines(2);
-        src.setEllipsize(TextUtils.TruncateAt.END);
-        box.addView(src);
-        String date = r.optString("date", "");
-        box.addView(text(date.length() >= 16 ? date.substring(0, 10) + " " + date.substring(11, 16) : date, 10f, AppTheme.textMuted(), false));
+        else if (ev.equals("downloadIgnored")) label = "Ignored";
+        else if (ev.equals("seriesFolderImported")) { label = "Imported"; color = AppTheme.success(); }
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+        blp.setMarginStart(dp(8));
+        top.addView(UiKit.badge(act, I18n.tr(label), color), blp);
+        row.addView(top);
+        StringBuilder sb = new StringBuilder();
+        if (e != null) sb.append(episodeCode(e));
+        long when = parseUtc(r.optString("date", ""));
+        if (when > 0) appendDot(sb, fmtLocal(when));
+        String q = qualityName(r.optJSONObject("quality"));
+        if (!q.isEmpty()) appendDot(sb, q);
+        TextView c = UiKit.singleLine(UiKit.caption(act, sb.toString()));
+        c.setPadding(0, dp(4), 0, 0);
+        row.addView(c);
+        String src = r.optString("sourceTitle", "");
+        if (!src.isEmpty()) {
+            TextView st = UiKit.singleLine(UiKit.caption(act, src));
+            st.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            st.setPadding(0, dp(2), 0, 0);
+            row.addView(st);
+        }
         if (s != null && s.optInt("id") > 0) {
             final int sid = s.optInt("id");
-            box.setClickable(true);
-            box.setOnClickListener(v -> openSeries(sid));
+            row.setBackground(UiKit.rowRipple(act));
+            row.setClickable(true);
+            row.setFocusable(true);
+            row.setOnClickListener(v -> openSeries(sid));
         }
-        return box;
+        return row;
     }
 
     // ================================================================== WANTED
 
     private void loadWanted() {
-        final int req = ++requestCounter;
+        final int g = gen;
         final int pg = page;
-        showMessage("Loading...");
-        async(api -> api.wantedMissing(pg, PAGE_SIZE), o -> {
-            if (req != requestCounter) return;
-            listContainer.removeAllViews();
+        showLoading("Loading missing episodes…");
+        async(io, api -> api.wantedMissing(pg, PAGE_SIZE), o -> {
+            if (g != gen || section != S_WANTED || detailSeriesId > 0) return;
+            content.removeAllViews();
+            clearRefs();
             int total = o.optInt("totalRecords");
-            LinearLayout bar = new LinearLayout(act);
-            bar.setOrientation(LinearLayout.HORIZONTAL);
-            bar.setGravity(Gravity.CENTER_VERTICAL);
-            bar.setPadding(0, dp(8), 0, dp(4));
-            bar.addView(text(total + " " + I18n.tr("missing"), 11f, AppTheme.textSecondary(), false), new LinearLayout.LayoutParams(0, -2, 1.0f));
-            bar.addView(actionButton("SEARCH ALL", AppTheme.success(), v ->
-                    confirm(I18n.tr("Ask Sonarr to search for all monitored missing episodes?"), I18n.tr("SEARCH"), AppTheme.success(), () ->
-                            action(api2 -> { api2.command("{\"name\":\"MissingEpisodeSearch\",\"monitored\":true}"); return null; },
-                                    "Search queued.", null))), new LinearLayout.LayoutParams(-2, dp(34)));
-            listContainer.addView(bar);
             JSONArray recs = o.optJSONArray("records");
-            if (recs == null || recs.length() == 0) { showMessage("No monitored missing episodes."); return; }
+            if (recs == null || recs.length() == 0) {
+                content.addView(UiKit.empty(act, I18n.tr("Nothing missing"), I18n.tr("Every monitored episode that has aired is downloaded.")));
+                return;
+            }
+            LinearLayout bar = UiKit.row(act);
+            bar.setPadding(dp(4), 0, 0, dp(8));
+            TextView cnt = UiKit.overline(act, total == 1 ? I18n.tr("1 missing episode") : tf("{0} missing episodes", total));
+            cnt.setPadding(0, 0, 0, 0);
+            bar.addView(cnt, new LinearLayout.LayoutParams(0, -2, 1.0f));
+            Button all = compact(UiKit.outline(act, I18n.tr("Search All"), v ->
+                    confirm("Search all missing?", "Ask Sonarr to search for every monitored missing episode? This can hit your indexers hard.",
+                            "Search", false, () -> runAction(v, api -> { api.searchAllMissing(); return null; }, "Search started.", null))));
+            bar.addView(all, new LinearLayout.LayoutParams(-2, dp(34)));
+            content.addView(bar);
+            LinearLayout card = UiKit.card(act);
+            card.setPadding(dp(4), dp(4), dp(4), dp(4));
             for (int i = 0; i < recs.length(); i++) {
                 JSONObject r = recs.optJSONObject(i);
-                if (r != null) listContainer.addView(wantedRow(r));
+                if (r == null) continue;
+                if (card.getChildCount() > 0) card.addView(listDivider());
+                card.addView(wantedRow(r), new LinearLayout.LayoutParams(-1, -2));
             }
+            content.addView(card);
             addPager(pg, total);
-        }, t -> { if (req == requestCounter) showError(t); });
+        }, t -> {
+            if (g == gen) showFailure(t, "Could not load missing episodes");
+        });
     }
 
     private View wantedRow(final JSONObject e) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(12), dp(10), dp(10), dp(10));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        row.setLayoutParams(lp);
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
         JSONObject s = e.optJSONObject("series");
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        TextView t = text(s == null ? "?" : s.optString("title"), 12.5f, AppTheme.text(), true);
-        t.setMaxLines(2);
-        t.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(t);
-        tx.addView(text(String.format(Locale.US, "S%02dE%02d  %s  (%s)", e.optInt("seasonNumber"), e.optInt("episodeNumber"),
-                e.optString("title"), e.optString("airDate")), 10.5f, AppTheme.textMuted(), false));
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(UiKit.singleLine(UiKit.text(act, s == null ? "?" : s.optString("title", "?"), 14f, AppTheme.text(), UiKit.MEDIUM)));
+        long air = parseUtc(e.optString("airDateUtc", ""));
+        String et = e.optString("title", "");
+        TextView c = UiKit.singleLine(UiKit.caption(act, episodeCode(e) + " · " + (et.isEmpty() ? I18n.tr("TBA") : et)
+                + (air > 0 ? " · " + tf("Aired {0}", fmtLocalDate(air)) : "")));
+        c.setPadding(0, dp(2), 0, 0);
+        tx.addView(c);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginEnd(dp(10));
+        row.addView(tx, tlp);
         final int epId = e.optInt("id");
-        row.addView(actionButton("SEARCH", AppTheme.success(), v ->
-                action(api -> { api.searchEpisode(epId); return null; }, "Search queued.", null)), new LinearLayout.LayoutParams(-2, dp(32)));
+        row.addView(compact(UiKit.outline(act, I18n.tr("Search"), v ->
+                runAction(v, api -> { api.searchEpisode(epId); return null; }, "Episode search started.", null))),
+                new LinearLayout.LayoutParams(-2, dp(32)));
         if (s != null && s.optInt("id") > 0) {
             final int sid = s.optInt("id");
+            tx.setBackground(UiKit.rowRipple(act));
+            tx.setClickable(true);
             tx.setOnClickListener(v -> openSeries(sid));
         }
         return row;
     }
 
     private void addPager(int pg, int total) {
-        LinearLayout pager = new LinearLayout(act);
-        pager.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, -2);
-        plp.topMargin = dp(10);
-        pager.setLayoutParams(plp);
-        if (pg > 1) pager.addView(actionButton("PREV", AppTheme.accent(), v -> { page--; refresh(); }), weight());
-        if (pg * PAGE_SIZE < total) pager.addView(actionButton("NEXT", AppTheme.accent(), v -> { page++; refresh(); }), weight());
-        if (pager.getChildCount() > 0) listContainer.addView(pager);
+        int pages = Math.max(1, (total + PAGE_SIZE - 1) / PAGE_SIZE);
+        if (pages <= 1) return;
+        TextView info = UiKit.caption(act, tf("Page {0} of {1}", pg, pages));
+        info.setGravity(Gravity.CENTER);
+        info.setPadding(0, dp(4), 0, 0);
+        content.addView(info, new LinearLayout.LayoutParams(-1, -2));
+        Button prev = UiKit.outline(act, I18n.tr("Previous"), v -> {
+            page = Math.max(1, page - 1);
+            scroll.scrollTo(0, 0);
+            refresh();
+        });
+        Button next = UiKit.outline(act, I18n.tr("Next"), v -> {
+            page++;
+            scroll.scrollTo(0, 0);
+            refresh();
+        });
+        if (pg <= 1) setBusy(prev, true);
+        if (pg >= pages) setBusy(next, true);
+        content.addView(UiKit.buttonRow(act, prev, next));
     }
 
     // ================================================================== SYSTEM
 
     private void loadSystem() {
-        final int req = ++requestCounter;
-        showMessage("Loading...");
-        async(api -> {
+        final int g = gen;
+        showLoading("Loading system status…");
+        async(io, api -> {
             JSONObject o = new JSONObject();
             o.put("status", api.status());
-            try { o.put("health", api.health()); } catch (Throwable ignored) {}
-            try { o.put("disk", api.diskSpace()); } catch (Throwable ignored) {}
-            try { o.put("roots", api.rootFolders()); } catch (Throwable ignored) {}
-            try { o.put("profiles", api.qualityProfiles()); } catch (Throwable ignored) {}
-            try { o.put("indexers", api.indexers()); } catch (Throwable ignored) {}
-            try { o.put("clients", api.downloadClients()); } catch (Throwable ignored) {}
+            try { o.put("health", api.health()); } catch (Throwable ignored) { }
+            try { o.put("disk", api.diskSpace()); } catch (Throwable ignored) { }
+            try { o.put("roots", api.rootFolders()); } catch (Throwable ignored) { }
+            try { o.put("profiles", api.qualityProfiles()); } catch (Throwable ignored) { }
+            try { o.put("indexers", api.indexers()); } catch (Throwable ignored) { }
+            try { o.put("clients", api.downloadClients()); } catch (Throwable ignored) { }
             return o;
         }, o -> {
-            if (req != requestCounter) return;
+            if (g != gen || section != S_SYSTEM || detailSeriesId > 0) return;
             renderSystem(o);
-        }, t -> { if (req == requestCounter) showError(t); });
+        }, t -> {
+            if (g == gen) showFailure(t, "Could not load system status");
+        });
     }
 
     private LinearLayout sysCard(String title) {
-        LinearLayout card = new LinearLayout(act);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(10), dp(14), dp(12));
-        card.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 14));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(10);
-        card.setLayoutParams(lp);
-        TextView t = text(I18n.tr(title), 11f, AppTheme.textMuted(), true);
-        t.setLetterSpacing(0.08f);
-        t.setPadding(0, 0, 0, dp(4));
-        card.addView(t);
-        listContainer.addView(card);
+        LinearLayout card = UiKit.card(act);
+        card.addView(UiKit.overline(act, I18n.tr(title)));
+        content.addView(card);
         return card;
     }
 
     private void renderSystem(JSONObject o) {
-        listContainer.removeAllViews();
+        content.removeAllViews();
+        clearRefs();
         JSONObject st = o.optJSONObject("status");
-        LinearLayout c = sysCard("STATUS");
+        LinearLayout c = sysCard("Status");
         if (st != null) {
-            c.addView(text("Sonarr v" + st.optString("version") + "  -  " + st.optString("osName") + " " + st.optString("osVersion"), 12f, AppTheme.text(), false));
-            c.addView(text(st.optString("appData"), 10.5f, AppTheme.textMuted(), false));
-            String sd = st.optString("startTime", "");
-            if (!sd.isEmpty()) c.addView(text(I18n.tr("Started") + ": " + sd.replace('T', ' ').replaceAll("\\..*$", "").replace("Z", " UTC"), 10.5f, AppTheme.textMuted(), false));
+            c.addView(kv("Version", st.optString("version", "—")));
+            String os = (st.optString("osName", "") + " " + st.optString("osVersion", "")).trim();
+            if (!os.isEmpty()) c.addView(kv("System", os));
+            String rt = (st.optString("runtimeName", "") + " " + st.optString("runtimeVersion", "")).trim();
+            if (!rt.isEmpty()) c.addView(kv("Runtime", rt));
+            long started = parseUtc(st.optString("startTime", ""));
+            if (started > 0) c.addView(kv("Started", fmtLocal(started)));
+            if (!st.optString("appData", "").isEmpty()) c.addView(kvMono("App data", st.optString("appData", "")));
         }
 
         JSONArray health = o.optJSONArray("health");
-        c = sysCard("HEALTH");
+        c = sysCard("Health");
         if (health == null || health.length() == 0) {
-            c.addView(text("✔ " + I18n.tr("No problems detected."), 12f, AppTheme.success(), false));
+            c.addView(UiKit.badge(act, I18n.tr("No problems detected"), AppTheme.success()));
         } else {
             for (int i = 0; i < health.length(); i++) {
                 JSONObject h = health.optJSONObject(i);
                 if (h == null) continue;
-                boolean err = "error".equalsIgnoreCase(h.optString("type"));
-                TextView t = text((err ? "✖ " : "⚠ ") + h.optString("message"), 11.5f, err ? AppTheme.danger() : AppTheme.warning(), false);
-                t.setPadding(0, dp(3), 0, dp(3));
-                c.addView(t);
+                boolean err = "error".equalsIgnoreCase(h.optString("type", ""));
+                LinearLayout row = UiKit.column(act);
+                row.setPadding(0, i == 0 ? 0 : dp(10), 0, 0);
+                row.addView(UiKit.badge(act, I18n.tr(err ? "Error" : "Warning"), err ? AppTheme.danger() : AppTheme.warning()),
+                        new LinearLayout.LayoutParams(-2, -2));
+                TextView t = UiKit.body(act, h.optString("message", ""));
+                t.setPadding(0, dp(4), 0, 0);
+                row.addView(t);
+                c.addView(row);
             }
         }
 
         JSONArray disk = o.optJSONArray("disk");
         if (disk != null && disk.length() > 0) {
-            c = sysCard("DISK SPACE");
+            c = sysCard("Disk space");
             for (int i = 0; i < disk.length(); i++) {
                 JSONObject dsk = disk.optJSONObject(i);
                 if (dsk == null) continue;
                 long total = dsk.optLong("totalSpace"), free = dsk.optLong("freeSpace");
-                String label = dsk.optString("label", "").isEmpty() ? dsk.optString("path") : dsk.optString("label") + " (" + dsk.optString("path") + ")";
-                c.addView(text(label, 11.5f, AppTheme.text(), false));
-                ProgressBar pb = new ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal);
-                pb.setMax(100);
-                pb.setProgress(total > 0 ? (int) ((total - free) * 100 / total) : 0);
-                LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, dp(4));
-                plp.topMargin = dp(3);
-                c.addView(pb, plp);
-                TextView fr = text(fmtSize(free) + " " + I18n.tr("free of") + " " + fmtSize(total), 10.5f, AppTheme.textMuted(), false);
-                fr.setPadding(0, dp(2), 0, dp(6));
-                c.addView(fr);
+                LinearLayout row = UiKit.column(act);
+                row.setPadding(0, i == 0 ? 0 : dp(12), 0, 0);
+                TextView p = UiKit.mono(act, dsk.optString("path", ""));
+                p.setTextSize(12f);
+                row.addView(p);
+                int used = total > 0 ? (int) ((total - free) * 100 / total) : 0;
+                row.addView(UiKit.progress(act, used, used >= 95 ? AppTheme.danger() : used >= 85 ? AppTheme.warning() : AppTheme.accent()));
+                TextView fr = UiKit.caption(act, tf("{0} free of {1}", fmtSize(free), fmtSize(total)));
+                fr.setPadding(0, dp(4), 0, 0);
+                row.addView(fr);
+                c.addView(row);
             }
         }
 
-        // root folders
-        c = sysCard("ROOT FOLDERS");
+        c = sysCard("Root folders");
         JSONArray roots = o.optJSONArray("roots");
+        if (roots == null || roots.length() == 0) {
+            c.addView(UiKit.caption(act, I18n.tr("No root folder yet. Series need one to be added.")));
+        }
         for (int i = 0; roots != null && i < roots.length(); i++) {
             final JSONObject rf = roots.optJSONObject(i);
             if (rf == null) continue;
-            LinearLayout row = new LinearLayout(act);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            LinearLayout tx = new LinearLayout(act);
-            tx.setOrientation(LinearLayout.VERTICAL);
-            tx.addView(text(rf.optString("path"), 12f, AppTheme.text(), false));
-            tx.addView(text(fmtSize(rf.optLong("freeSpace")) + " " + I18n.tr("free"), 10.5f, AppTheme.textMuted(), false));
-            row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-            row.addView(actionButton("REMOVE", AppTheme.danger(), v ->
-                    confirm(I18n.tr("Remove this root folder from Sonarr? Files are not deleted."), I18n.tr("REMOVE"), AppTheme.danger(), () ->
-                            action(api -> { api.deleteRootFolder(rf.optInt("id")); return null; }, "Removed.", this::refresh))),
+            LinearLayout row = UiKit.row(act);
+            row.setPadding(0, dp(6), 0, dp(6));
+            LinearLayout tx = UiKit.column(act);
+            TextView p = UiKit.mono(act, rf.optString("path", ""));
+            p.setTextSize(12f);
+            tx.addView(p);
+            boolean ok = rf.optBoolean("accessible", true);
+            TextView fs = UiKit.caption(act, ok ? tf("{0} free", fmtSize(rf.optLong("freeSpace"))) : I18n.tr("Not accessible"));
+            if (!ok) fs.setTextColor(AppTheme.danger());
+            tx.addView(fs);
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+            tlp.setMarginEnd(dp(10));
+            row.addView(tx, tlp);
+            final int rid = rf.optInt("id");
+            row.addView(compact(UiKit.danger(act, I18n.tr("Remove"), v ->
+                    confirm("Remove root folder?", "Remove this root folder from Sonarr? Files on disk are not deleted.", "Remove", true, () ->
+                            runAction(v, api -> { api.deleteRootFolder(rid); return null; }, "Root folder removed.", this::refresh)))),
                     new LinearLayout.LayoutParams(-2, dp(32)));
             c.addView(row);
         }
-        final LinearLayout cc = c;
-        c.addView(actionButton("+ ADD ROOT FOLDER", AppTheme.accent(), v -> showAddRoot()),
-                lpTop(dp(34), dp(8)));
+        Button addRoot = UiKit.outline(act, I18n.tr("Add Root Folder"), v -> showAddRoot());
+        c.addView(UiKit.buttonRow(act, addRoot));
 
-        // profiles
-        c = sysCard("QUALITY PROFILES");
+        c = sysCard("Quality profiles");
         JSONArray profs = o.optJSONArray("profiles");
+        if (profs == null || profs.length() == 0) c.addView(UiKit.caption(act, I18n.tr("None configured.")));
         for (int i = 0; profs != null && i < profs.length(); i++) {
             JSONObject p = profs.optJSONObject(i);
-            if (p != null) c.addView(text("• " + p.optString("name"), 12f, AppTheme.text(), false));
+            if (p != null) c.addView(kv(p.optString("name", "?"), p.optBoolean("upgradeAllowed") ? I18n.tr("Upgrades allowed") : I18n.tr("No upgrades")));
         }
 
-        c = sysCard("INDEXERS");
+        c = sysCard("Indexers");
         addEnabledList(c, o.optJSONArray("indexers"), "enableRss");
-        c = sysCard("DOWNLOAD CLIENTS");
+        c = sysCard("Download clients");
         addEnabledList(c, o.optJSONArray("clients"), "enable");
 
-        c = sysCard("TASKS");
-        LinearLayout r1 = new LinearLayout(act);
-        r1.setOrientation(LinearLayout.HORIZONTAL);
-        r1.addView(actionButton("RSS SYNC", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RssSync"); return null; }, "RSS sync queued.", null)), weight());
-        r1.addView(actionButton("REFRESH ALL", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RefreshSeries"); return null; }, "Refresh queued.", null)), weight());
-        c.addView(r1);
-        LinearLayout r2 = new LinearLayout(act);
-        r2.setOrientation(LinearLayout.HORIZONTAL);
-        r2.addView(actionButton("RESCAN ALL", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RescanSeries"); return null; }, "Rescan queued.", null)), weight());
-        r2.addView(actionButton("BACKUP", AppTheme.accent(), v -> action(api -> { api.simpleCommand("Backup"); return null; }, "Backup queued.", null)), weight());
-        c.addView(r2, lpTop(-2, dp(6)));
-        TextView note = text(I18n.tr("Indexers and download clients are managed by Prowlarr / the SERVICES tab. Advanced settings are available in Sonarr's own web interface."),
-                10.5f, AppTheme.textMuted(), false);
-        note.setPadding(0, dp(12), 0, 0);
-        listContainer.addView(note);
+        c = sysCard("Tasks");
+        Button rss = UiKit.outline(act, I18n.tr("RSS Sync"), v ->
+                runAction(v, api -> { api.simpleCommand("RssSync"); return null; }, "RSS sync queued.", null));
+        Button refreshAll = UiKit.outline(act, I18n.tr("Refresh All"), v ->
+                runAction(v, api -> { api.simpleCommand("RefreshSeries"); return null; }, "Refresh queued for every series.", null));
+        c.addView(UiKit.buttonRow(act, rss, refreshAll));
+        Button rescanAll = UiKit.outline(act, I18n.tr("Rescan All"), v ->
+                runAction(v, api -> { api.simpleCommand("RescanSeries"); return null; }, "Rescan queued for every series.", null));
+        Button backup = UiKit.outline(act, I18n.tr("Backup"), v ->
+                runAction(v, api -> { api.simpleCommand("Backup"); return null; }, "Backup queued.", null));
+        c.addView(UiKit.buttonRow(act, rescanAll, backup));
+
+        TextView note = UiKit.caption(act, I18n.tr("Indexers and download clients are managed by Prowlarr and the Services tab. Advanced settings are in Sonarr's own web interface."));
+        note.setPadding(dp(4), 0, dp(4), 0);
+        content.addView(note);
     }
 
     private void addEnabledList(LinearLayout card, JSONArray arr, String flag) {
         if (arr == null || arr.length() == 0) {
-            card.addView(text(I18n.tr("None configured."), 11.5f, AppTheme.textSecondary(), false));
+            card.addView(UiKit.caption(act, I18n.tr("None configured.")));
             return;
         }
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) continue;
-            boolean on = o.has(flag) ? o.optBoolean(flag) : true;
-            TextView t = text((on ? "● " : "○ ") + o.optString("name") + "  (" + o.optString("implementationName", o.optString("implementation")) + ")",
-                    11.5f, on ? AppTheme.text() : AppTheme.textMuted(), false);
-            t.setPadding(0, dp(2), 0, dp(2));
-            card.addView(t);
+            boolean on = !o.has(flag) || o.optBoolean(flag);
+            LinearLayout row = UiKit.row(act);
+            row.setPadding(0, dp(6), 0, dp(6));
+            LinearLayout tx = UiKit.column(act);
+            tx.addView(UiKit.singleLine(UiKit.text(act, o.optString("name", "?"), 14f, AppTheme.text(), UiKit.MEDIUM)));
+            String impl = o.optString("implementationName", o.optString("implementation", ""));
+            if (!impl.isEmpty()) tx.addView(UiKit.caption(act, impl));
+            row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+            row.addView(UiKit.badge(act, I18n.tr(on ? "Enabled" : "Disabled"), on ? AppTheme.success() : AppTheme.textMuted()));
+            card.addView(row);
         }
     }
 
     private void showAddRoot() {
-        final LinearLayout body = dialogBody(I18n.tr("Add root folder"));
-        final EditText path = new EditText(act);
-        path.setHint("/path/to/tv");
-        path.setHintTextColor(AppTheme.textMuted());
-        path.setTextColor(AppTheme.text());
-        path.setSingleLine(true);
-        body.addView(path);
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("ADD", AppTheme.success(), v -> {
+        final Sheet s = new Sheet("Add root folder");
+        TextView hint = UiKit.body(act, I18n.tr("Sonarr stores each series in a folder inside this path."));
+        s.box.addView(hint);
+        final EditText path = field(s.box, "Folder path", "", true);
+        path.setHint("/storage/emulated/0/FishbowlMedia/TV");
+        path.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        Button cancel = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        final Button add = UiKit.primary(act, I18n.tr("Add"), null);
+        add.setOnClickListener(v -> {
             final String p = path.getText().toString().trim();
-            if (p.isEmpty()) return;
-            d.dismiss();
-            action(api -> { api.addRootFolder(p); return null; }, "Root folder added.", this::refresh);
-        }), weight());
-        body.addView(row);
-        d.show();
+            if (p.isEmpty()) {
+                toast("Enter a folder path.");
+                return;
+            }
+            setBusy(add, true);
+            async(io, api -> { api.addRootFolder(p); return null; }, r -> {
+                s.dismiss();
+                toast("Root folder added.");
+                refresh();
+            }, e -> {
+                setBusy(add, false);
+                toast(msg(e));
+            });
+        });
+        s.box.addView(UiKit.buttonRow(act, cancel, add));
+        s.show();
     }
 
-    // ================================================================== AUTO (periodic missing search)
+    // ================================================================== AUTO SEARCH
 
     private void renderAuto() {
-        requestCounter++;
-        listContainer.removeAllViews();
+        content.removeAllViews();
+        clearRefs();
 
-        LinearLayout card = new LinearLayout(act);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(12), dp(14), dp(12));
-        card.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 14));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(8);
-        card.setLayoutParams(lp);
-
-        LinearLayout top = new LinearLayout(act);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.addView(text(I18n.tr("Search missing episodes"), 13.5f, AppTheme.text(), true));
-        TextView h = text(I18n.tr("Ask Sonarr to search every monitored missing episode on a fixed interval."), 11f, AppTheme.textMuted(), false);
-        h.setPadding(0, dp(2), dp(8), 0);
-        tx.addView(h);
-        top.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Switch sw = new Switch(act);
-        sw.setChecked(AutomationPrefs.isSonarrMissingEnabled(act));
+        LinearLayout card = UiKit.card(act);
+        card.addView(UiKit.overline(act, I18n.tr("Missing episode search")));
+        final Switch sw = switchRow(card, "Search missing episodes automatically",
+                "Ask Sonarr to search every monitored missing episode on a fixed interval.",
+                AutomationPrefs.isSonarrMissingEnabled(act));
         sw.setOnCheckedChangeListener((v, checked) -> {
             AutomationPrefs.setSonarrMissingEnabled(act, checked);
-            toast(checked ? "Auto-search enabled." : "Auto-search disabled.");
+            toast(checked ? "Auto search on." : "Auto search off.");
         });
-        UiStyle.styleSwitch(act, sw);
-        top.addView(sw);
-        card.addView(top);
 
-        LinearLayout period = new LinearLayout(act);
-        period.setOrientation(LinearLayout.HORIZONTAL);
-        period.setGravity(Gravity.CENTER_VERTICAL);
-        period.setPadding(0, dp(8), 0, 0);
-        period.addView(text(I18n.tr("Search every (minutes)"), 12.5f, AppTheme.text(), false), new LinearLayout.LayoutParams(0, -2, 1.0f));
-        final EditText input = new EditText(act);
+        TextView l = UiKit.caption(act, I18n.tr("Interval (minutes)"));
+        l.setPadding(0, dp(14), 0, dp(6));
+        card.addView(l);
+        LinearLayout period = UiKit.row(act);
+        final EditText input = UiKit.input(act, String.valueOf(AutomationPrefs.DEFAULT_SONARR_MINUTES));
         input.setInputType(InputType.TYPE_CLASS_NUMBER);
         input.setText(String.valueOf(AutomationPrefs.getSonarrMissingMinutes(act)));
-        input.setTextColor(AppTheme.text());
-        input.setTextSize(13f);
-        input.setGravity(Gravity.CENTER);
-        input.setSingleLine(true);
-        period.addView(input, new LinearLayout.LayoutParams(dp(80), -2));
-        Button save = actionButton("SAVE", AppTheme.accent(), null);
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, dp(34));
+        period.addView(input, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        Button save = UiKit.outline(act, I18n.tr("Save"), null);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, dp(44));
         slp.setMarginStart(dp(8));
         period.addView(save, slp);
-        final Runnable dirty = UiStyle.bindDirty(save, input,
-                () -> String.valueOf(AutomationPrefs.getSonarrMissingMinutes(act)));
+        final Runnable dirty = UiStyle.bindDirty(save, input, () -> String.valueOf(AutomationPrefs.getSonarrMissingMinutes(act)));
         save.setOnClickListener(v -> {
             int val = AutomationPrefs.DEFAULT_SONARR_MINUTES;
-            try { val = Integer.parseInt(input.getText().toString().trim()); } catch (Throwable ignored) {}
+            try { val = Integer.parseInt(input.getText().toString().trim()); } catch (Throwable ignored) { }
             AutomationPrefs.setSonarrMissingMinutes(act, val);
             input.setText(String.valueOf(AutomationPrefs.getSonarrMissingMinutes(act)));
             dirty.run();
-            toast("Saved: every " + AutomationPrefs.getSonarrMissingMinutes(act) + " min");
+            toast(tf("Saved: every {0} min", AutomationPrefs.getSonarrMissingMinutes(act)));
         });
         card.addView(period);
-        listContainer.addView(card);
+        TextView range = UiKit.caption(act, tf("Between {0} and {1} minutes.", AutomationPrefs.MIN_SONARR_MINUTES, AutomationPrefs.MAX_SONARR_MINUTES));
+        range.setPadding(0, dp(6), 0, 0);
+        card.addView(range);
+        content.addView(card);
 
-        final TextView status = text("", 11f, AppTheme.textSecondary(), false);
-        status.setPadding(0, dp(10), 0, dp(6));
+        LinearLayout statusCard = UiKit.card(act);
+        statusCard.addView(UiKit.overline(act, I18n.tr("Last run")));
+        final TextView status = UiKit.body(act, "");
         long last = AutomationPrefs.getSonarrMissingLastRun(act);
         status.setText(last > 0
-                ? "Last run: " + new Date(last) + "\n" + AutomationPrefs.getSonarrMissingLastSummary(act)
-                : "Not run yet. Checked every 5 minutes while Sonarr is running.");
-        listContainer.addView(status);
+                ? fmtLocal(last) + "\n" + I18n.tr(AutomationPrefs.getSonarrMissingLastSummary(act))
+                : I18n.tr("Not run yet. Checked every 5 minutes while Sonarr is running."));
+        statusCard.addView(status);
+        final Button preview = UiKit.outline(act, I18n.tr("Preview"), null);
+        final Button now = UiKit.primary(act, I18n.tr("Search Now"), null);
+        preview.setOnClickListener(v -> runAuto(true, status, preview, now));
+        now.setOnClickListener(v -> runAuto(false, status, preview, now));
+        statusCard.addView(UiKit.buttonRow(act, preview, now));
+        content.addView(statusCard);
 
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.addView(actionButton("PREVIEW", AppTheme.accent(), v -> runAuto(true, status)), weight());
-        row.addView(actionButton("SEARCH NOW", AppTheme.success(), v -> runAuto(false, status)), weight());
-        listContainer.addView(row);
-
-        TextView note = text("Only monitored episodes are searched. Sonarr downloads whatever its indexers find, "
-                + "so keep Prowlarr and Transmission running. Very short intervals can get you rate-limited by indexers.",
-                10.5f, AppTheme.textMuted(), false);
-        note.setPadding(0, dp(12), 0, 0);
-        listContainer.addView(note);
+        TextView note = UiKit.caption(act, I18n.tr("Only monitored episodes are searched. Keep Prowlarr and Transmission running. Very short intervals can get you rate-limited by indexers."));
+        note.setPadding(dp(4), 0, dp(4), 0);
+        content.addView(note);
     }
 
-    private void runAuto(final boolean dryRun, final TextView status) {
-        status.setText(dryRun ? "Checking..." : "Searching...");
-        bg.execute(() -> {
-            final String out = com.fishbowl.app.services.SonarrMissingSearch.run(act, dryRun);
-            act.runOnUiThread(() -> {
-                status.setText(out);
-                if (!dryRun) refresh();
+    private void runAuto(final boolean dryRun, final TextView status, final Button a, final Button b) {
+        status.setText(I18n.tr(dryRun ? "Checking…" : "Searching…"));
+        setBusy(a, true);
+        setBusy(b, true);
+        try {
+            slow.execute(() -> {
+                String out;
+                try {
+                    out = com.fishbowl.app.services.SonarrMissingSearch.run(act, dryRun);
+                } catch (Throwable t) {
+                    out = "Failed: " + msg(t);
+                }
+                final String res = out;
+                act.runOnUiThread(() -> {
+                    if (dead()) return;
+                    setBusy(a, false);
+                    setBusy(b, false);
+                    status.setText(I18n.tr(res));
+                });
             });
-        });
+        } catch (RejectedExecutionException ignored) {
+            setBusy(a, false);
+            setBusy(b, false);
+        }
     }
 
     // ================================================================== dialogs & small UI helpers
 
-    private LinearLayout dialogBody(String title) {
-        LinearLayout body = new LinearLayout(act);
-        body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(dp(18), dp(16), dp(18), dp(14));
-        TextView t = text(title, 15f, AppTheme.text(), true);
-        t.setPadding(0, 0, 0, dp(6));
-        body.addView(t);
-        return body;
+    /** Themed dialog with a title and a vertical body; add views to {@link #box}. */
+    private final class Sheet {
+        final LinearLayout box;
+        final AlertDialog dialog;
+
+        Sheet(String title) {
+            box = UiKit.column(act);
+            box.setPadding(dp(20), dp(18), dp(20), dp(16));
+            if (title != null) {
+                TextView t = UiKit.title(act, I18n.tr(title));
+                t.setMaxLines(3);
+                t.setEllipsize(TextUtils.TruncateAt.END);
+                t.setPadding(0, 0, 0, dp(10));
+                box.addView(t);
+            }
+            ScrollView sv = new ScrollView(act);
+            sv.addView(box, new ViewGroup.LayoutParams(-1, -2));
+            dialog = new AlertDialog.Builder(act).setView(I18n.attach(sv)).create();
+            if (dialog.getWindow() != null) {
+                dialog.getWindow().setBackgroundDrawable(UiKit.shape(act, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
+            }
+        }
+
+        void show() {
+            if (dead()) return;
+            try { dialog.show(); } catch (Throwable ignored) { }
+        }
+
+        void dismiss() {
+            try { dialog.dismiss(); } catch (Throwable ignored) { }
+        }
     }
 
-    private Dialog dialog(View content) {
-        ScrollView wrap = null;
-        AlertDialog d = new AlertDialog.Builder(act).setView(content).create();
-        if (d.getWindow() != null) d.getWindow().setBackgroundDrawable(rounded(AppTheme.card(), AppTheme.outline(), 16));
+    private void confirm(String title, String message, String positive, boolean destructive, final Runnable onYes) {
+        final Sheet s = new Sheet(title);
+        s.box.addView(UiKit.body(act, I18n.tr(message)));
+        Button no = UiKit.outline(act, I18n.tr("Cancel"), v -> s.dismiss());
+        View.OnClickListener yesL = v -> {
+            s.dismiss();
+            onYes.run();
+        };
+        Button yes = destructive ? UiKit.danger(act, I18n.tr(positive), yesL) : UiKit.primary(act, I18n.tr(positive), yesL);
+        s.box.addView(UiKit.buttonRow(act, no, yes));
+        s.show();
+    }
+
+    private void choose(String title, String[] items, int selected, final IntDone cb) {
+        final Sheet s = new Sheet(title);
+        for (int i = 0; i < items.length; i++) {
+            final int idx = i;
+            boolean sel = i == selected;
+            TextView row = UiKit.text(act, (sel ? "✓  " : "") + I18n.tr(items[i]), 14f,
+                    sel ? AppTheme.accent() : AppTheme.text(), sel ? UiKit.BOLD : UiKit.MEDIUM);
+            row.setPadding(dp(12), dp(12), dp(12), dp(12));
+            row.setBackground(UiKit.rowRipple(act));
+            row.setClickable(true);
+            row.setFocusable(true);
+            row.setOnClickListener(v -> {
+                s.dismiss();
+                cb.run(idx);
+            });
+            s.box.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        }
+        s.show();
+    }
+
+    private EditText field(LinearLayout parent, String label, String value, boolean mono) {
+        TextView l = UiKit.caption(act, I18n.tr(label));
+        l.setPadding(0, dp(12), 0, dp(6));
+        parent.addView(l);
+        EditText e = UiKit.input(act, "");
+        e.setText(value == null ? "" : value);
+        if (mono) e.setTypeface(Typeface.MONOSPACE);
+        parent.addView(e, new LinearLayout.LayoutParams(-1, -2));
+        return e;
+    }
+
+    private Switch switchRow(LinearLayout parent, String label, String hint, boolean checked) {
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(0, dp(12), 0, 0);
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(UiKit.text(act, I18n.tr(label), 14f, AppTheme.text(), null));
+        if (hint != null) {
+            TextView h = UiKit.caption(act, I18n.tr(hint));
+            h.setPadding(0, dp(2), 0, 0);
+            tx.addView(h);
+        }
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginEnd(dp(12));
+        row.addView(tx, tlp);
+        Switch sw = new Switch(act);
+        sw.setChecked(checked);
+        UiStyle.styleSwitch(act, sw);
+        row.addView(sw);
+        parent.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        return sw;
+    }
+
+    private View kv(String key, String value) {
+        return UiKit.kv(act, I18n.tr(key), value == null || value.isEmpty() ? "—" : value);
+    }
+
+    private View kvMono(String key, String value) {
+        View r = kv(key, value);
+        if (r instanceof ViewGroup && ((ViewGroup) r).getChildCount() > 1 && ((ViewGroup) r).getChildAt(1) instanceof TextView) {
+            TextView v = (TextView) ((ViewGroup) r).getChildAt(1);
+            v.setTypeface(Typeface.MONOSPACE);
+            v.setTextSize(12f);
+            v.setTextIsSelectable(true);
+        }
+        return r;
+    }
+
+    private View listDivider() {
+        View d = UiKit.divider(act);
+        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) d.getLayoutParams();
+        lp.topMargin = 0;
+        lp.bottomMargin = 0;
+        lp.setMarginStart(dp(12));
+        lp.setMarginEnd(dp(12));
+        d.setLayoutParams(lp);
         return d;
     }
 
-    private LinearLayout buttonRow() {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, dp(12), 0, 0);
-        return row;
+    private Button compact(Button b) {
+        b.setTextSize(12.5f);
+        b.setMinHeight(dp(32));
+        b.setMinimumHeight(dp(32));
+        b.setPadding(dp(12), 0, dp(12), 0);
+        return b;
     }
 
-    private void confirm(String message, String positive, int color, final Runnable onYes) {
-        final LinearLayout body = dialogBody(I18n.tr("Confirm"));
-        body.addView(text(message, 12.5f, AppTheme.textSecondary(), false));
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton(positive, color, v -> { d.dismiss(); onYes.run(); }), weight());
-        body.addView(row);
-        d.show();
+    /** Updates a {@link UiKit#progress} bar in place; returns the colour now applied. */
+    private int updateProgress(View track, double percent, int color, int currentColor) {
+        if (!(track instanceof LinearLayout)) return currentColor;
+        LinearLayout l = (LinearLayout) track;
+        if (l.getChildCount() < 2) return currentColor;
+        View fill = l.getChildAt(0);
+        View rest = l.getChildAt(1);
+        if (!(fill.getLayoutParams() instanceof LinearLayout.LayoutParams)
+                || !(rest.getLayoutParams() instanceof LinearLayout.LayoutParams)) return currentColor;
+        float p = (float) Math.max(0, Math.min(100, percent));
+        LinearLayout.LayoutParams a = (LinearLayout.LayoutParams) fill.getLayoutParams();
+        LinearLayout.LayoutParams b = (LinearLayout.LayoutParams) rest.getLayoutParams();
+        float wa = Math.max(p, 0.001f);
+        float wb = Math.max(100f - p, 0.001f);
+        if (Math.abs(a.weight - wa) > 0.01f || Math.abs(b.weight - wb) > 0.01f) {
+            a.weight = wa;
+            b.weight = wb;
+            fill.setLayoutParams(a);
+            rest.setLayoutParams(b);
+        }
+        if (color != currentColor) fill.setBackground(UiKit.shape(act, color, 0, UiKit.R_PILL));
+        return color;
     }
 
+    private TextView findSubtitle(LinearLayout header) {
+        View col = header.getChildCount() > 0 ? header.getChildAt(0) : null;
+        if (col instanceof LinearLayout) {
+            LinearLayout c = (LinearLayout) col;
+            if (c.getChildCount() > 1 && c.getChildAt(1) instanceof TextView) return (TextView) c.getChildAt(1);
+            TextView t = UiKit.caption(act, "");
+            c.addView(t);
+            return t;
+        }
+        return UiKit.caption(act, "");
+    }
+
+    /** Poster with a rounded placeholder; decoded off the UI thread into a bounded LruCache. */
     private ImageView poster(JSONObject series, int wDp, int hDp) {
         final ImageView iv = new ImageView(act);
         iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        iv.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 6));
+        iv.setBackground(UiKit.shape(act, AppTheme.inner(), 0, 8));
         iv.setClipToOutline(true);
         String url = null;
         JSONArray imgs = series.optJSONArray("images");
         for (int i = 0; imgs != null && i < imgs.length(); i++) {
             JSONObject im = imgs.optJSONObject(i);
-            if (im == null || !"poster".equals(im.optString("coverType"))) continue;
+            if (im == null || !"poster".equals(im.optString("coverType", ""))) continue;
             String local = im.optString("url", "");
             String remote = im.optString("remoteUrl", "");
             url = series.optInt("id") > 0 && !local.isEmpty() ? local : (!remote.isEmpty() ? remote : local);
             break;
         }
         if (url == null || url.isEmpty()) return iv;
+        final int maxPx = dp(wDp) * 3 / 2;
+        final String key = (maxPx <= 400 ? "s:" : "l:") + url;
         final String u = url;
-        Bitmap cached = imgCache.get(u);
-        if (cached != null) { iv.setImageBitmap(cached); return iv; }
-        iv.setTag(u);
-        imgPool.execute(() -> {
-            try {
-                SonarrApi api = SonarrApi.get(act);
-                final Bitmap bmp = api.loadImage(u, 300);
-                if (bmp == null) return;
-                imgCache.put(u, bmp);
-                act.runOnUiThread(() -> { if (u.equals(iv.getTag())) iv.setImageBitmap(bmp); });
-            } catch (Throwable ignored) {}
-        });
+        iv.setTag(key);
+        Bitmap cached = imgCache.get(key);
+        if (cached != null) {
+            iv.setImageBitmap(cached);
+            return iv;
+        }
+        if (imgFailed.contains(key)) return iv;
+        List<ImageView> waiting = imgPending.get(key);
+        if (waiting != null) {
+            waiting.add(iv);
+            return iv;
+        }
+        waiting = new ArrayList<>();
+        waiting.add(iv);
+        imgPending.put(key, waiting);
+        try {
+            imgPool.execute(() -> {
+                Bitmap bmp = null;
+                try {
+                    bmp = SonarrApi.get(act).loadImage(u, maxPx);
+                } catch (Throwable ignored) {
+                    // placeholder stays
+                }
+                final Bitmap b = bmp;
+                act.runOnUiThread(() -> {
+                    List<ImageView> ws = imgPending.remove(key);
+                    if (b == null) {
+                        imgFailed.add(key);
+                        return;
+                    }
+                    imgCache.put(key, b);
+                    if (ws == null || dead()) return;
+                    for (ImageView v : ws) if (key.equals(v.getTag())) v.setImageBitmap(b);
+                });
+            });
+        } catch (RejectedExecutionException e) {
+            imgPending.remove(key);
+        }
         return iv;
     }
 
-    private void showMessage(String m) {
-        listContainer.removeAllViews();
-        TextView t = text(I18n.tr(m), 12f, AppTheme.textSecondary(), false);
-        t.setPadding(0, dp(16), 0, 0);
-        listContainer.addView(t);
+    private static void appendDot(StringBuilder sb, String part) {
+        if (part == null || part.trim().isEmpty()) return;
+        if (sb.length() > 0) sb.append(" · ");
+        sb.append(part);
     }
 
-    private void showError(Throwable err) {
-        listContainer.removeAllViews();
-        TextView t = text(msg(err), 12f, AppTheme.danger(), false);
-        t.setPadding(0, dp(16), 0, dp(8));
-        listContainer.addView(t);
-        listContainer.addView(actionButton("RETRY", AppTheme.accent(), v -> refresh()), new LinearLayout.LayoutParams(-1, dp(40)));
+    private static void setText(TextView v, CharSequence s) {
+        if (v == null) return;
+        String n = s == null ? "" : s.toString();
+        if (!n.contentEquals(v.getText())) v.setText(n);
     }
 
-    private LinearLayout.LayoutParams weight() {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(34), 1.0f);
-        lp.setMarginEnd(dp(6));
-        return lp;
+    private static String tf(String template, Object... args) {
+        String s = I18n.tr(template);
+        for (int i = 0; i < args.length; i++) s = s.replace("{" + i + "}", String.valueOf(args[i]));
+        return s;
     }
 
-    private LinearLayout.LayoutParams lpTop(int h, int topPx) {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, h);
-        lp.topMargin = topPx;
-        return lp;
+    private int dp(float v) {
+        return UiKit.dp(act, v);
     }
 
-    private TextView pill(String label, boolean selected) {
-        TextView t = text(I18n.tr(label), 10f, selected ? AppTheme.onAccent() : AppTheme.textSecondary(), true);
-        t.setGravity(Gravity.CENTER);
-        t.setSingleLine(true);
-        t.setPadding(dp(14), 0, dp(14), 0);
-        t.setBackground(rounded(selected ? AppTheme.accent() : AppTheme.card(), AppTheme.outline(), 17));
-        t.setClickable(true);
-        return t;
+    // ================================================================== formatting
+
+    /** Parses Sonarr's UTC timestamps ("2026-11-24T21:00:00Z", optional fraction); 0 when absent. */
+    private static long parseUtc(String iso) {
+        if (iso == null || iso.length() < 19) return 0L;
+        try {
+            SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
+            f.setTimeZone(TimeZone.getTimeZone("UTC"));
+            Date d = f.parse(iso.substring(0, 19));
+            return d == null ? 0L : d.getTime();
+        } catch (Throwable t) {
+            return 0L;
+        }
     }
 
-    private Button actionButton(String label, int c, View.OnClickListener l) {
-        Button b = new Button(act);
-        b.setText(I18n.tr(label));
-        b.setAllCaps(false);
-        b.setTextSize(10.5f);
-        b.setMinHeight(0);
-        b.setMinimumHeight(0);
-        b.setTypeface(Typeface.DEFAULT_BOLD);
-        b.setTextColor(c);
-        b.setBackground(rounded(Color.argb(25, Color.red(c), Color.green(c), Color.blue(c)),
-                Color.argb(80, Color.red(c), Color.green(c), Color.blue(c)), 8));
-        if (l != null) b.setOnClickListener(l);
-        return b;
+    private static String fmtLocal(long ms) {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date(ms));
     }
 
-    private TextView text(String s, float size, int color, boolean bold) {
-        TextView t = new TextView(act);
-        t.setText(s);
-        t.setTextSize(size);
-        t.setTextColor(color);
-        if (bold) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        return t;
+    private static String fmtLocalDate(long ms) {
+        return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date(ms));
     }
 
-    private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(fill);
-        g.setStroke(dp(1), stroke);
-        g.setCornerRadius(dp(radiusDp));
-        return g;
-    }
-
-    private int dp(int v) {
-        return Math.round(v * act.getResources().getDisplayMetrics().density);
-    }
-
-    private static String today() {
-        return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+    private static String fmtLocalTime(long ms) {
+        return new SimpleDateFormat("HH:mm", Locale.US).format(new Date(ms));
     }
 
     private static String capitalize(String s) {
@@ -1590,14 +2468,19 @@ public final class SonarrTabView {
 
     private static String fmtSize(long bytes) {
         if (bytes <= 0) return "0 B";
-        double gb = bytes / 1073741824.0;
-        if (gb >= 1) return String.format(Locale.US, "%.1f GB", gb);
-        double mb = bytes / 1048576.0;
-        if (mb >= 1) return String.format(Locale.US, "%.0f MB", mb);
-        return String.format(Locale.US, "%.0f KB", bytes / 1024.0);
+        if (bytes < 1024) return bytes + " B";
+        double v = bytes / 1024.0;
+        String[] u = {"KB", "MB", "GB", "TB"};
+        int i = 0;
+        while (v >= 1024 && i < u.length - 1) {
+            v /= 1024;
+            i++;
+        }
+        return String.format(Locale.US, v >= 100 ? "%.0f %s" : "%.1f %s", v, u[i]);
     }
 
     private static String fmtAge(double minutes) {
+        if (minutes < 0 || Double.isNaN(minutes)) return "";
         if (minutes < 60) return (int) minutes + "m";
         if (minutes < 2880) return (int) (minutes / 60) + "h";
         return (int) (minutes / 1440) + "d";

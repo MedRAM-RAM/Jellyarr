@@ -7,24 +7,77 @@ import android.graphics.BitmapFactory;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
 
 /**
- * Thin client for the local Sonarr v3/v4 REST API (http://127.0.0.1:8989/api/v3) used by the Sonarr tab.
- * Every method blocks: call it from a background thread.
+ * Thin client for the local Sonarr REST API (http://127.0.0.1:8989/api/v3; the v3 API is also what
+ * Sonarr v4 serves). Every method blocks: call it from a background thread.
+ *
+ * Errors are {@link ApiException}s with readable messages: "not running" for a refused connection,
+ * and the server's own validation {@code errorMessage} / {@code message} for 4xx answers.
  */
 public final class SonarrApi {
 
     private static final String HOST = "http://127.0.0.1:8989";
     private static final String BASE = HOST + "/api/v3";
+    private static final int MAX_BODY_BYTES = 48 * 1024 * 1024;
+    private static final int MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+    private static final long KEY_TTL_MS = 60_000L;
+
+    public static final String NOT_RUNNING =
+            "Sonarr is not running (cannot reach 127.0.0.1:8989). Start it from the Services tab, then retry.";
+    public static final String NO_KEY = "Sonarr API key not found. Start Sonarr once so it creates its config.";
+
+    /** Readable failure with a coarse kind so the screen can show a "not running" state. */
+    public static final class ApiException extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        public static final int OTHER = 0;
+        public static final int NOT_RUNNING = 1;
+        public static final int AUTH = 2;
+        public static final int TIMEOUT = 3;
+        public static final int NO_KEY = 4;
+
+        public final int kind;
+        public final int httpCode;
+
+        public ApiException(int kind, int httpCode, String message) {
+            super(message);
+            this.kind = kind;
+            this.httpCode = httpCode;
+        }
+    }
+
+    public static boolean isNotRunning(Throwable t) {
+        return t instanceof ApiException && ((ApiException) t).kind == ApiException.NOT_RUNNING;
+    }
+
+    public static boolean isNoKey(Throwable t) {
+        return t instanceof ApiException && ((ApiException) t).kind == ApiException.NO_KEY;
+    }
+
+    public static boolean isAuthError(Throwable t) {
+        return t instanceof ApiException && ((ApiException) t).kind == ApiException.AUTH;
+    }
+
+    private static volatile String cachedKey = null;
+    private static volatile long cachedKeyAt = 0L;
 
     private final String key;
 
@@ -34,9 +87,18 @@ public final class SonarrApi {
 
     /** Returns a client, or throws a readable error when Sonarr has no API key yet. */
     public static SonarrApi get(Context ctx) throws Exception {
-        MediaServiceManager mgr = MediaServiceManager.getInstance(ctx.getApplicationContext());
-        String k = mgr == null ? null : mgr.getServiceApiKey("sonarr");
-        if (k == null || k.isEmpty()) throw new Exception("Sonarr API key not found. Start Sonarr once first.");
+        String k = cachedKey;
+        if (k == null || System.currentTimeMillis() - cachedKeyAt > KEY_TTL_MS) {
+            MediaServiceManager mgr = MediaServiceManager.getInstance(ctx.getApplicationContext());
+            k = mgr == null ? null : mgr.getServiceApiKey("sonarr");
+            if (k == null || k.trim().isEmpty()) {
+                cachedKey = null;
+                throw new ApiException(ApiException.NO_KEY, 0, NO_KEY);
+            }
+            k = k.trim();
+            cachedKey = k;
+            cachedKeyAt = System.currentTimeMillis();
+        }
         return new SonarrApi(k);
     }
 
@@ -48,87 +110,194 @@ public final class SonarrApi {
         }
     }
 
+    /** ISO-8601 UTC instant (what Sonarr's own UI sends for calendar ranges). */
+    public static String isoUtc(long epochMs) {
+        SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return f.format(new Date(epochMs));
+    }
+
     // ------------------------------------------------------------------ transport
 
     private String call(String method, String path, String body, int timeoutMs) throws Exception {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(BASE + path).openConnection();
-            conn.setConnectTimeout(8000);
+            conn.setConnectTimeout(6000);
             conn.setReadTimeout(timeoutMs);
+            conn.setUseCaches(false);
             conn.setRequestMethod(method);
             conn.setRequestProperty("X-Api-Key", key);
+            conn.setRequestProperty("Accept", "application/json");
             if (body != null) {
-                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                 conn.setDoOutput(true);
                 OutputStream os = conn.getOutputStream();
-                os.write(body.getBytes(StandardCharsets.UTF_8));
-                os.close();
+                try {
+                    os.write(body.getBytes(StandardCharsets.UTF_8));
+                } finally {
+                    os.close();
+                }
             }
             int code = conn.getResponseCode();
             InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            StringBuilder sb = new StringBuilder();
-            if (is != null) {
-                BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
-                String line;
-                while ((line = br.readLine()) != null) sb.append(line);
-                br.close();
+            String text = readAll(is, MAX_BODY_BYTES);
+            if (code == 401) {
+                cachedKey = null;
+                throw new ApiException(ApiException.AUTH, code,
+                        "Sonarr rejected the API key (HTTP 401). Restart Sonarr from the Services tab, then retry.");
             }
-            if (code >= 400) {
-                String detail = sb.toString();
-                String msg = "Sonarr returned HTTP " + code;
-                try {
-                    if (detail.startsWith("[")) {
-                        JSONArray a = new JSONArray(detail);
-                        if (a.length() > 0) msg += ": " + a.getJSONObject(0).optString("errorMessage", "");
-                    } else if (detail.startsWith("{")) {
-                        JSONObject o = new JSONObject(detail);
-                        String m = o.optString("message", o.optString("errorMessage", ""));
-                        if (!m.isEmpty()) msg += ": " + m;
-                    }
-                } catch (Throwable ignored) {}
-                throw new Exception(msg);
+            if (code >= 400) throw new ApiException(ApiException.OTHER, code, errorMessage(code, text));
+            return text;
+        } catch (ConnectException | NoRouteToHostException e) {
+            throw new ApiException(ApiException.NOT_RUNNING, 0, NOT_RUNNING);
+        } catch (SocketTimeoutException e) {
+            throw new ApiException(ApiException.TIMEOUT, 0, "Sonarr did not answer in time. It may be busy; try again shortly.");
+        } catch (ApiException e) {
+            throw e;
+        } catch (IOException e) {
+            String m = String.valueOf(e.getMessage());
+            if (m.contains("ECONNREFUSED") || m.contains("Failed to connect") || m.contains("Connection refused")) {
+                throw new ApiException(ApiException.NOT_RUNNING, 0, NOT_RUNNING);
             }
-            return sb.toString();
+            throw new ApiException(ApiException.OTHER, 0, "Sonarr connection failed: " + m);
         } finally {
             if (conn != null) conn.disconnect();
         }
     }
 
-    private JSONArray arr(String path) throws Exception {
-        String r = call("GET", path, null, 25000);
-        return r.isEmpty() ? new JSONArray() : new JSONArray(r);
-    }
-
-    private JSONObject obj(String path) throws Exception {
-        String r = call("GET", path, null, 25000);
-        return r.isEmpty() ? new JSONObject() : new JSONObject(r);
-    }
-
-    /** Downloads a cover image (local MediaCover path or a remote URL). Returns null on failure. */
-    public Bitmap loadImage(String url, int maxWidthPx) {
-        HttpURLConnection conn = null;
+    /** Builds a readable message from Sonarr's error body (validation array or {message, description}). */
+    private static String errorMessage(int code, String detail) {
+        String base = "Sonarr returned HTTP " + code;
+        String d = detail == null ? "" : detail.trim();
         try {
-            String full = url.startsWith("http") ? url : HOST + (url.startsWith("/") ? "" : "/") + url;
-            conn = (HttpURLConnection) new URL(full).openConnection();
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(20000);
-            if (full.startsWith(HOST)) conn.setRequestProperty("X-Api-Key", key);
-            if (conn.getResponseCode() >= 400) return null;
-            InputStream is = conn.getInputStream();
+            if (d.startsWith("[")) {
+                JSONArray a = new JSONArray(d);
+                List<String> msgs = new ArrayList<>();
+                for (int i = 0; i < a.length() && msgs.size() < 3; i++) {
+                    JSONObject o = a.optJSONObject(i);
+                    if (o == null) continue;
+                    String m = o.optString("errorMessage", "").trim();
+                    if (!m.isEmpty() && !msgs.contains(m)) msgs.add(m);
+                }
+                if (!msgs.isEmpty()) return join(msgs, "\n");
+            } else if (d.startsWith("{")) {
+                JSONObject o = new JSONObject(d);
+                String m = o.optString("message", "").trim();
+                if (m.isEmpty()) m = o.optString("errorMessage", "").trim();
+                if (m.isEmpty()) m = o.optString("title", "").trim();
+                String desc = o.optString("description", "").trim();
+                if (!m.isEmpty() && !desc.isEmpty() && !desc.equals(m) && desc.length() < 300) m = m + " (" + desc + ")";
+                if (!m.isEmpty()) return m;
+            }
+        } catch (Throwable ignored) {
+            // fall through to the generic message
+        }
+        if (code == 404) return base + ": not found.";
+        if (code >= 500) return base + ": internal error. Check Sonarr's logs.";
+        return base + ".";
+    }
+
+    private static String join(List<String> parts, String sep) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : parts) {
+            if (sb.length() > 0) sb.append(sep);
+            sb.append(p);
+        }
+        return sb.toString();
+    }
+
+    private static String readAll(InputStream is, int max) throws Exception {
+        if (is == null) return "";
+        try {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             byte[] buf = new byte[8192];
             int n;
-            while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
-            is.close();
-            byte[] data = bos.toByteArray();
+            while ((n = is.read(buf)) != -1) {
+                bos.write(buf, 0, n);
+                if (bos.size() > max) throw new ApiException(ApiException.OTHER, 0, "Sonarr response is too large.");
+            }
+            return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        } finally {
+            try { is.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private JSONArray arr(String path) throws Exception {
+        return arr(path, 30000);
+    }
+
+    private JSONArray arr(String path, int timeoutMs) throws Exception {
+        String r = call("GET", path, null, timeoutMs).trim();
+        if (r.isEmpty()) return new JSONArray();
+        try {
+            return new JSONArray(r);
+        } catch (org.json.JSONException e) {
+            throw new ApiException(ApiException.OTHER, 0, "Sonarr sent an unexpected response.");
+        }
+    }
+
+    private JSONObject obj(String path) throws Exception {
+        String r = call("GET", path, null, 30000).trim();
+        if (r.isEmpty()) return new JSONObject();
+        try {
+            return new JSONObject(r);
+        } catch (org.json.JSONException e) {
+            throw new ApiException(ApiException.OTHER, 0, "Sonarr sent an unexpected response.");
+        }
+    }
+
+    // ------------------------------------------------------------------ images
+
+    /**
+     * Downloads and decodes a cover image (local MediaCover path or a remote URL). For local posters the
+     * small "-250" variant Sonarr generates is tried first. Returns null on failure.
+     */
+    public Bitmap loadImage(String url, int maxWidthPx) {
+        if (url == null || url.isEmpty()) return null;
+        String full = url.startsWith("http") ? url : HOST + (url.startsWith("/") ? "" : "/") + url;
+        if (full.startsWith(HOST) && maxWidthPx <= 400) {
+            String small = full.replaceFirst("/poster\\.jpg", "/poster-250.jpg");
+            if (!small.equals(full)) {
+                Bitmap b = fetchBitmap(small, maxWidthPx);
+                if (b != null) return b;
+            }
+        }
+        return fetchBitmap(full, maxWidthPx);
+    }
+
+    private Bitmap fetchBitmap(String full, int maxWidthPx) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(full).openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(20000);
+            conn.setInstanceFollowRedirects(true);
+            if (full.startsWith(HOST)) conn.setRequestProperty("X-Api-Key", key);
+            if (conn.getResponseCode() >= 400) return null;
+            byte[] data;
+            InputStream is = conn.getInputStream();
+            try {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = is.read(buf)) != -1) {
+                    bos.write(buf, 0, n);
+                    if (bos.size() > MAX_IMAGE_BYTES) return null;
+                }
+                data = bos.toByteArray();
+            } finally {
+                try { is.close(); } catch (Exception ignored) {}
+            }
             BitmapFactory.Options o = new BitmapFactory.Options();
             o.inJustDecodeBounds = true;
             BitmapFactory.decodeByteArray(data, 0, data.length, o);
+            if (o.outWidth <= 0 || o.outHeight <= 0) return null;
             int sample = 1;
-            while (o.outWidth / (sample * 2) >= maxWidthPx) sample *= 2;
+            while (o.outWidth / (sample * 2) >= Math.max(1, maxWidthPx)) sample *= 2;
             BitmapFactory.Options o2 = new BitmapFactory.Options();
             o2.inSampleSize = sample;
+            o2.inPreferredConfig = Bitmap.Config.RGB_565;
             return BitmapFactory.decodeByteArray(data, 0, data.length, o2);
         } catch (Throwable t) {
             return null;
@@ -139,21 +308,25 @@ public final class SonarrApi {
 
     // ------------------------------------------------------------------ series
 
-    public JSONArray series() throws Exception { return arr("/series"); }
+    public JSONArray series() throws Exception { return arr("/series", 60000); }
 
     public JSONObject series(int id) throws Exception { return obj("/series/" + id); }
 
-    public JSONArray lookup(String term) throws Exception { return arr("/series/lookup?term=" + enc(term)); }
+    public JSONArray lookup(String term) throws Exception { return arr("/series/lookup?term=" + enc(term), 60000); }
 
+    /** PUT /series/{id}: monitored flags and season monitoring (Sonarr updates the season's episodes too). */
     public void putSeries(JSONObject series) throws Exception {
         call("PUT", "/series/" + series.getInt("id"), series.toString(), 30000);
     }
 
     public void deleteSeries(int id, boolean deleteFiles) throws Exception {
-        call("DELETE", "/series/" + id + "?deleteFiles=" + deleteFiles + "&addImportListExclusion=false", null, 60000);
+        call("DELETE", "/series/" + id + "?deleteFiles=" + deleteFiles + "&addImportListExclusion=false", null, 120000);
     }
 
-    /** Adds a series from a lookup result. monitor: all, future, missing, existing, firstSeason, lastSeason, none. */
+    /**
+     * POST /series from a lookup result. monitor (MonitorTypes): all, future, missing, existing, pilot,
+     * firstSeason, lastSeason, none.
+     */
     public void addSeries(JSONObject lookup, String rootFolder, int qualityProfileId, String monitor,
                           boolean seasonFolder, String seriesType, boolean searchMissing) throws Exception {
         JSONObject body = new JSONObject(lookup.toString());
@@ -163,16 +336,23 @@ public final class SonarrApi {
         body.put("monitored", !"none".equals(monitor));
         body.put("seasonFolder", seasonFolder);
         body.put("seriesType", seriesType);
-        try {
-            JSONArray lp = arr("/languageprofile");
-            if (lp.length() > 0) body.put("languageProfileId", lp.getJSONObject(0).optInt("id", 1));
-        } catch (Throwable ignored) {
-            // Sonarr v4 has no language profiles
+        if (!body.has("tags")) body.put("tags", new JSONArray());
+        if (!body.has("languageProfileId")) {
+            try {
+                // Sonarr v3 requires a language profile; v4 keeps a single deprecated one (or none).
+                JSONArray lp = arr("/languageprofile");
+                JSONObject first = lp.length() > 0 ? lp.optJSONObject(0) : null;
+                if (first != null) body.put("languageProfileId", first.optInt("id", 1));
+            } catch (Throwable ignored) {
+                // not available: v4
+            }
         }
         JSONObject opts = new JSONObject();
         opts.put("monitor", monitor);
         opts.put("searchForMissingEpisodes", searchMissing);
         opts.put("searchForCutoffUnmetEpisodes", false);
+        opts.put("ignoreEpisodesWithFiles", false);
+        opts.put("ignoreEpisodesWithoutFiles", false);
         body.put("addOptions", opts);
         call("POST", "/series", body.toString(), 60000);
     }
@@ -180,11 +360,17 @@ public final class SonarrApi {
     // ------------------------------------------------------------------ episodes
 
     public JSONArray episodes(int seriesId) throws Exception {
-        return arr("/episode?seriesId=" + seriesId + "&includeEpisodeFile=true");
+        return arr("/episode?seriesId=" + seriesId + "&includeEpisodeFile=true", 60000);
     }
 
-    public void putEpisode(JSONObject episode) throws Exception {
-        call("PUT", "/episode/" + episode.getInt("id"), episode.toString(), 20000);
+    /** PUT /episode/monitor {episodeIds, monitored} (EpisodesMonitoredResource). */
+    public void monitorEpisodes(int[] episodeIds, boolean monitored) throws Exception {
+        JSONObject b = new JSONObject();
+        JSONArray ids = new JSONArray();
+        for (int id : episodeIds) ids.put(id);
+        b.put("episodeIds", ids);
+        b.put("monitored", monitored);
+        call("PUT", "/episode/monitor", b.toString(), 20000);
     }
 
     public void deleteEpisodeFile(int episodeFileId) throws Exception {
@@ -207,8 +393,13 @@ public final class SonarrApi {
         command("{\"name\":\"EpisodeSearch\",\"episodeIds\":[" + episodeId + "]}");
     }
 
+    public void searchAllMissing() throws Exception {
+        command("{\"name\":\"MissingEpisodeSearch\",\"monitored\":true}");
+    }
+
+    /** v4 reads "seriesIds", v3 reads "seriesId"; each ignores the other, so one series is refreshed either way. */
     public void refreshSeries(int seriesId) throws Exception {
-        command("{\"name\":\"RefreshSeries\",\"seriesId\":" + seriesId + "}");
+        command("{\"name\":\"RefreshSeries\",\"seriesIds\":[" + seriesId + "],\"seriesId\":" + seriesId + "}");
     }
 
     public void rescanSeries(int seriesId) throws Exception {
@@ -216,50 +407,65 @@ public final class SonarrApi {
     }
 
     public void simpleCommand(String name) throws Exception {
-        command("{\"name\":\"" + name + "\"}");
+        JSONObject o = new JSONObject();
+        o.put("name", name);
+        command(o.toString());
     }
 
     // ------------------------------------------------------------------ releases (interactive search)
 
     public JSONArray releasesForEpisode(int episodeId) throws Exception {
-        String r = call("GET", "/release?episodeId=" + episodeId, null, 120000);
-        return r.isEmpty() ? new JSONArray() : new JSONArray(r);
+        return arr("/release?episodeId=" + episodeId, 180000);
     }
 
     public JSONArray releasesForSeason(int seriesId, int season) throws Exception {
-        String r = call("GET", "/release?seriesId=" + seriesId + "&seasonNumber=" + season, null, 120000);
-        return r.isEmpty() ? new JSONArray() : new JSONArray(r);
+        return arr("/release?seriesId=" + seriesId + "&seasonNumber=" + season, 180000);
     }
 
+    /**
+     * POST /release with the release's guid + indexerId (Sonarr finds the cached search result by them;
+     * the cache expires about 30 minutes after the search).
+     */
     public void grabRelease(JSONObject release) throws Exception {
         JSONObject b = new JSONObject();
         b.put("guid", release.optString("guid"));
         b.put("indexerId", release.optInt("indexerId"));
-        call("POST", "/release", b.toString(), 30000);
+        call("POST", "/release", b.toString(), 60000);
     }
 
     // ------------------------------------------------------------------ queue / history / calendar / wanted
 
+    /** Paging resource: {page, pageSize, totalRecords, records[]}. */
     public JSONObject queue(int page, int pageSize) throws Exception {
-        return obj("/queue?page=" + page + "&pageSize=" + pageSize + "&includeSeries=true&includeEpisode=true");
+        return obj("/queue?page=" + page + "&pageSize=" + pageSize
+                + "&includeUnknownSeriesItems=false&includeSeries=true&includeEpisode=true");
     }
 
-    public void removeQueueItem(int id, boolean removeFromClient, boolean blocklist) throws Exception {
-        call("DELETE", "/queue/" + id + "?removeFromClient=" + removeFromClient + "&blocklist=" + blocklist, null, 20000);
+    /**
+     * DELETE /queue/{id}. skipRedownload=false lets Sonarr search for a replacement after blocklisting
+     * (Sonarr v4; ignored by v3).
+     */
+    public void removeQueueItem(int id, boolean removeFromClient, boolean blocklist, boolean skipRedownload) throws Exception {
+        call("DELETE", "/queue/" + id + "?removeFromClient=" + removeFromClient + "&blocklist=" + blocklist
+                + "&skipRedownload=" + skipRedownload, null, 30000);
     }
 
+    /** Paging resource: {page, pageSize, totalRecords, records[]}. */
     public JSONObject history(int page, int pageSize) throws Exception {
         return obj("/history?page=" + page + "&pageSize=" + pageSize
                 + "&includeSeries=true&includeEpisode=true&sortKey=date&sortDirection=descending");
     }
 
-    public JSONArray calendar(String startDate, String endDate) throws Exception {
-        return arr("/calendar?start=" + startDate + "&end=" + endDate + "&includeSeries=true&unmonitored=false");
+    /** start / end are ISO-8601 UTC instants, see {@link #isoUtc(long)}. */
+    public JSONArray calendar(String startIsoUtc, String endIsoUtc) throws Exception {
+        return arr("/calendar?start=" + enc(startIsoUtc) + "&end=" + enc(endIsoUtc)
+                + "&unmonitored=false&includeSeries=true&includeEpisodeFile=false");
     }
 
+    /** Paging resource of monitored missing episodes, newest air date first. */
     public JSONObject wantedMissing(int page, int pageSize) throws Exception {
         return obj("/wanted/missing?page=" + page + "&pageSize=" + pageSize
-                + "&monitored=true&includeSeries=true&sortKey=airDateUtc&sortDirection=descending");
+                + "&monitored=true&includeSeries=true&sortKey=episodes.airDateUtc&sortDirection=descending");
     }
 
     // ------------------------------------------------------------------ system / settings
@@ -273,10 +479,10 @@ public final class SonarrApi {
     public JSONArray rootFolders() throws Exception { return arr("/rootfolder"); }
 
     public void addRootFolder(String path) throws Exception {
-        call("POST", "/rootfolder", new JSONObject().put("path", path).toString(), 20000);
+        call("POST", "/rootfolder", new JSONObject().put("path", path).toString(), 30000);
     }
 
-    public void deleteRootFolder(int id) throws Exception { call("DELETE", "/rootfolder/" + id, null, 20000); }
+    public void deleteRootFolder(int id) throws Exception { call("DELETE", "/rootfolder/" + id, null, 30000); }
 
     public JSONArray qualityProfiles() throws Exception { return arr("/qualityprofile"); }
 
@@ -286,9 +492,8 @@ public final class SonarrApi {
 
     public JSONArray tags() throws Exception { return arr("/tag"); }
 
+    /** kind: indexer | downloadclient */
     public String testAll(String kind) throws Exception {
-        // kind: indexer | downloadclient
-        String r = call("POST", "/" + kind + "/testall", null, 120000);
-        return r;
+        return call("POST", "/" + kind + "/testall", null, 120000);
     }
 }

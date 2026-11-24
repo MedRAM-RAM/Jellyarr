@@ -2,11 +2,13 @@ package com.fishbowl.app;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.Dialog;
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
-import android.graphics.Color;
-import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.InsetDrawable;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.text.Editable;
 import android.text.TextUtils;
 import android.text.TextWatcher;
@@ -17,120 +19,142 @@ import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.fishbowl.app.services.MediaServiceManager;
 import com.fishbowl.app.services.RadarrApi;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TimeZone;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * "Radarr" tab: a native client for Radarr's web UI, the movie twin of {@link SonarrTabView}.
  *
  * <ul>
- *   <li>MOVIES - browse / filter the library, open a movie (monitor, search, interactive search,
- *       refresh / rescan, delete file, delete movie).</li>
- *   <li>ADD - lookup a movie and add it with root folder, profile, availability, monitored, search.</li>
- *   <li>CALENDAR - cinema / digital / physical releases.</li>
- *   <li>QUEUE - live downloads with remove / blocklist.</li>
- *   <li>HISTORY - grabbed / imported / failed events.</li>
- *   <li>WANTED - monitored missing and cutoff unmet movies, search one or all.</li>
- *   <li>SYSTEM - status, health, disk space, root folders, profiles, indexers, clients, tasks.</li>
+ *   <li>Movies - search / filter the library, open a movie (monitor, search, interactive search,
+ *       refresh / rescan, delete file, delete movie); "Add movie" looks a title up on TMDb.</li>
+ *   <li>Calendar - cinema / digital / physical releases of monitored movies.</li>
+ *   <li>Queue - live downloads (polled while visible) with remove / blocklist.</li>
+ *   <li>History - grabbed / imported / failed events.</li>
+ *   <li>Wanted - monitored missing and cutoff unmet movies, search one or all.</li>
+ *   <li>System - status, health, disk space, root folders, profiles, indexers, clients, tasks.</li>
  * </ul>
  */
 public final class RadarrTabView {
 
     private static final int S_MOVIES = 0;
-    private static final int S_ADD = 1;
-    private static final int S_CALENDAR = 2;
-    private static final int S_QUEUE = 3;
-    private static final int S_HISTORY = 4;
-    private static final int S_WANTED = 5;
-    private static final int S_SYSTEM = 6;
+    private static final int S_CALENDAR = 1;
+    private static final int S_QUEUE = 2;
+    private static final int S_HISTORY = 3;
+    private static final int S_WANTED = 4;
+    private static final int S_SYSTEM = 5;
 
-    private static final String[] SECTION_NAMES = {"MOVIES", "ADD", "CALENDAR", "QUEUE", "HISTORY", "WANTED", "SYSTEM"};
-    private static final String[] FILTER_NAMES = {"ALL", "MONITORED", "MISSING", "DOWNLOADED"};
+    private static final String[] SECTION_NAMES = {"Movies", "Calendar", "Queue", "History", "Wanted", "System"};
+    private static final String[] FILTER_NAMES = {"All", "Monitored", "Missing", "Downloaded"};
+    private static final String[] AVAIL_LABELS = {"Announced", "In cinemas", "Released"};
+    private static final String[] AVAIL_VALUES = {"announced", "inCinemas", "released"};
     private static final int PAGE_SIZE = 40;
+    private static final int LIST_CHUNK = 60;
+    private static final long QUEUE_POLL_MS = 5000;
+    private static final String PREFS = "radarr_tab";
 
     private interface Job<T> { T run(RadarrApi api) throws Exception; }
     private interface Done<T> { void run(T value); }
 
     private final Activity act;
+    private final Handler main = new Handler(Looper.getMainLooper());
     private final LinearLayout root;
-    private final LinearLayout navRow;
-    private final LinearLayout listContainer;
+    private final LinearLayout headerSlot;
+    private final LinearLayout chipRow;
     private final ScrollView scroll;
-    private final ExecutorService bg = Executors.newFixedThreadPool(2);
+    private final LinearLayout content;
+    private final ExecutorService bg = Executors.newCachedThreadPool();
     private final ExecutorService imgPool = Executors.newFixedThreadPool(3);
-    private final LruCache<String, Bitmap> imgCache = new LruCache<>(60);
+    private final Map<String, List<ImageView>> imgWaiting = new HashMap<>();
+    private static LruCache<String, Bitmap> posterCache;
 
     private int section = S_MOVIES;
     private int page = 1;
     private int detailMovieId = 0;
     private int requestCounter = 0;
     private int filterMode = 0;
+    private int movieLimit = LIST_CHUNK;
     private boolean wantedCutoff = false;
     private String movieFilter = "";
     private JSONArray movieCache = null;
+    private String version = null;
+    private boolean versionLoading = false;
+    private boolean attached = true;
+    private boolean starting = false;
+    private boolean monitorBusy = false;
+    private boolean queueOfflineShown = false;
+    private long lastOpenMs = 0;
+
+    private LinearLayout movieRowsBox;
+    private TextView movieCountView;
 
     private final Runnable queueTicker = new Runnable() {
         @Override public void run() {
-            if (section == S_QUEUE && detailMovieId == 0 && root.isShown()) {
-                loadQueue(true);
-                root.postDelayed(this, 6000);
-            }
+            if (section == S_QUEUE && detailMovieId == 0 && attached && root.isShown() && !dead()) loadQueue(true);
         }
+    };
+
+    private final Runnable filterTicker = new Runnable() {
+        @Override public void run() { fillMovieRows(); }
     };
 
     public RadarrTabView(Activity activity) {
         this.act = activity;
 
-        root = new LinearLayout(act);
-        root.setOrientation(LinearLayout.VERTICAL);
+        root = UiKit.column(act);
         root.setBackgroundColor(AppTheme.bg());
 
-        LinearLayout header = new LinearLayout(act);
-        header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(dp(16), dp(12), dp(16), dp(4));
-        TextView title = text("RADARR", 14f, AppTheme.text(), true);
-        title.setLetterSpacing(0.14f);
-        header.addView(title);
-        TextView sub = text(I18n.tr("Manage your movie library from here"), 11f, AppTheme.textMuted(), false);
-        sub.setPadding(0, dp(2), 0, dp(6));
-        header.addView(sub);
-        root.addView(header);
+        headerSlot = UiKit.column(act);
+        headerSlot.setPadding(dp(16), dp(12), dp(16), 0);
+        root.addView(headerSlot, new LinearLayout.LayoutParams(-1, -2));
 
-        HorizontalScrollView navScroll = new HorizontalScrollView(act);
-        navScroll.setHorizontalScrollBarEnabled(false);
-        navRow = new LinearLayout(act);
-        navRow.setOrientation(LinearLayout.HORIZONTAL);
-        navRow.setPadding(dp(12), 0, dp(12), dp(6));
-        navScroll.addView(navRow);
-        root.addView(navScroll);
+        chipRow = UiKit.row(act);
+        chipRow.setPadding(dp(16), 0, dp(16), dp(10));
+        root.addView(UiKit.chipScroller(act, chipRow), new LinearLayout.LayoutParams(-1, -2));
 
         scroll = new ScrollView(act);
-        listContainer = new LinearLayout(act);
-        listContainer.setOrientation(LinearLayout.VERTICAL);
-        listContainer.setPadding(dp(16), 0, dp(16), dp(24));
-        scroll.addView(listContainer, new ViewGroup.LayoutParams(-1, -2));
+        scroll.setFillViewport(true);
+        content = UiKit.column(act);
+        content.setPadding(dp(16), dp(4), dp(16), dp(24));
+        scroll.addView(content, new ViewGroup.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1.0f));
+
+        root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) { attached = true; }
+            @Override public void onViewDetachedFromWindow(View v) {
+                attached = false;
+                stopPolling();
+                main.removeCallbacks(filterTicker);
+            }
+        });
+        updateHeader();
+        renderNav();
     }
 
     public View getView() { return root; }
@@ -157,12 +181,20 @@ public final class RadarrTabView {
     }
 
     public void refresh() {
+        stopPolling();
+        main.removeCallbacks(filterTicker);
+        movieRowsBox = null;
+        movieCountView = null;
         renderNav();
-        root.removeCallbacks(queueTicker);
-        if (detailMovieId > 0) { loadDetail(); return; }
+        updateHeader();
+        loadVersionOnce();
+        if (detailMovieId > 0) {
+            loadDetail();
+            return;
+        }
         switch (section) {
             case S_CALENDAR: loadCalendar(); break;
-            case S_QUEUE: loadQueue(false); root.postDelayed(queueTicker, 6000); break;
+            case S_QUEUE: queueOfflineShown = false; loadQueue(false); break;
             case S_HISTORY: loadHistory(); break;
             case S_WANTED: loadWanted(); break;
             case S_SYSTEM: loadSystem(); break;
@@ -170,206 +202,395 @@ public final class RadarrTabView {
         }
     }
 
+    // ================================================================== chrome
+
+    private void updateHeader() {
+        headerSlot.removeAllViews();
+        String sub;
+        if (version != null && movieCache != null) sub = trf("Radarr v{0} · {1} movies", version, movieCache.length());
+        else if (version != null) sub = trf("Radarr v{0}", version);
+        else sub = tr("Movies, downloads and releases");
+        Button refreshBtn = UiKit.outline(act, tr("Refresh"), v -> refresh());
+        headerSlot.addView(UiKit.header(act, tr("Radarr"), sub, refreshBtn));
+    }
+
     private void renderNav() {
-        navRow.removeAllViews();
+        chipRow.removeAllViews();
         for (int i = 0; i < SECTION_NAMES.length; i++) {
             final int idx = i;
-            boolean selected = idx == section && detailMovieId == 0 && idx != S_ADD;
-            TextView p = pill(SECTION_NAMES[i], selected);
-            p.setOnClickListener(v -> {
-                if (idx == S_ADD) {
-                    section = S_MOVIES;
-                    page = 1;
-                    detailMovieId = 0;
-                    refresh();
-                    showAddDialog();
+            TextView chip = UiKit.chip(act, tr(SECTION_NAMES[i]), idx == section);
+            chip.setOnClickListener(v -> {
+                if (idx == section && detailMovieId == 0 && page == 1) {
+                    scroll.smoothScrollTo(0, 0);
                     return;
                 }
                 section = idx;
                 page = 1;
                 detailMovieId = 0;
                 refresh();
+                scroll.scrollTo(0, 0);
             });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(34));
-            lp.setMarginEnd(dp(6));
-            navRow.addView(p, lp);
+            chipRow.addView(chip, UiKit.chipLp(act));
         }
     }
 
-    // ================================================================== async helper
-
-    private <T> void async(final Job<T> job, final Done<T> ok, final Done<Throwable> err) {
-        bg.execute(() -> {
-            try {
-                final RadarrApi api = RadarrApi.get(act);
-                final T r = job.run(api);
-                act.runOnUiThread(() -> { if (ok != null) ok.run(r); });
-            } catch (final Throwable t) {
-                act.runOnUiThread(() -> {
-                    if (err != null) err.run(t);
-                    else toast(msg(t));
-                });
+    private void loadVersionOnce() {
+        if (version != null || versionLoading) return;
+        versionLoading = true;
+        async(api -> api.status(), st -> {
+            versionLoading = false;
+            String v = st.optString("version", "");
+            if (!v.isEmpty()) {
+                version = v;
+                updateHeader();
             }
+        }, t -> versionLoading = false);
+    }
+
+    // ================================================================== async plumbing
+
+    private boolean dead() {
+        return act.isFinishing() || act.isDestroyed();
+    }
+
+    private void ui(final Runnable r) {
+        if (dead()) return;
+        main.post(() -> {
+            if (!dead()) r.run();
         });
     }
 
-    /** Runs a fire-and-forget action and toasts the outcome. */
-    private void action(final Job<Void> job, final String okMsg, final Runnable after) {
+    private <T> void async(final Job<T> job, final Done<T> ok, final Done<Throwable> err) {
+        try {
+            bg.execute(() -> {
+                T result = null;
+                Throwable failure = null;
+                try {
+                    result = job.run(RadarrApi.get(act));
+                } catch (Throwable t) {
+                    failure = t;
+                }
+                final T res = result;
+                final Throwable fail = failure;
+                ui(() -> {
+                    if (fail == null) {
+                        if (ok != null) ok.run(res);
+                    } else if (err != null) {
+                        err.run(fail);
+                    } else {
+                        toast(errText(fail));
+                    }
+                });
+            });
+        } catch (RejectedExecutionException ignored) {
+            // executor gone: the activity is being torn down
+        }
+    }
+
+    /** Runs a one-shot action with {@code trigger} disabled until it finishes, then toasts the outcome. */
+    private void action(final View trigger, final Job<Void> job, final String okMsg, final Runnable after) {
+        if (trigger != null && !trigger.isEnabled()) return;
+        setBusy(trigger, true);
         async(job, v -> {
-            toast(okMsg);
+            setBusy(trigger, false);
+            if (okMsg != null) toast(okMsg);
             if (after != null) after.run();
-        }, t -> toast(msg(t)));
+        }, t -> {
+            setBusy(trigger, false);
+            toast(errText(t));
+        });
     }
 
-    private static String msg(Throwable t) {
+    private static void setBusy(View v, boolean busy) {
+        if (v == null) return;
+        v.setEnabled(!busy);
+        v.setAlpha(busy ? 0.5f : 1f);
+    }
+
+    /** Swallows a second tap that arrives while a dialog is opening. */
+    private boolean debounce() {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastOpenMs < 700) return true;
+        lastOpenMs = now;
+        return false;
+    }
+
+    private static String errText(Throwable t) {
+        if (RadarrApi.isOffline(t)) return tr("Radarr is not running");
+        if (t instanceof JSONException) return tr("Radarr sent an unexpected answer.");
         String m = t == null ? null : t.getMessage();
-        return m == null ? "Unknown error (is Radarr running?)" : m;
+        if (m == null || m.trim().isEmpty()) m = t == null ? "Unknown error" : t.getClass().getSimpleName();
+        return tr(m);
     }
 
-    private void toast(String s) { Toast.makeText(act, I18n.tr(s), Toast.LENGTH_SHORT).show(); }
+    private void toast(String s) {
+        if (dead() || s == null) return;
+        Toast.makeText(act, s, s.length() > 60 ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+    }
+
+    private static String tr(String s) { return I18n.tr(s); }
+
+    /** Fills {0}, {1}... then translates the result (the Arabic dictionary holds the same template). */
+    private static String trf(String template, Object... args) {
+        String s = template;
+        for (int i = 0; i < args.length; i++) s = s.replace("{" + i + "}", String.valueOf(args[i]));
+        return I18n.tr(s);
+    }
+
+    private int dp(float v) { return UiKit.dp(act, v); }
+
+    // ================================================================== states
+
+    private void showLoading(String msg) {
+        content.removeAllViews();
+        content.addView(UiKit.loading(act, msg));
+    }
+
+    private void showError(Throwable t) {
+        content.removeAllViews();
+        content.addView(errorView(t, true));
+    }
+
+    private View errorView(Throwable t, boolean withRetry) {
+        if (RadarrApi.isOffline(t)) {
+            View v = UiKit.error(act, tr("Radarr is not running"),
+                    tr("Start Radarr here or from the Services tab. This screen loads as soon as it is up."), null, null);
+            if (v instanceof LinearLayout) {
+                final Button start = UiKit.primary(act, tr(starting ? "Starting…" : "Start Radarr"), null);
+                start.setOnClickListener(x -> startRadarr(start));
+                if (starting) setBusy(start, true);
+                if (withRetry) {
+                    ((LinearLayout) v).addView(UiKit.buttonRow(act, start, UiKit.outline(act, tr("Retry"), x -> refresh())));
+                } else {
+                    ((LinearLayout) v).addView(UiKit.buttonRow(act, start));
+                }
+            }
+            return v;
+        }
+        if (!withRetry) return UiKit.error(act, tr("Radarr reported an error"), errText(t), null, null);
+        return UiKit.error(act, tr("Could not load Radarr"), errText(t), tr("Retry"), x -> refresh());
+    }
+
+    private void startRadarr(final Button b) {
+        if (starting) return;
+        starting = true;
+        setBusy(b, true);
+        b.setText(tr("Starting…"));
+        try {
+            MediaServiceManager.getInstance(act.getApplicationContext()).startService("radarr");
+        } catch (Throwable t) {
+            starting = false;
+            setBusy(b, false);
+            b.setText(tr("Start Radarr"));
+            toast(errText(t));
+            return;
+        }
+        try {
+            bg.execute(() -> {
+                long end = System.currentTimeMillis() + 120000;
+                boolean up = false;
+                while (System.currentTimeMillis() < end && attached && !dead()) {
+                    if (RadarrApi.isPortOpen()) {
+                        up = true;
+                        break;
+                    }
+                    try { Thread.sleep(1500); } catch (InterruptedException e) { break; }
+                }
+                if (up) {
+                    try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
+                }
+                final boolean ok = up;
+                ui(() -> {
+                    starting = false;
+                    if (!ok) toast(tr("Radarr has not started yet. Check the Services tab."));
+                    refresh();
+                });
+            });
+        } catch (RejectedExecutionException e) {
+            starting = false;
+        }
+    }
+
+    // ================================================================== polling
+
+    private void schedulePoll() {
+        main.removeCallbacks(queueTicker);
+        if (section == S_QUEUE && detailMovieId == 0 && attached && root.isShown()) {
+            main.postDelayed(queueTicker, QUEUE_POLL_MS);
+        }
+    }
+
+    private void stopPolling() {
+        main.removeCallbacks(queueTicker);
+    }
 
     // ================================================================== MOVIES list
 
     private void loadMovies() {
         final int req = ++requestCounter;
-        listContainer.removeAllViews();
-        if (movieCache != null) {
-            renderMovieList();
-        } else {
-            showMessage("Loading...");
-        }
+        if (movieCache != null) renderMovies();
+        else showLoading(tr("Loading movies…"));
         async(api -> api.movies(), arr -> {
             if (req != requestCounter || detailMovieId > 0 || section != S_MOVIES) return;
+            boolean fresh = movieCache == null || movieRowsBox == null;
             movieCache = arr;
-            renderMovieList();
-        }, t -> { if (req == requestCounter && movieCache == null) showError(t); });
+            updateHeader();
+            if (fresh) renderMovies();
+            else fillMovieRows();
+        }, t -> {
+            if (req != requestCounter || section != S_MOVIES || detailMovieId > 0) return;
+            if (movieCache == null || RadarrApi.isOffline(t)) {
+                movieCache = null;
+                showError(t);
+            } else {
+                toast(errText(t));
+            }
+        });
     }
 
-    private void renderMovieList() {
-        listContainer.removeAllViews();
-        LinearLayout bar = new LinearLayout(act);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(0, dp(8), 0, dp(4));
-        final EditText filter = new EditText(act);
-        filter.setHint(I18n.tr("Filter movies"));
-        filter.setHintTextColor(AppTheme.textMuted());
-        filter.setTextColor(AppTheme.text());
-        filter.setTextSize(13f);
-        filter.setSingleLine(true);
+    private void renderMovies() {
+        content.removeAllViews();
+        LinearLayout bar = UiKit.row(act);
+        final EditText filter = UiKit.input(act, tr("Search your movies"));
         filter.setText(movieFilter);
         filter.setSelection(filter.getText().length());
+        filter.setImeOptions(EditorInfo.IME_ACTION_DONE);
         bar.addView(filter, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        final Button mode = actionButton(FILTER_NAMES[filterMode], AppTheme.textSecondary(), null);
-        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(-2, dp(36));
-        mlp.setMarginStart(dp(8));
-        bar.addView(mode, mlp);
-        Button add = actionButton("+ ADD", AppTheme.accent(), v -> showAddDialog());
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-2, dp(36));
-        alp.setMarginStart(dp(6));
-        bar.addView(add, alp);
-        listContainer.addView(bar);
-
-        final LinearLayout rows = new LinearLayout(act);
-        rows.setOrientation(LinearLayout.VERTICAL);
-        final TextView count = text("", 11f, AppTheme.textSecondary(), false);
-        count.setPadding(0, dp(2), 0, dp(2));
-        listContainer.addView(count);
-        listContainer.addView(rows);
-        fillMovieRows(rows, count);
-        mode.setOnClickListener(v -> {
-            filterMode = (filterMode + 1) % FILTER_NAMES.length;
-            mode.setText(I18n.tr(FILTER_NAMES[filterMode]));
-            fillMovieRows(rows, count);
+        Button add = UiKit.primary(act, tr("Add movie"), v -> {
+            if (!debounce()) showAddDialog();
         });
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-2, -2);
+        alp.setMarginStart(dp(8));
+        bar.addView(add, alp);
+        content.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+
+        final LinearLayout chips = UiKit.row(act);
+        chips.setPadding(0, dp(12), 0, dp(4));
+        content.addView(UiKit.chipScroller(act, chips), new LinearLayout.LayoutParams(-1, -2));
+        drawFilterChips(chips);
+
+        movieCountView = UiKit.caption(act, "");
+        movieCountView.setPadding(dp(2), dp(6), dp(2), dp(8));
+        content.addView(movieCountView);
+        movieRowsBox = UiKit.column(act);
+        content.addView(movieRowsBox, new LinearLayout.LayoutParams(-1, -2));
+        fillMovieRows();
+
         filter.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void afterTextChanged(Editable e) {
                 movieFilter = e.toString();
-                fillMovieRows(rows, count);
+                movieLimit = LIST_CHUNK;
+                main.removeCallbacks(filterTicker);
+                main.postDelayed(filterTicker, 180);
             }
         });
     }
 
-    private void fillMovieRows(LinearLayout rows, TextView count) {
-        rows.removeAllViews();
-        if (movieCache == null) return;
+    private void drawFilterChips(final LinearLayout chips) {
+        chips.removeAllViews();
+        for (int i = 0; i < FILTER_NAMES.length; i++) {
+            final int idx = i;
+            TextView c = UiKit.chip(act, tr(FILTER_NAMES[i]), idx == filterMode);
+            c.setOnClickListener(v -> {
+                if (filterMode == idx) return;
+                filterMode = idx;
+                movieLimit = LIST_CHUNK;
+                drawFilterChips(chips);
+                fillMovieRows();
+            });
+            chips.addView(c, UiKit.chipLp(act));
+        }
+    }
+
+    private List<JSONObject> filteredMovies() {
         List<JSONObject> list = new ArrayList<>();
+        if (movieCache == null) return list;
         String f = movieFilter.trim().toLowerCase(Locale.ROOT);
         for (int i = 0; i < movieCache.length(); i++) {
             JSONObject m = movieCache.optJSONObject(i);
             if (m == null) continue;
-            if (!f.isEmpty() && !m.optString("title", "").toLowerCase(Locale.ROOT).contains(f)) continue;
-            if (filterMode == 1 && !m.optBoolean("monitored")) continue;
-            if (filterMode == 2 && (m.optBoolean("hasFile") || !m.optBoolean("monitored"))) continue;
-            if (filterMode == 3 && !m.optBoolean("hasFile")) continue;
+            if (!f.isEmpty()) {
+                String hay = (m.optString("title", "") + " " + m.optString("originalTitle", "") + " " + m.optInt("year"))
+                        .toLowerCase(Locale.ROOT);
+                if (!hay.contains(f)) continue;
+            }
+            boolean mon = m.optBoolean("monitored");
+            boolean has = m.optBoolean("hasFile");
+            if (filterMode == 1 && !mon) continue;
+            if (filterMode == 2 && (has || !mon)) continue;
+            if (filterMode == 3 && !has) continue;
             list.add(m);
         }
-        java.util.Collections.sort(list, (a, b) -> a.optString("sortTitle", a.optString("title"))
-                .compareToIgnoreCase(b.optString("sortTitle", b.optString("title"))));
-        count.setText(list.size() + " / " + movieCache.length() + " " + I18n.tr("movies"));
+        Collections.sort(list, (a, b) -> sortKey(a).compareToIgnoreCase(sortKey(b)));
+        return list;
+    }
+
+    private static String sortKey(JSONObject m) {
+        String s = RadarrApi.str(m, "sortTitle");
+        return s.isEmpty() ? m.optString("title", "") : s;
+    }
+
+    private void fillMovieRows() {
+        if (movieRowsBox == null || movieCountView == null || movieCache == null) return;
+        movieRowsBox.removeAllViews();
+        List<JSONObject> list = filteredMovies();
+        int total = movieCache.length();
+        movieCountView.setText(list.size() == total ? trf("{0} movies", total) : trf("{0} of {1} movies", list.size(), total));
         if (list.isEmpty()) {
-            TextView t = text(I18n.tr(movieCache.length() == 0 ? "No movies yet. Tap + ADD to add one." : "No matches."),
-                    12f, AppTheme.textSecondary(), false);
-            t.setPadding(0, dp(12), 0, 0);
-            rows.addView(t);
+            movieRowsBox.addView(total == 0
+                    ? UiKit.empty(act, tr("No movies yet"), tr("Tap Add movie to find a movie on TMDb and add it."))
+                    : UiKit.empty(act, tr("No matches"), tr("Try another search or filter.")));
             return;
         }
-        for (JSONObject m : list) rows.addView(movieRow(m));
+        LinearLayout card = listCard();
+        int n = Math.min(list.size(), movieLimit);
+        for (int i = 0; i < n; i++) {
+            if (i > 0) card.addView(separator(64));
+            card.addView(movieRow(list.get(i)));
+        }
+        movieRowsBox.addView(card);
+        if (list.size() > n) {
+            int more = Math.min(list.size() - n, LIST_CHUNK);
+            Button b = UiKit.outline(act, trf("Show {0} more", more), v -> {
+                movieLimit += LIST_CHUNK;
+                fillMovieRows();
+            });
+            movieRowsBox.addView(b, fullLp(0));
+        }
     }
 
     private View movieRow(final JSONObject m) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(8), dp(8), dp(10), dp(8));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        row.setLayoutParams(lp);
-
-        row.addView(poster(m, 46, 68), new LinearLayout.LayoutParams(dp(46), dp(68)));
-
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.setPadding(dp(10), 0, dp(6), 0);
-        TextView t = text(m.optString("title", "?") + (m.optInt("year") > 0 ? "  (" + m.optInt("year") + ")" : ""),
-                13f, AppTheme.text(), true);
-        t.setMaxLines(2);
-        t.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(t);
-        String line = capitalize(m.optString("status", ""))
-                + (m.optInt("runtime") > 0 ? " - " + m.optInt("runtime") + " min" : "")
-                + (m.optString("studio").isEmpty() ? "" : " - " + m.optString("studio"));
-        TextView l1 = text(line, 10.5f, AppTheme.textMuted(), false);
-        l1.setPadding(0, dp(2), 0, 0);
-        l1.setMaxLines(1);
-        l1.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(l1);
-        boolean has = m.optBoolean("hasFile");
-        JSONObject file = m.optJSONObject("movieFile");
-        String fileLine;
-        int fileColor;
-        if (has) {
-            fileLine = "✔ " + (file == null ? "" : qualityName(file) + "  ") + fmtSize(file != null ? file.optLong("size") : m.optLong("sizeOnDisk"));
-            fileColor = AppTheme.success();
-        } else {
-            fileLine = "✖ " + I18n.tr("No file");
-            fileColor = m.optBoolean("monitored") ? AppTheme.warning() : AppTheme.textMuted();
-        }
-        TextView l2 = text(fileLine, 10.5f, fileColor, false);
-        l2.setPadding(0, dp(2), 0, 0);
-        tx.addView(l2);
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        TextView mon = text(m.optBoolean("monitored") ? "●" : "○", 16f,
-                m.optBoolean("monitored") ? AppTheme.accent() : AppTheme.textMuted(), false);
-        row.addView(mon);
-
-        row.setClickable(true);
-        row.setOnClickListener(v -> openMovie(m.optInt("id")));
+        LinearLayout row = listRow();
+        row.addView(poster(m, 40), posterLp(40));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(rowTitle(titleYear(m)));
+        tx.addView(rowMeta(movieMeta(m)));
+        row.addView(tx, textLp());
+        View badge = movieBadge(m);
+        if (badge != null) row.addView(badge);
+        final int id = m.optInt("id");
+        row.setOnClickListener(v -> openMovie(id));
         return row;
+    }
+
+    private String movieMeta(JSONObject m) {
+        String runtime = fmtRuntime(m.optInt("runtime"));
+        if (m.optBoolean("hasFile")) {
+            JSONObject f = m.optJSONObject("movieFile");
+            long size = f != null ? f.optLong("size") : m.optLong("sizeOnDisk");
+            return joinDot(runtime, qualityName(f), size > 0 ? fmtSize(size) : "");
+        }
+        return joinDot(runtime, RadarrApi.str(m, "studio"), tr(statusLabel(RadarrApi.str(m, "status"))));
+    }
+
+    private View movieBadge(JSONObject m) {
+        boolean mon = m.optBoolean("monitored");
+        if (m.optBoolean("hasFile")) return UiKit.badge(act, tr("Downloaded"), AppTheme.success());
+        if (!mon) return UiKit.badge(act, tr("Unmonitored"), AppTheme.textMuted());
+        if (m.optBoolean("isAvailable", true)) return UiKit.badge(act, tr("Missing"), AppTheme.warning());
+        return UiKit.badge(act, tr("Not released"), AppTheme.textMuted());
     }
 
     private void openMovie(int id) {
@@ -384,8 +605,7 @@ public final class RadarrTabView {
     private void loadDetail() {
         final int req = ++requestCounter;
         final int id = detailMovieId;
-        listContainer.removeAllViews();
-        showMessage("Loading...");
+        showLoading(tr("Loading movie…"));
         async(api -> {
             JSONObject pack = new JSONObject();
             pack.put("movie", api.movie(id));
@@ -394,439 +614,568 @@ public final class RadarrTabView {
         }, pack -> {
             if (req != requestCounter || detailMovieId != id) return;
             renderDetail(pack.optJSONObject("movie"), pack.optJSONArray("profiles"));
-        }, t -> { if (req == requestCounter) showError(t); });
+        }, t -> {
+            if (req != requestCounter || detailMovieId != id) return;
+            if (RadarrApi.statusOf(t) == 404) {
+                detailMovieId = 0;
+                movieCache = null;
+                toast(tr("This movie is no longer in Radarr."));
+                refresh();
+                return;
+            }
+            showError(t);
+        });
     }
 
     private void renderDetail(final JSONObject movie, JSONArray profiles) {
-        listContainer.removeAllViews();
-        if (movie == null) { showMessage("Movie not found."); return; }
+        content.removeAllViews();
+        if (movie == null || movie.optInt("id") <= 0) {
+            content.addView(UiKit.empty(act, tr("Movie not found"), tr("It may have been removed from Radarr.")));
+            return;
+        }
         final int id = movie.optInt("id");
+        final String title = titleYear(movie);
 
-        LinearLayout back = new LinearLayout(act);
-        back.setOrientation(LinearLayout.HORIZONTAL);
-        back.setPadding(0, dp(8), 0, dp(4));
-        back.addView(actionButton("< BACK", AppTheme.textSecondary(), v -> onBack()), new LinearLayout.LayoutParams(-2, dp(34)));
-        listContainer.addView(back);
+        TextView back = UiKit.chip(act, tr("Back"), false);
+        back.setOnClickListener(v -> onBack());
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+        blp.bottomMargin = dp(12);
+        content.addView(back, blp);
 
-        LinearLayout head = new LinearLayout(act);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setPadding(dp(10), dp(10), dp(10), dp(10));
-        head.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 14));
-        head.addView(poster(movie, 90, 132), new LinearLayout.LayoutParams(dp(90), dp(132)));
-        LinearLayout info = new LinearLayout(act);
-        info.setOrientation(LinearLayout.VERTICAL);
-        info.setPadding(dp(12), 0, 0, 0);
-        info.addView(text(movie.optString("title") + (movie.optInt("year") > 0 ? " (" + movie.optInt("year") + ")" : ""),
-                15f, AppTheme.text(), true));
-        String meta = capitalize(movie.optString("status", ""))
-                + (movie.optInt("runtime") > 0 ? " - " + movie.optInt("runtime") + " min" : "")
-                + (movie.optString("studio").isEmpty() ? "" : " - " + movie.optString("studio"));
-        TextView m = text(meta, 11f, AppTheme.textSecondary(), false);
-        m.setPadding(0, dp(3), 0, 0);
-        info.addView(m);
+        // ---- hero
+        LinearLayout hero = UiKit.card(act);
+        LinearLayout top = UiKit.row(act);
+        top.setGravity(Gravity.TOP);
+        top.addView(poster(movie, 96), posterLp(96));
+        LinearLayout info = UiKit.column(act);
+        info.addView(UiKit.title(act, title));
+        String rating = "";
+        JSONObject ratings = movie.optJSONObject("ratings");
+        JSONObject tmdb = ratings == null ? null : ratings.optJSONObject("tmdb");
+        if (tmdb != null && tmdb.optDouble("value", 0) > 0) rating = String.format(Locale.US, "TMDb %.1f", tmdb.optDouble("value"));
+        TextView meta = UiKit.caption(act, joinDot(fmtRuntime(movie.optInt("runtime")), RadarrApi.str(movie, "certification"),
+                RadarrApi.str(movie, "studio"), rating));
+        meta.setPadding(0, dp(4), 0, 0);
+        info.addView(meta);
+        LinearLayout badges = UiKit.row(act);
+        badges.setPadding(0, dp(10), 0, 0);
+        View b1 = movieBadge(movie);
+        if (b1 != null) badges.addView(b1);
+        if (movie.optBoolean("monitored")) {
+            LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(-2, -2);
+            lp2.setMarginStart(dp(6));
+            badges.addView(UiKit.badge(act, tr("Monitored"), AppTheme.accent()), lp2);
+        }
+        info.addView(badges);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        ilp.setMarginStart(dp(14));
+        top.addView(info, ilp);
+        hero.addView(top);
 
+        String ov = RadarrApi.str(movie, "overview");
+        if (!ov.isEmpty()) {
+            final TextView o = UiKit.body(act, ov);
+            o.setMaxLines(4);
+            o.setEllipsize(TextUtils.TruncateAt.END);
+            o.setPadding(0, dp(12), 0, 0);
+            o.setOnClickListener(v -> {
+                boolean collapsed = o.getMaxLines() == 4;
+                o.setMaxLines(collapsed ? 200 : 4);
+            });
+            hero.addView(o);
+        }
+
+        final Button search = UiKit.primary(act, tr("Search"), null);
+        search.setOnClickListener(v -> action(search, api -> {
+            api.searchMovie(id);
+            return null;
+        }, tr("Search started. Radarr grabs the best release it finds."), null));
+        Button interactive = UiKit.outline(act, tr("Interactive search"), v -> {
+            if (!debounce()) showReleases(id, title);
+        });
+        hero.addView(UiKit.buttonRow(act, search, interactive));
+
+        final Button refreshB = UiKit.outline(act, tr("Refresh"), null);
+        refreshB.setOnClickListener(v -> action(refreshB, api -> {
+            api.refreshMovie(id);
+            return null;
+        }, tr("Refreshing metadata…"), () -> movieCache = null));
+        final Button rescan = UiKit.outline(act, tr("Rescan"), null);
+        rescan.setOnClickListener(v -> action(rescan, api -> {
+            api.rescanMovie(id);
+            return null;
+        }, tr("Rescanning the movie folder…"), () -> movieCache = null));
+        Button del = UiKit.danger(act, tr("Delete"), v -> {
+            if (!debounce()) confirmDeleteMovie(movie);
+        });
+        hero.addView(UiKit.buttonRow(act, refreshB, rescan, del));
+        content.addView(hero);
+
+        // ---- monitored
+        LinearLayout monCard = UiKit.card(act);
+        final Switch sw = switchRow(monCard, tr("Monitored"),
+                tr("Radarr searches for monitored movies and upgrades them automatically."), movie.optBoolean("monitored"));
+        sw.setOnCheckedChangeListener((b, checked) -> setMonitored(movie, sw, checked));
+        content.addView(monCard);
+
+        // ---- file
+        final JSONObject file = movie.optJSONObject("movieFile");
+        LinearLayout fc = UiKit.card(act);
+        fc.addView(UiKit.overline(act, tr("File")));
+        if (movie.optBoolean("hasFile") && file != null) {
+            fc.addView(UiKit.kv(act, tr("Quality"), orDash(qualityName(file))));
+            fc.addView(UiKit.kv(act, tr("Size"), fmtSize(file.optLong("size"))));
+            JSONObject mi = file.optJSONObject("mediaInfo");
+            if (mi != null) {
+                String video = joinDot(RadarrApi.str(mi, "videoCodec"), RadarrApi.str(mi, "resolution"),
+                        RadarrApi.str(mi, "videoDynamicRangeType"));
+                String audio = joinDot(RadarrApi.str(mi, "audioCodec"), RadarrApi.str(mi, "audioChannels"),
+                        RadarrApi.str(mi, "audioLanguages"));
+                if (!video.isEmpty()) fc.addView(UiKit.kv(act, tr("Video"), video));
+                if (!audio.isEmpty()) fc.addView(UiKit.kv(act, tr("Audio"), audio));
+            }
+            String added = fmtDateTime(RadarrApi.str(file, "dateAdded"));
+            if (!added.isEmpty()) fc.addView(UiKit.kv(act, tr("Added"), added));
+            String rel = RadarrApi.str(file, "relativePath");
+            if (!rel.isEmpty()) {
+                TextView rp = UiKit.mono(act, rel);
+                rp.setTextColor(AppTheme.textSecondary());
+                rp.setPadding(0, dp(6), 0, 0);
+                fc.addView(rp);
+            }
+            final int fileId = file.optInt("id");
+            final Button delFile = UiKit.danger(act, tr("Delete file"), null);
+            delFile.setOnClickListener(v -> confirm(tr("Delete file?"),
+                    tr("The downloaded file is deleted from disk. The movie stays in Radarr and can be downloaded again."),
+                    tr("Delete file"), true, () -> action(delFile, api -> {
+                        api.deleteMovieFile(fileId);
+                        return null;
+                    }, tr("File deleted"), () -> {
+                        movieCache = null;
+                        refresh();
+                    })));
+            fc.addView(UiKit.buttonRow(act, delFile));
+        } else {
+            fc.addView(UiKit.body(act, tr(movie.optBoolean("isAvailable", true)
+                    ? "No file yet. Use Search to look for a release."
+                    : "No file yet. The movie is not available for download yet.")));
+        }
+        content.addView(fc);
+
+        // ---- details
         String profName = "";
         int pid = movie.optInt("qualityProfileId");
         for (int i = 0; profiles != null && i < profiles.length(); i++) {
             JSONObject p = profiles.optJSONObject(i);
-            if (p != null && p.optInt("id") == pid) { profName = p.optString("name"); break; }
-        }
-        TextView q = text(I18n.tr("Quality profile") + ": " + (profName.isEmpty() ? String.valueOf(pid) : profName)
-                + "  -  " + I18n.tr("Availability") + ": " + movie.optString("minimumAvailability", "-"),
-                11f, AppTheme.textSecondary(), false);
-        q.setPadding(0, dp(2), 0, 0);
-        info.addView(q);
-
-        StringBuilder dates = new StringBuilder();
-        appendDate(dates, "Cinemas", movie.optString("inCinemas", ""));
-        appendDate(dates, "Digital", movie.optString("digitalRelease", ""));
-        appendDate(dates, "Physical", movie.optString("physicalRelease", ""));
-        if (dates.length() > 0) {
-            TextView dt = text(dates.toString(), 10.5f, AppTheme.textMuted(), false);
-            dt.setPadding(0, dp(2), 0, 0);
-            info.addView(dt);
-        }
-        TextView path = text(movie.optString("path", ""), 10f, AppTheme.textMuted(), false);
-        path.setPadding(0, dp(2), 0, 0);
-        info.addView(path);
-        String ov = movie.optString("overview", "");
-        if (!ov.isEmpty()) {
-            final TextView o = text(ov, 11f, AppTheme.textSecondary(), false);
-            o.setMaxLines(4);
-            o.setEllipsize(TextUtils.TruncateAt.END);
-            o.setPadding(0, dp(6), 0, 0);
-            o.setOnClickListener(v -> {
-                boolean collapsed = o.getMaxLines() == 4;
-                o.setMaxLines(collapsed ? 100 : 4);
-            });
-            info.addView(o);
-        }
-        head.addView(info, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        listContainer.addView(head);
-
-        // file info
-        final JSONObject file = movie.optJSONObject("movieFile");
-        LinearLayout fileCard = new LinearLayout(act);
-        fileCard.setOrientation(LinearLayout.VERTICAL);
-        fileCard.setPadding(dp(12), dp(10), dp(12), dp(10));
-        fileCard.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams fclp = new LinearLayout.LayoutParams(-1, -2);
-        fclp.topMargin = dp(8);
-        fileCard.setLayoutParams(fclp);
-        if (movie.optBoolean("hasFile") && file != null) {
-            fileCard.addView(text("✔ " + qualityName(file) + "  -  " + fmtSize(file.optLong("size")), 12.5f, AppTheme.success(), true));
-            String rel = file.optString("relativePath", "");
-            if (!rel.isEmpty()) {
-                TextView rt = text(rel, 10.5f, AppTheme.textSecondary(), false);
-                rt.setPadding(0, dp(2), 0, 0);
-                fileCard.addView(rt);
+            if (p != null && p.optInt("id") == pid) {
+                profName = p.optString("name");
+                break;
             }
-            JSONObject mi = file.optJSONObject("mediaInfo");
-            if (mi != null) {
-                String codec = (mi.optString("videoCodec", "") + " " + mi.optString("resolution", "")).trim();
-                String audio = (mi.optString("audioCodec", "") + (mi.optString("audioChannels", "").isEmpty() ? "" : " " + mi.optString("audioChannels"))).trim();
-                String mline = codec + (codec.isEmpty() || audio.isEmpty() ? "" : "  -  ") + audio;
-                if (!mline.isEmpty()) fileCard.addView(text(mline, 10.5f, AppTheme.textMuted(), false));
-            }
-            final int fileId = file.optInt("id");
-            Button del = actionButton("DELETE FILE", AppTheme.danger(), v ->
-                    confirm(I18n.tr("Delete the downloaded file of this movie?"), I18n.tr("DELETE"), AppTheme.danger(), () ->
-                            action(api -> { api.deleteMovieFile(fileId); return null; }, "File deleted.", () -> {
-                                movieCache = null;
-                                refresh();
-                            })));
-            fileCard.addView(del, lpTop(dp(32), dp(8)));
-        } else {
-            fileCard.addView(text("✖ " + I18n.tr("No file on disk"), 12.5f, AppTheme.warning(), true));
         }
-        listContainer.addView(fileCard);
+        LinearLayout dc = UiKit.card(act);
+        dc.addView(UiKit.overline(act, tr("Details")));
+        dc.addView(UiKit.kv(act, tr("Status"), tr(statusLabel(RadarrApi.str(movie, "status")))));
+        dc.addView(UiKit.kv(act, tr("Quality profile"), profName.isEmpty() ? (pid > 0 ? "#" + pid : "-") : profName));
+        dc.addView(UiKit.kv(act, tr("Minimum availability"), tr(availabilityLabel(RadarrApi.str(movie, "minimumAvailability")))));
+        addDateKv(dc, tr("In cinemas"), RadarrApi.str(movie, "inCinemas"));
+        addDateKv(dc, tr("Digital release"), RadarrApi.str(movie, "digitalRelease"));
+        addDateKv(dc, tr("Physical release"), RadarrApi.str(movie, "physicalRelease"));
+        String addedM = fmtDateTime(RadarrApi.str(movie, "added"));
+        if (!addedM.isEmpty()) dc.addView(UiKit.kv(act, tr("Added to Radarr"), addedM));
+        String path = RadarrApi.str(movie, "path");
+        if (!path.isEmpty()) {
+            TextView pl = UiKit.caption(act, tr("Path"));
+            pl.setPadding(0, dp(8), 0, dp(2));
+            dc.addView(pl);
+            dc.addView(UiKit.mono(act, path));
+        }
+        content.addView(dc);
+    }
 
-        // monitored switch
-        LinearLayout monRow = new LinearLayout(act);
-        monRow.setOrientation(LinearLayout.HORIZONTAL);
-        monRow.setGravity(Gravity.CENTER_VERTICAL);
-        monRow.setPadding(dp(4), dp(10), dp(4), dp(2));
-        monRow.addView(text(I18n.tr("Monitored"), 12.5f, AppTheme.text(), false), new LinearLayout.LayoutParams(0, -2, 1.0f));
-        final Switch monSw = new Switch(act);
-        monSw.setChecked(movie.optBoolean("monitored"));
-        UiStyle.styleSwitch(act, monSw);
-        monSw.setOnCheckedChangeListener((b, checked) -> {
-            try {
-                movie.put("monitored", checked);
-                final JSONObject copy = new JSONObject(movie.toString());
-                action(api -> { api.putMovie(copy); return null; }, checked ? "Monitoring enabled." : "Monitoring disabled.", () -> movieCache = null);
-            } catch (Throwable ex) { toast(msg(ex)); }
+    private void addDateKv(LinearLayout card, String label, String iso) {
+        String d = fmtDay(iso);
+        if (!d.isEmpty()) card.addView(UiKit.kv(act, label, d));
+    }
+
+    private void setMonitored(final JSONObject movie, final Switch sw, final boolean checked) {
+        if (monitorBusy) return;
+        final JSONObject copy = copyWith(movie, "monitored", checked);
+        if (copy == null) return;
+        monitorBusy = true;
+        sw.setEnabled(false);
+        async(api -> api.putMovie(copy), updated -> {
+            monitorBusy = false;
+            sw.setEnabled(true);
+            try { movie.put("monitored", checked); } catch (Exception ignored) {}
+            movieCache = null;
+            toast(tr(checked ? "Monitoring on" : "Monitoring off"));
+        }, t -> {
+            monitorBusy = false;
+            sw.setOnCheckedChangeListener(null);
+            sw.setChecked(!checked);
+            sw.setOnCheckedChangeListener((b, c2) -> setMonitored(movie, sw, c2));
+            sw.setEnabled(true);
+            toast(errText(t));
         });
-        monRow.addView(monSw);
-        listContainer.addView(monRow);
-
-        // actions
-        LinearLayout acts = new LinearLayout(act);
-        acts.setOrientation(LinearLayout.HORIZONTAL);
-        acts.addView(actionButton("SEARCH", AppTheme.success(), v ->
-                action(api -> { api.searchMovie(id); return null; }, "Search queued.", null)), weight());
-        acts.addView(actionButton("INTERACTIVE", AppTheme.accent(), v -> showReleases(id,
-                movie.optString("title") + (movie.optInt("year") > 0 ? " (" + movie.optInt("year") + ")" : ""))), weight());
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-1, -2);
-        alp.topMargin = dp(6);
-        listContainer.addView(acts, alp);
-
-        LinearLayout acts2 = new LinearLayout(act);
-        acts2.setOrientation(LinearLayout.HORIZONTAL);
-        acts2.addView(actionButton("REFRESH", AppTheme.accent(), v ->
-                action(api -> { api.refreshMovie(id); return null; }, "Refresh queued.", () -> movieCache = null)), weight());
-        acts2.addView(actionButton("RESCAN", AppTheme.accent(), v ->
-                action(api -> { api.rescanMovie(id); return null; }, "Rescan queued.", () -> movieCache = null)), weight());
-        acts2.addView(actionButton("DELETE", AppTheme.danger(), v -> confirmDeleteMovie(movie)), weight());
-        LinearLayout.LayoutParams alp2 = new LinearLayout.LayoutParams(-1, -2);
-        alp2.topMargin = dp(6);
-        listContainer.addView(acts2, alp2);
-    }
-
-    private static void appendDate(StringBuilder sb, String label, String iso) {
-        if (iso == null || iso.length() < 10) return;
-        if (sb.length() > 0) sb.append("   ");
-        sb.append(I18n.tr(label)).append(": ").append(iso.substring(0, 10));
-    }
-
-    private static String qualityName(JSONObject file) {
-        if (file == null) return "";
-        JSONObject q = file.optJSONObject("quality");
-        JSONObject qq = q == null ? null : q.optJSONObject("quality");
-        return qq == null ? "" : qq.optString("name", "");
     }
 
     private void confirmDeleteMovie(final JSONObject movie) {
-        final LinearLayout body = dialogBody(I18n.tr("Delete movie"));
-        body.addView(text(movie.optString("title"), 13f, AppTheme.text(), true));
-        final Switch files = new Switch(act);
-        files.setText(I18n.tr("Also delete files from disk"));
-        files.setTextColor(AppTheme.text());
-        UiStyle.styleSwitch(act, files);
-        files.setPadding(0, dp(12), 0, dp(4));
-        body.addView(files);
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("DELETE", AppTheme.danger(), v -> {
-            d.dismiss();
+        final LinearLayout body = dialogBody(tr("Delete movie?"), titleYear(movie));
+        TextView m = UiKit.body(act, tr("The movie is removed from Radarr."));
+        m.setPadding(0, dp(10), 0, dp(4));
+        body.addView(m);
+        final Switch files = switchRow(body, tr("Also delete the files"), tr("Removes the movie folder from disk."), false);
+        final Switch excl = switchRow(body, tr("Don't add it again"),
+                tr("Adds an import list exclusion so lists cannot re-add it."), false);
+        final AlertDialog d = dialog(body);
+        final Button cancel = UiKit.outline(act, tr("Cancel"), v -> d.dismiss());
+        final Button del = UiKit.danger(act, tr("Delete"), null);
+        del.setOnClickListener(v -> {
             final int id = movie.optInt("id");
             final boolean df = files.isChecked();
-            action(api -> { api.deleteMovie(id, df); return null; }, "Movie deleted.", () -> {
+            final boolean ex = excl.isChecked();
+            action(del, api -> {
+                api.deleteMovie(id, df, ex);
+                return null;
+            }, tr("Movie deleted"), () -> {
+                d.dismiss();
                 movieCache = null;
                 detailMovieId = 0;
                 refresh();
             });
-        }), weight());
-        body.addView(row);
-        d.show();
+        });
+        body.addView(UiKit.buttonRow(act, cancel, del));
+        show(d);
     }
 
     // ================================================================== interactive search
 
     private void showReleases(final int movieId, String title) {
-        final LinearLayout body = dialogBody(I18n.tr("Interactive search"));
-        body.addView(text(title, 12f, AppTheme.textSecondary(), false));
-        final LinearLayout list = new LinearLayout(act);
-        list.setOrientation(LinearLayout.VERTICAL);
-        final TextView loading = text(I18n.tr("Searching indexers... this can take up to a minute."), 12f, AppTheme.textSecondary(), false);
-        loading.setPadding(0, dp(12), 0, 0);
-        list.addView(loading);
-        ScrollView sv = new ScrollView(act);
-        sv.addView(list);
-        body.addView(sv, new LinearLayout.LayoutParams(-1, dp(380)));
-        final Dialog d = dialog(body);
-        d.show();
+        final LinearLayout body = dialogBody(tr("Interactive search"), title);
+        final LinearLayout list = UiKit.column(act);
+        list.addView(UiKit.loading(act, tr("Searching your indexers… this can take a minute.")));
+        body.addView(scrollBox(list));
+        final AlertDialog d = listDialog(body);
+        body.addView(UiKit.buttonRow(act, UiKit.outline(act, tr("Close"), v -> d.dismiss())));
+        final boolean[] open = {true};
+        d.setOnDismissListener(x -> open[0] = false);
+        show(d);
         async(api -> api.releasesForMovie(movieId), arr -> {
+            if (!open[0]) return;
             list.removeAllViews();
-            if (arr.length() == 0) {
-                list.addView(text(I18n.tr("No releases found."), 12f, AppTheme.textSecondary(), false));
-                return;
-            }
-            List<JSONObject> rel = new ArrayList<>();
+            List<JSONObject> ok = new ArrayList<>();
+            List<JSONObject> rejected = new ArrayList<>();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject r = arr.optJSONObject(i);
-                if (r != null) rel.add(r);
+                if (r == null) continue;
+                if (isRejected(r)) rejected.add(r); else ok.add(r);
             }
-            java.util.Collections.sort(rel, (a, b) -> {
-                boolean ra = a.optJSONArray("rejections") != null && a.optJSONArray("rejections").length() > 0;
-                boolean rb = b.optJSONArray("rejections") != null && b.optJSONArray("rejections").length() > 0;
-                if (ra != rb) return ra ? 1 : -1;
-                return b.optInt("seeders") - a.optInt("seeders");
-            });
+            ok.addAll(rejected); // keep Radarr's ranking, accepted releases first
+            if (ok.isEmpty()) {
+                list.addView(UiKit.empty(act, tr("No releases found"), tr("None of your indexers returned a result for this movie.")));
+                return;
+            }
+            TextView c = UiKit.caption(act, trf("{0} releases · {1} accepted", ok.size(), ok.size() - rejected.size()));
+            c.setPadding(dp(2), dp(4), 0, dp(4));
+            list.addView(c);
             int n = 0;
-            for (JSONObject r : rel) {
-                if (++n > 60) break;
-                list.addView(releaseRow(r, d));
+            for (JSONObject r : ok) {
+                if (++n > 80) break;
+                list.addView(releaseRow(r));
             }
-        }, t -> { list.removeAllViews(); list.addView(text(msg(t), 12f, AppTheme.danger(), false)); });
+        }, t -> {
+            if (!open[0]) return;
+            list.removeAllViews();
+            list.addView(errorView(t, false));
+        });
     }
 
-    private View releaseRow(final JSONObject r, final Dialog d) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(10), dp(8), dp(10), dp(8));
-        box.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
+    private static boolean isRejected(JSONObject r) {
+        if (r.optBoolean("rejected", false)) return true;
+        JSONArray rej = r.optJSONArray("rejections");
+        return rej != null && rej.length() > 0;
+    }
+
+    private View releaseRow(final JSONObject r) {
+        LinearLayout box = UiKit.column(act);
+        box.setPadding(dp(12), dp(10), dp(12), dp(10));
+        box.setBackground(UiKit.shape(act, AppTheme.inner(), 0, UiKit.R_INNER));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
+        lp.topMargin = dp(8);
         box.setLayoutParams(lp);
-        TextView t = text(r.optString("title"), 11.5f, AppTheme.text(), true);
-        t.setMaxLines(3);
+        TextView t = UiKit.text(act, r.optString("title"), 13f, AppTheme.text(), UiKit.MEDIUM);
+        t.setMaxLines(2);
         t.setEllipsize(TextUtils.TruncateAt.END);
         box.addView(t);
-        JSONObject q = r.optJSONObject("quality");
-        JSONObject qq = q == null ? null : q.optJSONObject("quality");
-        String proto = r.optString("protocol", "");
-        String line = (qq == null ? "" : qq.optString("name") + "  -  ") + fmtSize(r.optLong("size"))
-                + "  -  " + r.optString("indexer", "")
-                + ("torrent".equalsIgnoreCase(proto) ? "  -  S:" + r.optInt("seeders") + " L:" + r.optInt("leechers") : "")
-                + "  -  " + fmtAge(r.optDouble("ageMinutes", 0));
-        TextView l = text(line, 10f, AppTheme.textSecondary(), false);
-        l.setPadding(0, dp(2), 0, dp(2));
-        box.addView(l);
-        JSONArray rej = r.optJSONArray("rejections");
-        final boolean rejected = rej != null && rej.length() > 0;
-        if (rejected) {
-            box.addView(text("⚠ " + rej.optString(0), 10f, AppTheme.warning(), false));
+        boolean torrent = "torrent".equalsIgnoreCase(RadarrApi.str(r, "protocol"));
+        TextView meta = UiKit.caption(act, joinDot(qualityName(r), fmtSize(r.optLong("size")),
+                RadarrApi.str(r, "indexer"), fmtAge(r.optDouble("ageMinutes", 0))));
+        meta.setPadding(0, dp(3), 0, 0);
+        box.addView(meta);
+        if (torrent) {
+            TextView peers = UiKit.caption(act, trf("{0} seeders · {1} peers", r.optInt("seeders"), r.optInt("leechers")));
+            if (r.optInt("seeders") == 0) peers.setTextColor(AppTheme.danger());
+            box.addView(peers);
         }
-        box.addView(actionButton("GRAB", rejected ? AppTheme.warning() : AppTheme.success(), v -> {
-            Runnable go = () -> action(api -> { api.grabRelease(r); return null; }, "Sent to the download client.", d::dismiss);
-            if (rejected) confirm(I18n.tr("This release was rejected by Radarr. Download anyway?"), I18n.tr("GRAB"), AppTheme.warning(), go);
-            else go.run();
-        }), new LinearLayout.LayoutParams(-1, dp(34)));
+        final boolean rejected = isRejected(r);
+        JSONArray rej = r.optJSONArray("rejections");
+        for (int i = 0; rej != null && i < rej.length() && i < 2; i++) {
+            Object item = rej.opt(i);
+            String reason = item instanceof JSONObject ? ((JSONObject) item).optString("reason", "") : String.valueOf(item);
+            if (reason.isEmpty() || "null".equals(reason)) continue;
+            TextView w = UiKit.caption(act, "• " + reason);
+            w.setTextColor(AppTheme.warning());
+            w.setPadding(0, dp(2), 0, 0);
+            box.addView(w);
+        }
+        final Button grab = rejected ? UiKit.outline(act, tr("Grab anyway"), null) : UiKit.primary(act, tr("Grab"), null);
+        grab.setOnClickListener(v -> {
+            final Runnable go = () -> action(grab, api -> {
+                api.grabRelease(r);
+                return null;
+            }, tr("Sent to the download client"), () -> {
+                grab.setText(tr("Sent"));
+                setBusy(grab, true);
+            });
+            if (rejected) {
+                confirm(tr("Grab a rejected release?"), tr("Radarr rejected this release for the reasons shown. Download it anyway?"),
+                        tr("Grab anyway"), false, go);
+            } else {
+                go.run();
+            }
+        });
+        LinearLayout actions = UiKit.row(act);
+        actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        actions.setPadding(0, dp(8), 0, 0);
+        actions.addView(grab, new LinearLayout.LayoutParams(-2, dp(38)));
+        box.addView(actions, new LinearLayout.LayoutParams(-1, -2));
         return box;
     }
 
     // ================================================================== ADD movie
 
     private void showAddDialog() {
-        final LinearLayout body = dialogBody(I18n.tr("Add movie"));
-        final EditText term = new EditText(act);
-        term.setHint(I18n.tr("Search TMDb by title"));
-        term.setHintTextColor(AppTheme.textMuted());
-        term.setTextColor(AppTheme.text());
-        term.setTextSize(13f);
-        term.setSingleLine(true);
+        final LinearLayout body = dialogBody(tr("Add movie"), tr("Search TMDb through Radarr"));
+        LinearLayout bar = UiKit.row(act);
+        bar.setPadding(0, dp(12), 0, 0);
+        final EditText term = UiKit.input(act, tr("Movie title"));
         term.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        body.addView(term);
-        final LinearLayout results = new LinearLayout(act);
-        results.setOrientation(LinearLayout.VERTICAL);
-        ScrollView sv = new ScrollView(act);
-        sv.addView(results);
-        final Dialog d = dialog(body);
-        final Runnable[] go = new Runnable[1];
-        go[0] = () -> {
-            String q = term.getText().toString().trim();
-            if (q.isEmpty()) return;
+        bar.addView(term, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        final Button go = UiKit.primary(act, tr("Search"), null);
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-2, -2);
+        glp.setMarginStart(dp(8));
+        bar.addView(go, glp);
+        body.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+        final LinearLayout results = UiKit.column(act);
+        TextView hint = UiKit.caption(act, tr("Tip: tmdb:603 or imdb:tt0133093 finds an exact movie."));
+        hint.setPadding(dp(2), dp(10), 0, 0);
+        results.addView(hint);
+        body.addView(scrollBox(results));
+        final AlertDialog d = listDialog(body);
+        body.addView(UiKit.buttonRow(act, UiKit.outline(act, tr("Close"), v -> d.dismiss())));
+        final int[] seq = {0};
+        final Runnable run = () -> {
+            final String q = term.getText().toString().trim();
+            if (q.isEmpty() || !go.isEnabled()) return;
+            final int my = ++seq[0];
             results.removeAllViews();
-            results.addView(text(I18n.tr("Searching..."), 12f, AppTheme.textSecondary(), false));
+            results.addView(UiKit.loading(act, tr("Searching…")));
+            setBusy(go, true);
             async(api -> api.lookup(q), arr -> {
+                if (my != seq[0]) return;
+                setBusy(go, false);
                 results.removeAllViews();
                 if (arr.length() == 0) {
-                    results.addView(text(I18n.tr("No results."), 12f, AppTheme.textSecondary(), false));
+                    results.addView(UiKit.empty(act, tr("No results"), tr("Check the spelling or try the original title.")));
                     return;
                 }
-                for (int i = 0; i < Math.min(arr.length(), 25); i++) {
-                    final JSONObject r = arr.optJSONObject(i);
+                for (int i = 0; i < Math.min(arr.length(), 30); i++) {
+                    JSONObject r = arr.optJSONObject(i);
                     if (r != null) results.addView(lookupRow(r, d));
                 }
-            }, t -> { results.removeAllViews(); results.addView(text(msg(t), 12f, AppTheme.danger(), false)); });
+            }, t -> {
+                if (my != seq[0]) return;
+                setBusy(go, false);
+                results.removeAllViews();
+                results.addView(errorView(t, false));
+            });
         };
-        term.setOnEditorActionListener((v, actionId, ev) -> { go[0].run(); return true; });
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, dp(34));
-        blp.topMargin = dp(8);
-        body.addView(actionButton("SEARCH", AppTheme.accent(), v -> go[0].run()), blp);
-        body.addView(sv, new LinearLayout.LayoutParams(-1, dp(360)));
-        d.show();
+        go.setOnClickListener(v -> run.run());
+        term.setOnEditorActionListener((v, actionId, ev) -> {
+            run.run();
+            return true;
+        });
+        show(d);
+        term.requestFocus();
     }
 
-    private View lookupRow(final JSONObject r, final Dialog parent) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(6), dp(6), dp(6), dp(6));
-        row.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        row.setLayoutParams(lp);
-        row.addView(poster(r, 40, 58), new LinearLayout.LayoutParams(dp(40), dp(58)));
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.setPadding(dp(8), 0, 0, 0);
-        TextView t = text(r.optString("title") + (r.optInt("year") > 0 ? " (" + r.optInt("year") + ")" : ""), 12.5f, AppTheme.text(), true);
-        t.setMaxLines(2);
-        t.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(t);
-        final boolean exists = r.optInt("id") > 0;
-        String sline = (exists ? "✔ " + I18n.tr("Already added") + " - " : "")
-                + capitalize(r.optString("status", ""))
-                + (r.optInt("runtime") > 0 ? " - " + r.optInt("runtime") + " min" : "")
-                + (r.optString("studio").isEmpty() ? "" : " - " + r.optString("studio"));
-        TextView s = text(sline, 10.5f, exists ? AppTheme.success() : AppTheme.textMuted(), false);
-        s.setMaxLines(2);
-        s.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(s);
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        row.setClickable(true);
+    private View lookupRow(final JSONObject r, final AlertDialog parent) {
+        LinearLayout row = listRow();
+        row.setGravity(Gravity.TOP);
+        row.addView(poster(r, 40), posterLp(40));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(rowTitle(titleYear(r)));
+        tx.addView(rowMeta(joinDot(fmtRuntime(r.optInt("runtime")), RadarrApi.str(r, "studio"))));
+        String ov = RadarrApi.str(r, "overview");
+        if (!ov.isEmpty()) {
+            TextView o = UiKit.caption(act, ov);
+            o.setMaxLines(2);
+            o.setEllipsize(TextUtils.TruncateAt.END);
+            o.setPadding(0, dp(2), 0, 0);
+            tx.addView(o);
+        }
+        row.addView(tx, textLp());
+        final int existing = r.optInt("id");
+        if (existing > 0) row.addView(UiKit.badge(act, tr("In library"), AppTheme.success()));
         row.setOnClickListener(v -> {
-            if (exists) { parent.dismiss(); openMovie(r.optInt("id")); }
-            else showAddOptions(r, parent);
+            if (debounce()) return;
+            if (existing > 0) {
+                parent.dismiss();
+                section = S_MOVIES;
+                openMovie(existing);
+            } else {
+                showAddOptions(r, parent);
+            }
         });
         return row;
     }
 
-    private void showAddOptions(final JSONObject lookup, final Dialog parent) {
-        final LinearLayout body = dialogBody(I18n.tr("Add") + " " + lookup.optString("title"));
-        final TextView loading = text(I18n.tr("Loading options..."), 12f, AppTheme.textSecondary(), false);
-        body.addView(loading);
-        final Dialog d = dialog(body);
-        d.show();
+    private SharedPreferences prefs() {
+        return act.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
+    private void showAddOptions(final JSONObject lookup, final AlertDialog parent) {
+        final String title = titleYear(lookup);
+        final LinearLayout body = dialogBody(tr("Add movie"), title);
+        final LinearLayout form = UiKit.column(act);
+        form.addView(UiKit.loading(act, tr("Loading options…")));
+        body.addView(form, new LinearLayout.LayoutParams(-1, -2));
+        final AlertDialog d = dialog(body);
+        show(d);
         async(api -> {
             JSONObject o = new JSONObject();
             o.put("roots", api.rootFolders());
             o.put("profiles", api.qualityProfiles());
             return o;
         }, o -> {
-            body.removeView(loading);
-            final JSONArray roots = o.optJSONArray("roots");
-            final JSONArray profiles = o.optJSONArray("profiles");
-            if (roots == null || roots.length() == 0) {
-                body.addView(text(I18n.tr("No root folder is configured. Add one in the SYSTEM section first."), 12f, AppTheme.danger(), false));
+            form.removeAllViews();
+            JSONArray roots = o.optJSONArray("roots");
+            JSONArray profiles = o.optJSONArray("profiles");
+            if (roots == null || roots.length() == 0 || profiles == null || profiles.length() == 0) {
+                form.addView(UiKit.error(act, tr(roots == null || roots.length() == 0 ? "No root folder" : "No quality profile"),
+                        tr(roots == null || roots.length() == 0
+                                ? "Add a root folder in the System section first, then try again."
+                                : "Radarr has no quality profile. Create one in Radarr's web interface."), null, null));
+                form.addView(UiKit.buttonRow(act, UiKit.outline(act, tr("Close"), v -> d.dismiss())));
                 return;
             }
-            if (profiles == null || profiles.length() == 0) {
-                body.addView(text(I18n.tr("No quality profile found in Radarr."), 12f, AppTheme.danger(), false));
-                return;
+            SharedPreferences sp = prefs();
+            final String[] rootPaths = new String[roots.length()];
+            final String[] rootLabels = new String[roots.length()];
+            int rootSel = 0;
+            for (int i = 0; i < roots.length(); i++) {
+                JSONObject rf = roots.optJSONObject(i);
+                rootPaths[i] = rf == null ? "" : rf.optString("path");
+                long free = rf == null ? 0 : rf.optLong("freeSpace");
+                rootLabels[i] = rootPaths[i] + (free > 0 ? "  ·  " + trf("{0} free", fmtSize(free)) : "");
+                if (rootPaths[i].equals(sp.getString("root", ""))) rootSel = i;
             }
-            final String[] rootNames = new String[roots.length()];
-            for (int i = 0; i < roots.length(); i++) rootNames[i] = roots.optJSONObject(i).optString("path");
             final String[] profNames = new String[profiles.length()];
             final int[] profIds = new int[profiles.length()];
+            int profSel = 0;
             for (int i = 0; i < profiles.length(); i++) {
-                profNames[i] = profiles.optJSONObject(i).optString("name");
-                profIds[i] = profiles.optJSONObject(i).optInt("id");
+                JSONObject p = profiles.optJSONObject(i);
+                profNames[i] = p == null ? "?" : p.optString("name");
+                profIds[i] = p == null ? 0 : p.optInt("id");
+                if (profIds[i] == sp.getInt("profile", -1)) profSel = i;
             }
-            final String[] availLabels = {"Announced", "In cinemas", "Released"};
-            final String[] availVals = {"announced", "inCinemas", "released"};
-            final int[] selRoot = {0}, selProf = {0}, selAvail = {2};
-            body.addView(choiceField("Root folder", rootNames, selRoot));
-            body.addView(choiceField("Quality profile", profNames, selProf));
-            body.addView(choiceField("Minimum availability", availLabels, selAvail));
-            final Switch monitored = new Switch(act);
-            monitored.setText(I18n.tr("Monitored"));
-            monitored.setTextColor(AppTheme.text());
-            monitored.setChecked(true);
-            UiStyle.styleSwitch(act, monitored);
-            monitored.setPadding(0, dp(10), 0, dp(2));
-            body.addView(monitored);
-            final Switch search = new Switch(act);
-            search.setText(I18n.tr("Start search for movie"));
-            search.setTextColor(AppTheme.text());
-            search.setChecked(true);
-            UiStyle.styleSwitch(act, search);
-            search.setPadding(0, dp(6), 0, dp(6));
-            body.addView(search);
-            LinearLayout row = buttonRow();
-            row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-            row.addView(actionButton("ADD", AppTheme.success(), v -> {
-                d.dismiss();
-                final String root0 = rootNames[selRoot[0]];
+            final String[] availShown = new String[AVAIL_LABELS.length];
+            int availSel = 2;
+            for (int i = 0; i < AVAIL_LABELS.length; i++) {
+                availShown[i] = tr(AVAIL_LABELS[i]);
+                if (AVAIL_VALUES[i].equals(sp.getString("availability", "released"))) availSel = i;
+            }
+            final int[] selRoot = {rootSel};
+            final int[] selProf = {profSel};
+            final int[] selAvail = {availSel};
+            form.addView(pickField(tr("Root folder"), rootLabels, selRoot, true));
+            form.addView(pickField(tr("Quality profile"), profNames, selProf, false));
+            form.addView(pickField(tr("Minimum availability"), availShown, selAvail, false));
+            final Switch monitored = switchRow(form, tr("Monitored"), tr("Search for it now and upgrade it later."), true);
+            final Switch search = switchRow(form, tr("Start search now"), tr("Look for a release right after adding."), true);
+            final TextView err = UiKit.caption(act, "");
+            err.setTextColor(AppTheme.danger());
+            err.setVisibility(View.GONE);
+            err.setPadding(0, dp(8), 0, 0);
+            form.addView(err);
+            final Button cancel = UiKit.outline(act, tr("Cancel"), v -> d.dismiss());
+            final Button add = UiKit.primary(act, tr("Add movie"), null);
+            add.setOnClickListener(v -> {
+                if (!add.isEnabled()) return;
+                final String root0 = rootPaths[selRoot[0]];
                 final int prof0 = profIds[selProf[0]];
-                final String avail0 = availVals[selAvail[0]];
+                final String avail0 = AVAIL_VALUES[selAvail[0]];
                 final boolean mon0 = monitored.isChecked();
-                final boolean search0 = search.isChecked();
-                action(api -> {
-                    api.addMovie(lookup, root0, prof0, mon0, avail0, search0);
-                    return null;
-                }, "Movie added.", () -> {
-                    movieCache = null;
+                final boolean search0 = search.isChecked() && mon0;
+                setBusy(add, true);
+                setBusy(cancel, true);
+                add.setText(tr("Adding…"));
+                err.setVisibility(View.GONE);
+                async(api -> api.addMovie(lookup, root0, prof0, mon0, avail0, search0), created -> {
+                    prefs().edit().putString("root", root0).putInt("profile", prof0).putString("availability", avail0).apply();
+                    d.dismiss();
                     parent.dismiss();
-                    refresh();
+                    movieCache = null;
+                    toast(trf("{0} added", title));
+                    int nid = created.optInt("id");
+                    section = S_MOVIES;
+                    if (nid > 0) openMovie(nid);
+                    else refresh();
+                }, t -> {
+                    setBusy(add, false);
+                    setBusy(cancel, false);
+                    add.setText(tr("Add movie"));
+                    err.setText(errText(t));
+                    err.setVisibility(View.VISIBLE);
                 });
-            }), weight());
-            body.addView(row);
-        }, t -> { loading.setText(msg(t)); loading.setTextColor(AppTheme.danger()); });
+            });
+            form.addView(UiKit.buttonRow(act, cancel, add));
+        }, t -> {
+            form.removeAllViews();
+            form.addView(errorView(t, false));
+            form.addView(UiKit.buttonRow(act, UiKit.outline(act, tr("Close"), v -> d.dismiss())));
+        });
     }
 
-    private View choiceField(final String label, final String[] options, final int[] selected) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(0, dp(8), 0, 0);
-        box.addView(text(I18n.tr(label), 10.5f, AppTheme.textMuted(), false));
-        final TextView value = text(I18n.tr(options[selected[0]]), 13f, AppTheme.text(), false);
-        value.setPadding(dp(10), dp(9), dp(10), dp(9));
-        value.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 8));
+    /** Label + tappable value box that opens a single-choice list. */
+    private View pickField(final String label, final String[] options, final int[] selected, boolean mono) {
+        LinearLayout box = UiKit.column(act);
+        TextView l = UiKit.caption(act, label);
+        l.setPadding(dp(2), dp(12), 0, dp(6));
+        box.addView(l);
+        LinearLayout field = UiKit.row(act);
+        field.setPadding(dp(14), dp(11), dp(14), dp(11));
+        field.setBackground(UiKit.pressable(act, AppTheme.inner(), AppTheme.outline(), UiKit.R_INNER));
+        final TextView value = mono ? UiKit.mono(act, options[selected[0]])
+                : UiKit.text(act, options[selected[0]], 14f, AppTheme.text(), null);
+        value.setTextIsSelectable(false);
         value.setSingleLine(true);
         value.setEllipsize(TextUtils.TruncateAt.MIDDLE);
-        value.setOnClickListener(v -> {
-            final String[] shown = new String[options.length];
-            for (int i = 0; i < options.length; i++) shown[i] = I18n.tr(options[i]);
-            new AlertDialog.Builder(act).setItems(shown, (dd, which) -> {
+        field.addView(value, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        TextView caret = UiKit.caption(act, "▾");
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-2, -2);
+        clp.setMarginStart(dp(8));
+        field.addView(caret, clp);
+        field.setClickable(true);
+        field.setOnClickListener(v -> {
+            if (dead()) return;
+            new AlertDialog.Builder(act).setTitle(label).setSingleChoiceItems(options, selected[0], (dd, which) -> {
                 selected[0] = which;
-                value.setText(shown[which]);
+                value.setText(options[which]);
+                dd.dismiss();
             }).show();
         });
-        box.addView(value);
+        box.addView(field, new LinearLayout.LayoutParams(-1, -2));
         return box;
     }
 
@@ -834,74 +1183,72 @@ public final class RadarrTabView {
 
     private void loadCalendar() {
         final int req = ++requestCounter;
-        showMessage("Loading...");
+        showLoading(tr("Loading calendar…"));
         final SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
         Calendar c = Calendar.getInstance();
-        c.add(Calendar.DAY_OF_YEAR, -3);
+        c.add(Calendar.DAY_OF_YEAR, -7);
         final String start = f.format(c.getTime());
-        c.add(Calendar.DAY_OF_YEAR, 45);
+        c.add(Calendar.DAY_OF_YEAR, 7 + 60);
         final String end = f.format(c.getTime());
         async(api -> api.calendar(start, end), arr -> {
             if (req != requestCounter || section != S_CALENDAR || detailMovieId > 0) return;
-            listContainer.removeAllViews();
-            // One entry per (release date inside the window, release kind).
-            TreeMap<String, List<JSONObject>> byDate = new TreeMap<>();
+            content.removeAllViews();
+            TreeMap<String, List<Object[]>> byDay = new TreeMap<>();
             String[] keys = {"inCinemas", "digitalRelease", "physicalRelease"};
             String[] kinds = {"In cinemas", "Digital release", "Physical release"};
-            try {
-                for (int i = 0; i < arr.length(); i++) {
-                    JSONObject m = arr.optJSONObject(i);
-                    if (m == null) continue;
-                    for (int k = 0; k < keys.length; k++) {
-                        String iso = m.optString(keys[k], "");
-                        if (iso.length() < 10) continue;
-                        String day = iso.substring(0, 10);
-                        if (day.compareTo(start) < 0 || day.compareTo(end) > 0) continue;
-                        JSONObject entry = new JSONObject();
-                        entry.put("movie", m);
-                        entry.put("kind", kinds[k]);
-                        List<JSONObject> l = byDate.get(day);
-                        if (l == null) { l = new ArrayList<>(); byDate.put(day, l); }
-                        l.add(entry);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject m = arr.optJSONObject(i);
+                if (m == null) continue;
+                for (int k = 0; k < keys.length; k++) {
+                    String iso = RadarrApi.str(m, keys[k]);
+                    if (iso.length() < 10) continue;
+                    String day = iso.substring(0, 10);
+                    if (day.compareTo(start) < 0 || day.compareTo(end) > 0) continue;
+                    List<Object[]> l = byDay.get(day);
+                    if (l == null) {
+                        l = new ArrayList<>();
+                        byDay.put(day, l);
                     }
+                    l.add(new Object[]{m, kinds[k]});
                 }
-            } catch (Throwable ex) {
-                showError(ex);
+            }
+            if (byDay.isEmpty()) {
+                content.addView(UiKit.empty(act, tr("Nothing scheduled"),
+                        tr("No monitored movie is released between last week and the next two months.")));
                 return;
             }
-            if (byDate.isEmpty()) { showMessage("Nothing scheduled in this period."); return; }
-            String today = today();
-            for (java.util.Map.Entry<String, List<JSONObject>> en : byDate.entrySet()) {
-                boolean isToday = en.getKey().equals(today);
-                TextView h = text(en.getKey() + (isToday ? "   - " + I18n.tr("TODAY") : ""), 11f,
-                        isToday ? AppTheme.accent() : AppTheme.textMuted(), true);
-                h.setPadding(dp(2), dp(14), 0, dp(2));
-                listContainer.addView(h);
-                for (JSONObject entry : en.getValue()) listContainer.addView(calendarRow(entry));
+            String today = f.format(new Date());
+            for (Map.Entry<String, List<Object[]>> en : byDay.entrySet()) {
+                String label = fmtDay(en.getKey());
+                if (en.getKey().equals(today)) label = trf("Today · {0}", label);
+                TextView h = UiKit.overline(act, label);
+                if (en.getKey().equals(today)) h.setTextColor(AppTheme.accent());
+                h.setPadding(dp(2), dp(6), 0, dp(8));
+                content.addView(h);
+                LinearLayout card = listCard();
+                int n = 0;
+                for (Object[] e : en.getValue()) {
+                    if (n++ > 0) card.addView(separator(56));
+                    card.addView(calendarRow((JSONObject) e[0], (String) e[1]));
+                }
+                content.addView(card);
             }
-        }, t -> { if (req == requestCounter) showError(t); });
+        }, t -> {
+            if (req == requestCounter && section == S_CALENDAR) showError(t);
+        });
     }
 
-    private View calendarRow(JSONObject entry) {
-        final JSONObject m = entry.optJSONObject("movie");
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(dp(12), dp(8), dp(12), dp(8));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        row.setLayoutParams(lp);
-        row.addView(text(m == null ? "?" : m.optString("title") + (m.optInt("year") > 0 ? " (" + m.optInt("year") + ")" : ""),
-                12.5f, AppTheme.text(), true));
-        boolean has = m != null && m.optBoolean("hasFile");
-        TextView t = text(I18n.tr(entry.optString("kind")) + (has ? "   ✔" : ""), 11f,
-                has ? AppTheme.success() : AppTheme.textSecondary(), false);
-        row.addView(t);
-        if (m != null && m.optInt("id") > 0) {
-            row.setClickable(true);
-            final int mid = m.optInt("id");
-            row.setOnClickListener(v -> openMovie(mid));
-        }
+    private View calendarRow(final JSONObject m, String kind) {
+        LinearLayout row = listRow();
+        row.addView(poster(m, 32), posterLp(32));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(rowTitle(titleYear(m)));
+        tx.addView(rowMeta(joinDot(tr(kind), fmtRuntime(m.optInt("runtime")))));
+        row.addView(tx, textLp());
+        View b = movieBadge(m);
+        if (b != null) row.addView(b);
+        final int mid = m.optInt("id");
+        if (mid > 0) row.setOnClickListener(v -> openMovie(mid));
         return row;
     }
 
@@ -909,89 +1256,160 @@ public final class RadarrTabView {
 
     private void loadQueue(final boolean silent) {
         final int req = ++requestCounter;
-        if (!silent) showMessage("Loading...");
+        if (!silent) showLoading(tr("Loading queue…"));
         async(api -> api.queue(1, 100), o -> {
             if (req != requestCounter || section != S_QUEUE || detailMovieId > 0) return;
-            int y = scroll.getScrollY();
-            listContainer.removeAllViews();
-            JSONArray recs = o.optJSONArray("records");
-            if (recs == null || recs.length() == 0) { showMessage("The queue is empty."); return; }
-            TextView c = text(recs.length() + " " + I18n.tr("items downloading"), 11f, AppTheme.textSecondary(), false);
-            c.setPadding(0, dp(8), 0, dp(2));
-            listContainer.addView(c);
-            for (int i = 0; i < recs.length(); i++) {
-                JSONObject r = recs.optJSONObject(i);
-                if (r != null) listContainer.addView(queueRow(r));
+            queueOfflineShown = false;
+            final int y = scroll.getScrollY();
+            renderQueue(o);
+            if (silent) scroll.post(() -> scroll.scrollTo(0, y));
+            schedulePoll();
+        }, t -> {
+            if (req != requestCounter || section != S_QUEUE || detailMovieId > 0) return;
+            if (!silent || (RadarrApi.isOffline(t) && !queueOfflineShown)) {
+                showError(t);
+                queueOfflineShown = RadarrApi.isOffline(t);
             }
-            scroll.post(() -> scroll.scrollTo(0, y));
-        }, t -> { if (req == requestCounter && !silent) showError(t); });
+            schedulePoll();
+        });
+    }
+
+    private void renderQueue(JSONObject o) {
+        content.removeAllViews();
+        JSONArray recs = o.optJSONArray("records");
+        int count = recs == null ? 0 : recs.length();
+        int total = o.optInt("totalRecords", count);
+        if (count == 0) {
+            content.addView(UiKit.empty(act, tr("The queue is empty"),
+                    tr("Downloads Radarr sends to the download client show up here.")));
+            return;
+        }
+        TextView c = UiKit.caption(act, total > count ? trf("{0} in queue · showing {1}", total, count) : trf("{0} in queue", total));
+        c.setPadding(dp(2), 0, 0, dp(8));
+        content.addView(c);
+        LinearLayout card = listCard();
+        for (int i = 0; i < count; i++) {
+            JSONObject r = recs.optJSONObject(i);
+            if (r == null) continue;
+            if (card.getChildCount() > 0) card.addView(separator(12));
+            card.addView(queueRow(r));
+        }
+        content.addView(card);
     }
 
     private View queueRow(final JSONObject r) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(12), dp(10), dp(12), dp(10));
-        box.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 12));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(6);
-        box.setLayoutParams(lp);
+        LinearLayout box = UiKit.column(act);
+        box.setPadding(dp(12), dp(12), dp(12), dp(12));
+        box.setBackground(UiKit.rowRipple(act));
         JSONObject m = r.optJSONObject("movie");
-        box.addView(text(m == null ? r.optString("title") : m.optString("title")
-                + (m.optInt("year") > 0 ? " (" + m.optInt("year") + ")" : ""), 12.5f, AppTheme.text(), true));
-        TextView rel = text(r.optString("title"), 10f, AppTheme.textMuted(), false);
-        rel.setMaxLines(2);
-        rel.setEllipsize(TextUtils.TruncateAt.END);
-        rel.setPadding(0, dp(2), 0, dp(4));
-        box.addView(rel);
-        double size = r.optDouble("size", 0), left = r.optDouble("sizeleft", 0);
-        int pct = size > 0 ? (int) Math.max(0, Math.min(100, (size - left) * 100.0 / size)) : 0;
-        ProgressBar pb = new ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal);
-        pb.setMax(100);
-        pb.setProgress(pct);
-        box.addView(pb, new LinearLayout.LayoutParams(-1, dp(4)));
-        String status = r.optString("status", "") + ("warning".equals(r.optString("trackedDownloadStatus")) ? " ⚠" : "")
-                + "  -  " + pct + "%  -  " + fmtSize((long) size)
-                + (r.optString("timeleft").isEmpty() ? "" : "  -  " + r.optString("timeleft"))
-                + (r.optString("downloadClient").isEmpty() ? "" : "  -  " + r.optString("downloadClient"));
-        TextView st = text(status, 10.5f, AppTheme.textSecondary(), false);
-        st.setPadding(0, dp(4), 0, dp(4));
-        box.addView(st);
+        final String movieTitle = m != null ? titleYear(m) : r.optString("title");
+
+        LinearLayout top = UiKit.row(act);
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(rowTitle(movieTitle));
+        TextView rel = UiKit.caption(act, r.optString("title"));
+        rel.setSingleLine(true);
+        rel.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        rel.setPadding(0, dp(2), 0, 0);
+        tx.addView(rel);
+        top.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Object[] st = queueStatus(r);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+        blp.setMarginStart(dp(8));
+        top.addView(UiKit.badge(act, (String) st[0], (Integer) st[1]), blp);
+        box.addView(top);
+
+        double size = r.optDouble("size", 0);
+        double left = r.has("sizeleft") ? r.optDouble("sizeleft", 0) : r.optDouble("sizeLeft", 0);
+        int pct = size > 0 ? (int) Math.max(0, Math.min(100, Math.round((size - left) * 100.0 / size))) : 0;
+        box.addView(UiKit.progress(act, pct, (Integer) st[1]));
+        String timeleft = RadarrApi.str(r, "timeleft");
+        if (timeleft.isEmpty()) timeleft = RadarrApi.str(r, "timeLeft");
+        String eta = fmtTimeLeft(timeleft);
+        TextView meta = UiKit.caption(act, joinDot(pct + "%",
+                size > 0 ? trf("{0} of {1}", fmtSize((long) (size - left)), fmtSize((long) size)) : "",
+                eta.isEmpty() ? "" : trf("{0} left", eta), RadarrApi.str(r, "downloadClient")));
+        meta.setPadding(0, dp(6), 0, 0);
+        box.addView(meta);
+
         JSONArray msgs = r.optJSONArray("statusMessages");
-        if (msgs != null && msgs.length() > 0) {
-            JSONObject m0 = msgs.optJSONObject(0);
-            JSONArray mm = m0 == null ? null : m0.optJSONArray("messages");
-            String warn = mm != null && mm.length() > 0 ? mm.optString(0) : (m0 == null ? "" : m0.optString("title"));
-            if (!warn.isEmpty()) box.addView(text("⚠ " + warn, 10f, AppTheme.warning(), false));
+        int shown = 0;
+        for (int i = 0; msgs != null && i < msgs.length() && shown < 2; i++) {
+            JSONObject m0 = msgs.optJSONObject(i);
+            if (m0 == null) continue;
+            JSONArray mm = m0.optJSONArray("messages");
+            String w = mm != null && mm.length() > 0 ? mm.optString(0) : m0.optString("title");
+            if (w == null || w.isEmpty()) continue;
+            TextView wt = UiKit.caption(act, "• " + w);
+            wt.setTextColor(AppTheme.warning());
+            wt.setPadding(0, dp(3), 0, 0);
+            box.addView(wt);
+            shown++;
+        }
+        String em = RadarrApi.str(r, "errorMessage");
+        if (!em.isEmpty()) {
+            TextView et = UiKit.caption(act, em);
+            et.setTextColor(AppTheme.danger());
+            et.setPadding(0, dp(3), 0, 0);
+            box.addView(et);
         }
         final int qid = r.optInt("id");
-        box.addView(actionButton("REMOVE", AppTheme.danger(), v -> showRemoveQueue(qid)), new LinearLayout.LayoutParams(-1, dp(32)));
+        LinearLayout actions = UiKit.row(act);
+        actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        actions.setPadding(0, dp(8), 0, 0);
+        Button remove = UiKit.danger(act, tr("Remove"), v -> {
+            if (!debounce()) showRemoveQueue(qid, movieTitle);
+        });
+        actions.addView(remove, new LinearLayout.LayoutParams(-2, dp(36)));
+        box.addView(actions, new LinearLayout.LayoutParams(-1, -2));
+        final int mid = r.optInt("movieId");
+        if (mid > 0) box.setOnClickListener(v -> openMovie(mid));
         return box;
     }
 
-    private void showRemoveQueue(final int id) {
-        final LinearLayout body = dialogBody(I18n.tr("Remove from queue"));
-        final Switch client = new Switch(act);
-        client.setText(I18n.tr("Also remove from the download client"));
-        client.setTextColor(AppTheme.text());
-        client.setChecked(true);
-        UiStyle.styleSwitch(act, client);
-        body.addView(client);
-        final Switch block = new Switch(act);
-        block.setText(I18n.tr("Add the release to the blocklist"));
-        block.setTextColor(AppTheme.text());
-        UiStyle.styleSwitch(act, block);
-        block.setPadding(0, dp(10), 0, dp(10));
-        body.addView(block);
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("REMOVE", AppTheme.danger(), v -> {
-            d.dismiss();
-            final boolean rc = client.isChecked(), bl = block.isChecked();
-            action(api -> { api.removeQueueItem(id, rc, bl); return null; }, "Removed.", this::refresh);
-        }), weight());
-        body.addView(row);
-        d.show();
+    /** [label, colour] for a queue record. */
+    private static Object[] queueStatus(JSONObject r) {
+        String status = RadarrApi.str(r, "status");
+        String tracked = RadarrApi.str(r, "trackedDownloadStatus");
+        String state = RadarrApi.str(r, "trackedDownloadState");
+        if ("failed".equalsIgnoreCase(status) || "error".equalsIgnoreCase(tracked) || "failedPending".equals(state)) {
+            return new Object[]{tr("Failed"), AppTheme.danger()};
+        }
+        if ("importBlocked".equals(state)) return new Object[]{tr("Import blocked"), AppTheme.warning()};
+        if ("warning".equalsIgnoreCase(tracked) || "warning".equalsIgnoreCase(status)) return new Object[]{tr("Warning"), AppTheme.warning()};
+        if ("importPending".equals(state)) return new Object[]{tr("Import pending"), AppTheme.accent()};
+        if ("importing".equals(state)) return new Object[]{tr("Importing"), AppTheme.accent()};
+        if ("imported".equals(state)) return new Object[]{tr("Imported"), AppTheme.success()};
+        if ("downloadClientUnavailable".equalsIgnoreCase(status)) return new Object[]{tr("Client offline"), AppTheme.danger()};
+        if ("completed".equalsIgnoreCase(status)) return new Object[]{tr("Completed"), AppTheme.success()};
+        if ("paused".equalsIgnoreCase(status)) return new Object[]{tr("Paused"), AppTheme.textMuted()};
+        if ("queued".equalsIgnoreCase(status)) return new Object[]{tr("Queued"), AppTheme.textMuted()};
+        if ("delay".equalsIgnoreCase(status)) return new Object[]{tr("Delayed"), AppTheme.textMuted()};
+        return new Object[]{tr("Downloading"), AppTheme.accent()};
+    }
+
+    private void showRemoveQueue(final int id, String title) {
+        final LinearLayout body = dialogBody(tr("Remove from queue?"), title);
+        final Switch client = switchRow(body, tr("Remove from the download client"),
+                tr("Also deletes the torrent and its data in the download client."), true);
+        final Switch block = switchRow(body, tr("Block this release"),
+                tr("Adds it to the blocklist so Radarr does not grab it again."), false);
+        final AlertDialog d = dialog(body);
+        final Button cancel = UiKit.outline(act, tr("Cancel"), v -> d.dismiss());
+        final Button rm = UiKit.danger(act, tr("Remove"), null);
+        rm.setOnClickListener(v -> {
+            final boolean rc = client.isChecked();
+            final boolean bl = block.isChecked();
+            action(rm, api -> {
+                api.removeQueueItem(id, rc, bl);
+                return null;
+            }, tr("Removed from the queue"), () -> {
+                d.dismiss();
+                if (section == S_QUEUE) loadQueue(true);
+            });
+        });
+        body.addView(UiKit.buttonRow(act, cancel, rm));
+        show(d);
     }
 
     // ================================================================== HISTORY
@@ -999,53 +1417,65 @@ public final class RadarrTabView {
     private void loadHistory() {
         final int req = ++requestCounter;
         final int pg = page;
-        showMessage("Loading...");
+        showLoading(tr("Loading history…"));
         async(api -> api.history(pg, PAGE_SIZE), o -> {
-            if (req != requestCounter) return;
-            listContainer.removeAllViews();
+            if (req != requestCounter || section != S_HISTORY || detailMovieId > 0) return;
+            content.removeAllViews();
             JSONArray recs = o.optJSONArray("records");
-            if (recs == null || recs.length() == 0) { showMessage("No history yet."); return; }
+            int total = o.optInt("totalRecords", recs == null ? 0 : recs.length());
+            if (recs == null || recs.length() == 0) {
+                content.addView(UiKit.empty(act, tr("No history yet"), tr("Grabs, imports and failures appear here.")));
+                return;
+            }
+            TextView c = UiKit.caption(act, trf("{0} events", total));
+            c.setPadding(dp(2), 0, 0, dp(8));
+            content.addView(c);
+            LinearLayout card = listCard();
             for (int i = 0; i < recs.length(); i++) {
                 JSONObject r = recs.optJSONObject(i);
-                if (r != null) listContainer.addView(historyRow(r));
+                if (r == null) continue;
+                if (card.getChildCount() > 0) card.addView(separator(12));
+                card.addView(historyRow(r));
             }
-            addPager(pg, o.optInt("totalRecords"));
-        }, t -> { if (req == requestCounter) showError(t); });
+            content.addView(card);
+            addPager(pg, total);
+        }, t -> {
+            if (req == requestCounter && section == S_HISTORY) showError(t);
+        });
     }
 
     private View historyRow(final JSONObject r) {
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(12), dp(8), dp(12), dp(8));
-        box.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        box.setLayoutParams(lp);
+        LinearLayout row = listRow();
         JSONObject m = r.optJSONObject("movie");
-        box.addView(text(m == null ? "?" : m.optString("title") + (m.optInt("year") > 0 ? " (" + m.optInt("year") + ")" : ""),
-                12.5f, AppTheme.text(), true));
-        String ev = r.optString("eventType", "");
-        int color = AppTheme.textSecondary();
-        String label = ev;
-        if (ev.equals("grabbed")) { label = "Grabbed"; color = AppTheme.accent(); }
-        else if (ev.equals("downloadFolderImported")) { label = "Imported"; color = AppTheme.success(); }
-        else if (ev.equals("downloadFailed")) { label = "Download failed"; color = AppTheme.danger(); }
-        else if (ev.equals("movieFileDeleted")) { label = "File deleted"; color = AppTheme.warning(); }
-        else if (ev.equals("movieFileRenamed")) label = "Renamed";
-        else if (ev.equals("downloadIgnored")) label = "Ignored";
-        box.addView(text(I18n.tr(label), 11f, color, true));
-        TextView src = text(r.optString("sourceTitle"), 10f, AppTheme.textMuted(), false);
-        src.setMaxLines(2);
-        src.setEllipsize(TextUtils.TruncateAt.END);
-        box.addView(src);
-        String date = r.optString("date", "");
-        box.addView(text(date.length() >= 16 ? date.substring(0, 10) + " " + date.substring(11, 16) : date, 10f, AppTheme.textMuted(), false));
-        if (m != null && m.optInt("id") > 0) {
-            final int mid = m.optInt("id");
-            box.setClickable(true);
-            box.setOnClickListener(v -> openMovie(mid));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(rowTitle(m != null ? titleYear(m) : r.optString("sourceTitle")));
+        JSONObject data = r.optJSONObject("data");
+        String reason = data == null ? "" : RadarrApi.str(data, "reason");
+        tx.addView(rowMeta(joinDot(qualityName(r), relTime(parseIso(RadarrApi.str(r, "date"))), reason)));
+        if (m != null) {
+            TextView src = UiKit.caption(act, r.optString("sourceTitle"));
+            src.setSingleLine(true);
+            src.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            src.setPadding(0, dp(2), 0, 0);
+            tx.addView(src);
         }
-        return box;
+        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        String ev = RadarrApi.str(r, "eventType");
+        String label;
+        int color;
+        if ("grabbed".equals(ev)) { label = "Grabbed"; color = AppTheme.accent(); }
+        else if ("downloadFolderImported".equals(ev) || "movieFolderImported".equals(ev)) { label = "Imported"; color = AppTheme.success(); }
+        else if ("downloadFailed".equals(ev)) { label = "Failed"; color = AppTheme.danger(); }
+        else if ("movieFileDeleted".equals(ev)) { label = "File deleted"; color = AppTheme.warning(); }
+        else if ("movieFileRenamed".equals(ev)) { label = "Renamed"; color = AppTheme.textMuted(); }
+        else if ("downloadIgnored".equals(ev)) { label = "Ignored"; color = AppTheme.textMuted(); }
+        else { label = ev.isEmpty() ? "Event" : capitalize(ev); color = AppTheme.textMuted(); }
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+        blp.setMarginStart(dp(8));
+        row.addView(UiKit.badge(act, tr(label), color), blp);
+        final int mid = m != null ? m.optInt("id") : r.optInt("movieId");
+        if (mid > 0) row.setOnClickListener(v -> openMovie(mid));
+        return row;
     }
 
     // ================================================================== WANTED
@@ -1054,110 +1484,136 @@ public final class RadarrTabView {
         final int req = ++requestCounter;
         final int pg = page;
         final boolean cutoff = wantedCutoff;
-        showMessage("Loading...");
-        async(api -> cutoff ? api.wantedCutoff(pg, PAGE_SIZE) : api.wantedMissing(pg, PAGE_SIZE), o -> {
+        showLoading(tr("Loading wanted movies…"));
+        async(api -> {
+            try {
+                return cutoff ? api.wantedCutoff(pg, PAGE_SIZE) : api.wantedMissing(pg, PAGE_SIZE);
+            } catch (RadarrApi.ApiException e) {
+                // Older Radarr builds have no /wanted endpoints: compute the same list from the library.
+                if (e.status == 404) return api.wantedFromLibrary(cutoff, pg, PAGE_SIZE);
+                throw e;
+            }
+        }, o -> {
             if (req != requestCounter || section != S_WANTED || detailMovieId > 0) return;
-            listContainer.removeAllViews();
-            int total = o.optInt("totalRecords");
-
-            LinearLayout toggle = new LinearLayout(act);
-            toggle.setOrientation(LinearLayout.HORIZONTAL);
-            toggle.setPadding(0, dp(8), 0, dp(2));
-            TextView pm = pill("MISSING", !cutoff);
-            pm.setOnClickListener(v -> { wantedCutoff = false; page = 1; refresh(); });
-            LinearLayout.LayoutParams plp1 = new LinearLayout.LayoutParams(-2, dp(34));
-            plp1.setMarginEnd(dp(6));
-            toggle.addView(pm, plp1);
-            TextView pc = pill("CUTOFF UNMET", cutoff);
-            pc.setOnClickListener(v -> { wantedCutoff = true; page = 1; refresh(); });
-            toggle.addView(pc, new LinearLayout.LayoutParams(-2, dp(34)));
-            listContainer.addView(toggle);
-
-            LinearLayout bar = new LinearLayout(act);
-            bar.setOrientation(LinearLayout.HORIZONTAL);
-            bar.setGravity(Gravity.CENTER_VERTICAL);
-            bar.setPadding(0, dp(6), 0, dp(4));
-            bar.addView(text(total + " " + I18n.tr(cutoff ? "cutoff unmet" : "missing"), 11f, AppTheme.textSecondary(), false),
-                    new LinearLayout.LayoutParams(0, -2, 1.0f));
-            bar.addView(actionButton("SEARCH ALL", AppTheme.success(), v ->
-                    confirm(I18n.tr(cutoff ? "Ask Radarr to search for all monitored movies that have not met their cutoff?"
-                                    : "Ask Radarr to search for all monitored missing movies?"),
-                            I18n.tr("SEARCH"), AppTheme.success(), () ->
-                                    action(api2 -> {
-                                        if (cutoff) api2.searchCutoffUnmet(); else api2.searchMissing();
-                                        return null;
-                                    }, "Search queued.", null))), new LinearLayout.LayoutParams(-2, dp(34)));
-            listContainer.addView(bar);
-            JSONArray recs = o.optJSONArray("records");
-            if (recs == null || recs.length() == 0) {
-                TextView none = text(I18n.tr(cutoff ? "No monitored movies with unmet cutoff." : "No monitored missing movies."),
-                        12f, AppTheme.textSecondary(), false);
-                none.setPadding(0, dp(12), 0, 0);
-                listContainer.addView(none);
-                return;
-            }
-            for (int i = 0; i < recs.length(); i++) {
-                JSONObject r = recs.optJSONObject(i);
-                if (r != null) listContainer.addView(wantedRow(r));
-            }
-            addPager(pg, total);
-        }, t -> { if (req == requestCounter) showError(t); });
+            renderWanted(o, pg, cutoff);
+        }, t -> {
+            if (req == requestCounter && section == S_WANTED) showError(t);
+        });
     }
 
-    private View wantedRow(final JSONObject m) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(8), dp(8), dp(10), dp(8));
-        row.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(5);
-        row.setLayoutParams(lp);
-        row.addView(poster(m, 36, 52), new LinearLayout.LayoutParams(dp(36), dp(52)));
-        LinearLayout tx = new LinearLayout(act);
-        tx.setOrientation(LinearLayout.VERTICAL);
-        tx.setPadding(dp(10), 0, dp(6), 0);
-        TextView t = text(m.optString("title", "?") + (m.optInt("year") > 0 ? " (" + m.optInt("year") + ")" : ""),
-                12.5f, AppTheme.text(), true);
-        t.setMaxLines(2);
-        t.setEllipsize(TextUtils.TruncateAt.END);
-        tx.addView(t);
-        StringBuilder dates = new StringBuilder(capitalize(m.optString("status", "")));
-        String dig = m.optString("digitalRelease", "");
-        String cin = m.optString("inCinemas", "");
-        if (dig.length() >= 10) dates.append(" - ").append(I18n.tr("Digital")).append(" ").append(dig.substring(0, 10));
-        else if (cin.length() >= 10) dates.append(" - ").append(I18n.tr("Cinemas")).append(" ").append(cin.substring(0, 10));
-        if (m.optBoolean("hasFile")) {
-            String qn = qualityName(m.optJSONObject("movieFile"));
-            if (!qn.isEmpty()) dates.append(" - ").append(qn);
+    private void renderWanted(JSONObject o, int pg, final boolean cutoff) {
+        content.removeAllViews();
+        int total = o.optInt("totalRecords");
+
+        LinearLayout toggle = UiKit.row(act);
+        toggle.setPadding(0, 0, 0, dp(10));
+        TextView pm = UiKit.chip(act, tr("Missing"), !cutoff);
+        pm.setOnClickListener(v -> {
+            if (!wantedCutoff) return;
+            wantedCutoff = false;
+            page = 1;
+            refresh();
+        });
+        toggle.addView(pm, UiKit.chipLp(act));
+        TextView pc = UiKit.chip(act, tr("Cutoff unmet"), cutoff);
+        pc.setOnClickListener(v -> {
+            if (wantedCutoff) return;
+            wantedCutoff = true;
+            page = 1;
+            refresh();
+        });
+        toggle.addView(pc, UiKit.chipLp(act));
+        content.addView(UiKit.chipScroller(act, toggle), new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout bar = UiKit.row(act);
+        bar.setPadding(0, 0, 0, dp(10));
+        TextView count = UiKit.caption(act, trf("{0} movies", total));
+        bar.addView(count, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        final Button all = UiKit.primary(act, tr("Search all"), null);
+        all.setEnabled(total > 0);
+        if (total == 0) all.setAlpha(0.5f);
+        all.setOnClickListener(v -> confirm(tr("Search all?"),
+                tr(cutoff ? "Radarr searches for an upgrade for every monitored movie below its quality cutoff."
+                        : "Radarr searches for every monitored missing movie. This can send many requests to your indexers."),
+                tr("Search all"), false, () -> action(all, api -> {
+                    if (cutoff) api.searchCutoffUnmet(); else api.searchMissing();
+                    return null;
+                }, tr("Search started"), null)));
+        bar.addView(all, new LinearLayout.LayoutParams(-2, -2));
+        content.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+
+        JSONArray recs = o.optJSONArray("records");
+        if (recs == null || recs.length() == 0) {
+            content.addView(UiKit.empty(act, tr(cutoff ? "Nothing below cutoff" : "Nothing missing"),
+                    tr(cutoff ? "Every monitored movie meets its quality cutoff." : "Every monitored, available movie has a file.")));
+            return;
         }
-        tx.addView(text(dates.toString(), 10.5f, AppTheme.textMuted(), false));
-        row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        LinearLayout card = listCard();
+        for (int i = 0; i < recs.length(); i++) {
+            JSONObject r = recs.optJSONObject(i);
+            if (r == null) continue;
+            if (card.getChildCount() > 0) card.addView(separator(60));
+            card.addView(wantedRow(r, cutoff));
+        }
+        content.addView(card);
+        addPager(pg, total);
+    }
+
+    private View wantedRow(final JSONObject m, boolean cutoff) {
+        LinearLayout row = listRow();
+        row.addView(poster(m, 36), posterLp(36));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(rowTitle(titleYear(m)));
+        String when;
+        String dig = fmtDay(RadarrApi.str(m, "digitalRelease"));
+        String phys = fmtDay(RadarrApi.str(m, "physicalRelease"));
+        String cin = fmtDay(RadarrApi.str(m, "inCinemas"));
+        if (!dig.isEmpty()) when = trf("Digital {0}", dig);
+        else if (!phys.isEmpty()) when = trf("Physical {0}", phys);
+        else if (!cin.isEmpty()) when = trf("In cinemas {0}", cin);
+        else when = tr(statusLabel(RadarrApi.str(m, "status")));
+        String q = cutoff ? qualityName(m.optJSONObject("movieFile")) : "";
+        tx.addView(rowMeta(joinDot(q, when)));
+        row.addView(tx, textLp());
         final int mid = m.optInt("id");
-        row.addView(actionButton("SEARCH", AppTheme.success(), v ->
-                action(api -> { api.searchMovie(mid); return null; }, "Search queued.", null)), new LinearLayout.LayoutParams(-2, dp(32)));
-        if (mid > 0) {
-            tx.setOnClickListener(v -> openMovie(mid));
-        }
+        final Button s = UiKit.tonal(act, tr("Search"), null);
+        s.setOnClickListener(v -> action(s, api -> {
+            api.searchMovie(mid);
+            return null;
+        }, tr("Search started"), () -> {
+            s.setText(tr("Queued"));
+            setBusy(s, true);
+        }));
+        row.addView(s, new LinearLayout.LayoutParams(-2, dp(36)));
+        if (mid > 0) row.setOnClickListener(v -> openMovie(mid));
         return row;
     }
 
     private void addPager(int pg, int total) {
-        LinearLayout pager = new LinearLayout(act);
-        pager.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, -2);
-        plp.topMargin = dp(10);
-        pager.setLayoutParams(plp);
-        if (pg > 1) pager.addView(actionButton("PREV", AppTheme.accent(), v -> { page--; refresh(); }), weight());
-        if (pg * PAGE_SIZE < total) pager.addView(actionButton("NEXT", AppTheme.accent(), v -> { page++; refresh(); }), weight());
-        if (pager.getChildCount() > 0) listContainer.addView(pager);
+        if (total <= PAGE_SIZE) return;
+        final int pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+        Button prev = UiKit.outline(act, tr("Previous"), v -> {
+            page = Math.max(1, page - 1);
+            refresh();
+            scroll.scrollTo(0, 0);
+        });
+        Button next = UiKit.outline(act, tr("Next"), v -> {
+            page = Math.min(pages, page + 1);
+            refresh();
+            scroll.scrollTo(0, 0);
+        });
+        if (pg <= 1) setBusy(prev, true);
+        if (pg >= pages) setBusy(next, true);
+        TextView label = UiKit.caption(act, trf("Page {0} of {1}", pg, pages));
+        label.setGravity(Gravity.CENTER);
+        content.addView(UiKit.buttonRow(act, prev, label, next));
     }
 
     // ================================================================== SYSTEM
 
     private void loadSystem() {
         final int req = ++requestCounter;
-        showMessage("Loading...");
+        showLoading(tr("Loading system status…"));
         async(api -> {
             JSONObject o = new JSONObject();
             o.put("status", api.status());
@@ -1169,317 +1625,579 @@ public final class RadarrTabView {
             try { o.put("clients", api.downloadClients()); } catch (Throwable ignored) {}
             return o;
         }, o -> {
-            if (req != requestCounter) return;
+            if (req != requestCounter || section != S_SYSTEM || detailMovieId > 0) return;
             renderSystem(o);
-        }, t -> { if (req == requestCounter) showError(t); });
-    }
-
-    private LinearLayout sysCard(String title) {
-        LinearLayout card = new LinearLayout(act);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(10), dp(14), dp(12));
-        card.setBackground(rounded(AppTheme.card(), AppTheme.outline(), 14));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(10);
-        card.setLayoutParams(lp);
-        TextView t = text(I18n.tr(title), 11f, AppTheme.textMuted(), true);
-        t.setLetterSpacing(0.08f);
-        t.setPadding(0, 0, 0, dp(4));
-        card.addView(t);
-        listContainer.addView(card);
-        return card;
+        }, t -> {
+            if (req == requestCounter && section == S_SYSTEM) showError(t);
+        });
     }
 
     private void renderSystem(JSONObject o) {
-        listContainer.removeAllViews();
+        content.removeAllViews();
         JSONObject st = o.optJSONObject("status");
-        LinearLayout c = sysCard("STATUS");
+        LinearLayout c = UiKit.card(act);
+        c.addView(UiKit.overline(act, tr("Status")));
         if (st != null) {
-            c.addView(text("Radarr v" + st.optString("version") + "  -  " + st.optString("osName") + " " + st.optString("osVersion"), 12f, AppTheme.text(), false));
-            c.addView(text(st.optString("appData"), 10.5f, AppTheme.textMuted(), false));
-            String sd = st.optString("startTime", "");
-            if (!sd.isEmpty()) c.addView(text(I18n.tr("Started") + ": " + sd.replace('T', ' ').replaceAll("\\..*$", "").replace("Z", " UTC"), 10.5f, AppTheme.textMuted(), false));
+            String v = RadarrApi.str(st, "version");
+            if (!v.isEmpty() && !v.equals(version)) {
+                version = v;
+                updateHeader();
+            }
+            c.addView(UiKit.kv(act, tr("Version"), orDash(v)));
+            c.addView(UiKit.kv(act, tr("Operating system"), orDash(joinSpace(RadarrApi.str(st, "osName"), RadarrApi.str(st, "osVersion")))));
+            String rt = joinSpace(RadarrApi.str(st, "runtimeName"), RadarrApi.str(st, "runtimeVersion"));
+            if (!rt.isEmpty()) c.addView(UiKit.kv(act, tr("Runtime"), rt));
+            String started = fmtDateTime(RadarrApi.str(st, "startTime"));
+            if (!started.isEmpty()) c.addView(UiKit.kv(act, tr("Started"), started));
+            String appData = RadarrApi.str(st, "appData");
+            if (!appData.isEmpty()) {
+                TextView l = UiKit.caption(act, tr("App data"));
+                l.setPadding(0, dp(8), 0, dp(2));
+                c.addView(l);
+                c.addView(UiKit.mono(act, appData));
+            }
+        }
+        content.addView(c);
+
+        addHealthCard(o.optJSONArray("health"));
+
+        JSONArray disk = o.optJSONArray("disk");
+        if (disk != null && disk.length() > 0) {
+            c = UiKit.card(act);
+            c.addView(UiKit.overline(act, tr("Disk space")));
+            for (int i = 0; i < disk.length(); i++) {
+                JSONObject dsk = disk.optJSONObject(i);
+                if (dsk == null) continue;
+                long total = dsk.optLong("totalSpace");
+                long free = dsk.optLong("freeSpace");
+                String label = RadarrApi.str(dsk, "label");
+                TextView p = UiKit.mono(act, RadarrApi.str(dsk, "path") + (label.isEmpty() ? "" : "  (" + label + ")"));
+                p.setTextIsSelectable(false);
+                p.setPadding(0, i > 0 ? dp(10) : 0, 0, 0);
+                c.addView(p);
+                int used = total > 0 ? (int) ((total - free) * 100 / total) : 0;
+                c.addView(UiKit.progress(act, used, used >= 90 ? AppTheme.danger() : used >= 75 ? AppTheme.warning() : AppTheme.accent()));
+                TextView fr = UiKit.caption(act, trf("{0} free of {1}", fmtSize(free), fmtSize(total)));
+                fr.setPadding(0, dp(4), 0, 0);
+                c.addView(fr);
+            }
+            content.addView(c);
         }
 
-        JSONArray health = o.optJSONArray("health");
-        c = sysCard("HEALTH");
+        // root folders
+        c = UiKit.card(act);
+        c.addView(UiKit.overline(act, tr("Root folders")));
+        JSONArray roots = o.optJSONArray("roots");
+        if (roots == null || roots.length() == 0) {
+            c.addView(UiKit.body(act, tr("No root folder yet. Movies cannot be added until you add one.")));
+        }
+        for (int i = 0; roots != null && i < roots.length(); i++) {
+            final JSONObject rf = roots.optJSONObject(i);
+            if (rf == null) continue;
+            LinearLayout row = UiKit.row(act);
+            row.setPadding(0, dp(6), 0, dp(6));
+            LinearLayout tx = UiKit.column(act);
+            TextView path = UiKit.mono(act, rf.optString("path"));
+            path.setTextIsSelectable(false);
+            tx.addView(path);
+            boolean ok = rf.optBoolean("accessible", true);
+            TextView free = UiKit.caption(act, ok ? trf("{0} free", fmtSize(rf.optLong("freeSpace"))) : tr("Not accessible"));
+            if (!ok) free.setTextColor(AppTheme.danger());
+            tx.addView(free);
+            row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+            final Button rm = UiKit.danger(act, tr("Remove"), null);
+            rm.setOnClickListener(v -> confirm(tr("Remove root folder?"),
+                    tr("Radarr stops using this folder. Files on disk are not deleted."), tr("Remove"), true,
+                    () -> action(rm, api -> {
+                        api.deleteRootFolder(rf.optInt("id"));
+                        return null;
+                    }, tr("Root folder removed"), this::refresh)));
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, dp(36));
+            rlp.setMarginStart(dp(8));
+            row.addView(rm, rlp);
+            c.addView(row);
+        }
+        c.addView(UiKit.buttonRow(act, UiKit.outline(act, tr("Add root folder"), v -> {
+            if (!debounce()) showAddRoot();
+        })));
+        content.addView(c);
+
+        JSONArray profs = o.optJSONArray("profiles");
+        if (profs != null && profs.length() > 0) {
+            c = UiKit.card(act);
+            c.addView(UiKit.overline(act, tr("Quality profiles")));
+            List<String> names = new ArrayList<>();
+            for (int i = 0; i < profs.length(); i++) {
+                JSONObject p = profs.optJSONObject(i);
+                if (p != null) names.add(p.optString("name"));
+            }
+            c.addView(UiKit.body(act, TextUtils.join(" · ", names)));
+            content.addView(c);
+        }
+
+        addProviderCard(tr("Indexers"), o.optJSONArray("indexers"), "indexer",
+                tr("Indexers are synced from Prowlarr."));
+        addProviderCard(tr("Download clients"), o.optJSONArray("clients"), "downloadclient", null);
+
+        c = UiKit.card(act);
+        c.addView(UiKit.overline(act, tr("Tasks")));
+        c.addView(UiKit.buttonRow(act,
+                commandButton(tr("RSS sync"), "RssSync", tr("RSS sync started")),
+                commandButton(tr("Check downloads"), "RefreshMonitoredDownloads", tr("Checking downloads…"))));
+        c.addView(UiKit.buttonRow(act,
+                commandButton(tr("Refresh all"), "RefreshMovie", tr("Refreshing all movies…")),
+                commandButton(tr("Rescan all"), "RescanMovie", tr("Rescanning all movie folders…"))));
+        c.addView(UiKit.buttonRow(act, commandButton(tr("Backup"), "Backup", tr("Backup started"))));
+        content.addView(c);
+
+        TextView note = UiKit.caption(act, tr("Advanced settings are in Radarr's own web interface."));
+        note.setPadding(dp(2), dp(4), dp(2), 0);
+        content.addView(note);
+    }
+
+    private Button commandButton(String label, final String command, final String okMsg) {
+        final Button b = UiKit.outline(act, label, null);
+        b.setOnClickListener(v -> action(b, api -> {
+            api.simpleCommand(command);
+            return null;
+        }, okMsg, null));
+        return b;
+    }
+
+    private void addHealthCard(JSONArray health) {
+        LinearLayout c = UiKit.card(act);
+        c.addView(UiKit.overline(act, tr("Health")));
         if (health == null || health.length() == 0) {
-            c.addView(text("✔ " + I18n.tr("No problems detected."), 12f, AppTheme.success(), false));
+            LinearLayout row = UiKit.row(act);
+            row.addView(UiKit.badge(act, tr("Healthy"), AppTheme.success()));
+            TextView t = UiKit.caption(act, tr("No issues found."));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+            lp.setMarginStart(dp(10));
+            row.addView(t, lp);
+            c.addView(row);
         } else {
             for (int i = 0; i < health.length(); i++) {
                 JSONObject h = health.optJSONObject(i);
                 if (h == null) continue;
-                boolean err = "error".equalsIgnoreCase(h.optString("type"));
-                TextView t = text((err ? "✖ " : "⚠ ") + h.optString("message"), 11.5f, err ? AppTheme.danger() : AppTheme.warning(), false);
-                t.setPadding(0, dp(3), 0, dp(3));
-                c.addView(t);
+                String type = RadarrApi.str(h, "type");
+                int color = "error".equalsIgnoreCase(type) ? AppTheme.danger()
+                        : "warning".equalsIgnoreCase(type) ? AppTheme.warning() : AppTheme.accent();
+                String label = "error".equalsIgnoreCase(type) ? "Error" : "warning".equalsIgnoreCase(type) ? "Warning" : "Notice";
+                LinearLayout row = UiKit.row(act);
+                row.setGravity(Gravity.TOP);
+                row.setPadding(0, dp(6), 0, dp(6));
+                row.addView(UiKit.badge(act, tr(label), color));
+                TextView t = UiKit.body(act, RadarrApi.str(h, "message"));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+                lp.setMarginStart(dp(10));
+                row.addView(t, lp);
+                c.addView(row);
             }
         }
-
-        JSONArray disk = o.optJSONArray("disk");
-        if (disk != null && disk.length() > 0) {
-            c = sysCard("DISK SPACE");
-            for (int i = 0; i < disk.length(); i++) {
-                JSONObject dsk = disk.optJSONObject(i);
-                if (dsk == null) continue;
-                long total = dsk.optLong("totalSpace"), free = dsk.optLong("freeSpace");
-                String label = dsk.optString("label", "").isEmpty() ? dsk.optString("path") : dsk.optString("label") + " (" + dsk.optString("path") + ")";
-                c.addView(text(label, 11.5f, AppTheme.text(), false));
-                ProgressBar pb = new ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal);
-                pb.setMax(100);
-                pb.setProgress(total > 0 ? (int) ((total - free) * 100 / total) : 0);
-                LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, dp(4));
-                plp.topMargin = dp(3);
-                c.addView(pb, plp);
-                TextView fr = text(fmtSize(free) + " " + I18n.tr("free of") + " " + fmtSize(total), 10.5f, AppTheme.textMuted(), false);
-                fr.setPadding(0, dp(2), 0, dp(6));
-                c.addView(fr);
-            }
-        }
-
-        // root folders
-        c = sysCard("ROOT FOLDERS");
-        JSONArray roots = o.optJSONArray("roots");
-        for (int i = 0; roots != null && i < roots.length(); i++) {
-            final JSONObject rf = roots.optJSONObject(i);
-            if (rf == null) continue;
-            LinearLayout row = new LinearLayout(act);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            LinearLayout tx = new LinearLayout(act);
-            tx.setOrientation(LinearLayout.VERTICAL);
-            tx.addView(text(rf.optString("path"), 12f, AppTheme.text(), false));
-            tx.addView(text(fmtSize(rf.optLong("freeSpace")) + " " + I18n.tr("free"), 10.5f, AppTheme.textMuted(), false));
-            row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
-            row.addView(actionButton("REMOVE", AppTheme.danger(), v ->
-                    confirm(I18n.tr("Remove this root folder from Radarr? Files are not deleted."), I18n.tr("REMOVE"), AppTheme.danger(), () ->
-                            action(api -> { api.deleteRootFolder(rf.optInt("id")); return null; }, "Removed.", this::refresh))),
-                    new LinearLayout.LayoutParams(-2, dp(32)));
-            c.addView(row);
-        }
-        c.addView(actionButton("+ ADD ROOT FOLDER", AppTheme.accent(), v -> showAddRoot()),
-                lpTop(dp(34), dp(8)));
-
-        // profiles
-        c = sysCard("QUALITY PROFILES");
-        JSONArray profs = o.optJSONArray("profiles");
-        for (int i = 0; profs != null && i < profs.length(); i++) {
-            JSONObject p = profs.optJSONObject(i);
-            if (p != null) c.addView(text("• " + p.optString("name"), 12f, AppTheme.text(), false));
-        }
-
-        c = sysCard("INDEXERS");
-        addEnabledList(c, o.optJSONArray("indexers"), "enableRss");
-        c = sysCard("DOWNLOAD CLIENTS");
-        addEnabledList(c, o.optJSONArray("clients"), "enable");
-
-        c = sysCard("TASKS");
-        LinearLayout r1 = new LinearLayout(act);
-        r1.setOrientation(LinearLayout.HORIZONTAL);
-        r1.addView(actionButton("RSS SYNC", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RssSync"); return null; }, "RSS sync queued.", null)), weight());
-        r1.addView(actionButton("REFRESH ALL", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RefreshMovie"); return null; }, "Refresh queued.", null)), weight());
-        c.addView(r1);
-        LinearLayout r2 = new LinearLayout(act);
-        r2.setOrientation(LinearLayout.HORIZONTAL);
-        r2.addView(actionButton("RESCAN ALL", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RescanMovie"); return null; }, "Rescan queued.", null)), weight());
-        r2.addView(actionButton("BACKUP", AppTheme.accent(), v -> action(api -> { api.simpleCommand("Backup"); return null; }, "Backup queued.", null)), weight());
-        c.addView(r2, lpTop(-2, dp(6)));
-        LinearLayout r3 = new LinearLayout(act);
-        r3.setOrientation(LinearLayout.HORIZONTAL);
-        r3.addView(actionButton("CHECK DOWNLOADS", AppTheme.accent(), v -> action(api -> { api.simpleCommand("RefreshMonitoredDownloads"); return null; }, "Check queued.", null)), weight());
-        r3.addView(actionButton("IMPORT SCAN", AppTheme.accent(), v -> action(api -> { api.simpleCommand("DownloadedMoviesScan"); return null; }, "Scan queued.", null)), weight());
-        c.addView(r3, lpTop(-2, dp(6)));
-        TextView note = text(I18n.tr("Indexers and download clients are managed by Prowlarr / the SERVICES tab. Advanced settings are available in Radarr's own web interface."),
-                10.5f, AppTheme.textMuted(), false);
-        note.setPadding(0, dp(12), 0, 0);
-        listContainer.addView(note);
+        content.addView(c);
     }
 
-    private void addEnabledList(LinearLayout card, JSONArray arr, String flag) {
+    private void addProviderCard(String title, final JSONArray arr, final String kind, String note) {
+        LinearLayout c = UiKit.card(act);
+        c.addView(UiKit.overline(act, title));
         if (arr == null || arr.length() == 0) {
-            card.addView(text(I18n.tr("None configured."), 11.5f, AppTheme.textSecondary(), false));
-            return;
+            c.addView(UiKit.body(act, tr("None configured.")));
+        } else {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                boolean on = "indexer".equals(kind)
+                        ? (o.optBoolean("enableRss") || o.optBoolean("enableAutomaticSearch") || o.optBoolean("enableInteractiveSearch"))
+                        : o.optBoolean("enable", true);
+                LinearLayout row = UiKit.row(act);
+                row.setPadding(0, dp(6), 0, dp(6));
+                LinearLayout tx = UiKit.column(act);
+                tx.addView(rowTitle(o.optString("name")));
+                tx.addView(rowMeta(joinDot(o.optString("implementationName", o.optString("implementation")),
+                        tr(RadarrApi.str(o, "protocol").isEmpty() ? "" : capitalize(RadarrApi.str(o, "protocol"))))));
+                row.addView(tx, new LinearLayout.LayoutParams(0, -2, 1.0f));
+                row.addView(UiKit.badge(act, tr(on ? "Enabled" : "Disabled"), on ? AppTheme.success() : AppTheme.textMuted()));
+                c.addView(row);
+            }
+            final Button test = UiKit.outline(act, tr("Test all"), null);
+            test.setOnClickListener(v -> testAll(test, kind, arr));
+            c.addView(UiKit.buttonRow(act, test));
         }
-        for (int i = 0; i < arr.length(); i++) {
-            JSONObject o = arr.optJSONObject(i);
-            if (o == null) continue;
-            boolean on = o.has(flag) ? o.optBoolean(flag) : true;
-            TextView t = text((on ? "● " : "○ ") + o.optString("name") + "  (" + o.optString("implementationName", o.optString("implementation")) + ")",
-                    11.5f, on ? AppTheme.text() : AppTheme.textMuted(), false);
-            t.setPadding(0, dp(2), 0, dp(2));
-            card.addView(t);
+        if (note != null) {
+            TextView n = UiKit.caption(act, note);
+            n.setPadding(0, dp(8), 0, 0);
+            c.addView(n);
         }
+        content.addView(c);
+    }
+
+    private void testAll(final Button b, final String kind, final JSONArray providers) {
+        if (!b.isEnabled()) return;
+        setBusy(b, true);
+        b.setText(tr("Testing…"));
+        async(api -> api.testAll(kind), res -> {
+            setBusy(b, false);
+            b.setText(tr("Test all"));
+            List<String> failed = new ArrayList<>();
+            for (int i = 0; i < res.length(); i++) {
+                JSONObject r = res.optJSONObject(i);
+                if (r == null || r.optBoolean("isValid", true)) continue;
+                String name = "#" + r.optInt("id");
+                for (int j = 0; providers != null && j < providers.length(); j++) {
+                    JSONObject p = providers.optJSONObject(j);
+                    if (p != null && p.optInt("id") == r.optInt("id")) name = p.optString("name", name);
+                }
+                JSONArray vf = r.optJSONArray("validationFailures");
+                JSONObject f0 = vf == null ? null : vf.optJSONObject(0);
+                failed.add(name + (f0 == null ? "" : ": " + f0.optString("errorMessage", "")));
+            }
+            if (failed.isEmpty()) {
+                toast(trf("All {0} passed the test", res.length()));
+            } else {
+                info(trf("{0} of {1} failed", failed.size(), res.length()), TextUtils.join("\n\n", failed));
+            }
+        }, t -> {
+            setBusy(b, false);
+            b.setText(tr("Test all"));
+            toast(errText(t));
+        });
     }
 
     private void showAddRoot() {
-        final LinearLayout body = dialogBody(I18n.tr("Add root folder"));
-        final EditText path = new EditText(act);
-        path.setHint("/path/to/movies");
-        path.setHintTextColor(AppTheme.textMuted());
-        path.setTextColor(AppTheme.text());
-        path.setSingleLine(true);
-        body.addView(path);
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton("ADD", AppTheme.success(), v -> {
+        final LinearLayout body = dialogBody(tr("Add root folder"), tr("Folder where Radarr keeps your movies"));
+        final EditText path = UiKit.input(act, "/storage/emulated/0/Movies");
+        path.setTypeface(android.graphics.Typeface.MONOSPACE);
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, -2);
+        plp.topMargin = dp(12);
+        body.addView(path, plp);
+        final TextView err = UiKit.caption(act, "");
+        err.setTextColor(AppTheme.danger());
+        err.setVisibility(View.GONE);
+        err.setPadding(0, dp(8), 0, 0);
+        body.addView(err);
+        final AlertDialog d = dialog(body);
+        final Button cancel = UiKit.outline(act, tr("Cancel"), v -> d.dismiss());
+        final Button add = UiKit.primary(act, tr("Add"), null);
+        add.setOnClickListener(v -> {
             final String p = path.getText().toString().trim();
-            if (p.isEmpty()) return;
-            d.dismiss();
-            action(api -> { api.addRootFolder(p); return null; }, "Root folder added.", this::refresh);
-        }), weight());
-        body.addView(row);
-        d.show();
+            if (p.isEmpty() || !add.isEnabled()) return;
+            setBusy(add, true);
+            err.setVisibility(View.GONE);
+            async(api -> {
+                api.addRootFolder(p);
+                return Boolean.TRUE;
+            }, ok -> {
+                d.dismiss();
+                toast(tr("Root folder added"));
+                refresh();
+            }, t -> {
+                setBusy(add, false);
+                err.setText(errText(t));
+                err.setVisibility(View.VISIBLE);
+            });
+        });
+        body.addView(UiKit.buttonRow(act, cancel, add));
+        show(d);
     }
 
-    // ================================================================== dialogs & small UI helpers
+    // ================================================================== dialogs
 
-    private LinearLayout dialogBody(String title) {
-        LinearLayout body = new LinearLayout(act);
-        body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(dp(18), dp(16), dp(18), dp(14));
-        TextView t = text(title, 15f, AppTheme.text(), true);
-        t.setPadding(0, 0, 0, dp(6));
-        body.addView(t);
-        return body;
+    private LinearLayout dialogBody(String title, String subtitle) {
+        LinearLayout b = UiKit.column(act);
+        b.setPadding(dp(20), dp(18), dp(20), dp(16));
+        b.addView(UiKit.title(act, title));
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView s = UiKit.caption(act, subtitle);
+            s.setPadding(0, dp(2), 0, 0);
+            s.setMaxLines(2);
+            s.setEllipsize(TextUtils.TruncateAt.END);
+            b.addView(s);
+        }
+        return b;
     }
 
-    private Dialog dialog(View content) {
-        AlertDialog d = new AlertDialog.Builder(act).setView(content).create();
-        if (d.getWindow() != null) d.getWindow().setBackgroundDrawable(rounded(AppTheme.card(), AppTheme.outline(), 16));
+    /** Dialog whose whole body scrolls (forms). */
+    private AlertDialog dialog(View body) {
+        ScrollView sv = new ScrollView(act);
+        sv.addView(body, new ViewGroup.LayoutParams(-1, -2));
+        return dialogFor(sv);
+    }
+
+    /** Dialog with its own inner scroll area (result lists): no outer ScrollView, so the list scrolls. */
+    private AlertDialog listDialog(View body) {
+        return dialogFor(body);
+    }
+
+    private AlertDialog dialogFor(View view) {
+        AlertDialog d = new AlertDialog.Builder(act).setView(view).create();
+        if (d.getWindow() != null) {
+            d.getWindow().setBackgroundDrawable(new InsetDrawable(
+                    UiKit.shape(act, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD), dp(16)));
+        }
         return d;
     }
 
-    private LinearLayout buttonRow() {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, dp(12), 0, 0);
+    private void show(AlertDialog d) {
+        if (dead()) return;
+        try {
+            d.show();
+        } catch (Throwable ignored) {
+            // window token gone (activity finishing)
+        }
+    }
+
+    private void confirm(String title, String message, String positive, boolean destructive, final Runnable onYes) {
+        if (dead()) return;
+        LinearLayout body = dialogBody(title, null);
+        TextView m = UiKit.body(act, message);
+        m.setPadding(0, dp(8), 0, dp(4));
+        body.addView(m);
+        final AlertDialog d = dialog(body);
+        Button cancel = UiKit.outline(act, tr("Cancel"), v -> d.dismiss());
+        Button ok = destructive ? UiKit.danger(act, positive, null) : UiKit.primary(act, positive, null);
+        ok.setOnClickListener(v -> {
+            d.dismiss();
+            onYes.run();
+        });
+        body.addView(UiKit.buttonRow(act, cancel, ok));
+        show(d);
+    }
+
+    private void info(String title, String message) {
+        LinearLayout body = dialogBody(title, null);
+        TextView m = UiKit.body(act, message);
+        m.setPadding(0, dp(8), 0, dp(4));
+        m.setTextIsSelectable(true);
+        body.addView(m);
+        final AlertDialog d = dialog(body);
+        body.addView(UiKit.buttonRow(act, UiKit.outline(act, tr("Close"), v -> d.dismiss())));
+        show(d);
+    }
+
+    /** Fixed-height scroll area for result lists inside a dialog. */
+    private View scrollBox(View inner) {
+        ScrollView sv = new ScrollView(act);
+        sv.addView(inner, new ViewGroup.LayoutParams(-1, -2));
+        int h = act.getResources().getDisplayMetrics().heightPixels;
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, Math.min(dp(440), (int) (h * 0.55f)));
+        lp.topMargin = dp(8);
+        sv.setLayoutParams(lp);
+        return sv;
+    }
+
+    // ================================================================== building blocks
+
+    private LinearLayout listCard() {
+        LinearLayout card = UiKit.card(act);
+        card.setPadding(dp(4), dp(4), dp(4), dp(4));
+        return card;
+    }
+
+    private LinearLayout listRow() {
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
+        row.setBackground(UiKit.rowRipple(act));
+        row.setClickable(true);
         return row;
     }
 
-    private void confirm(String message, String positive, int color, final Runnable onYes) {
-        final LinearLayout body = dialogBody(I18n.tr("Confirm"));
-        body.addView(text(message, 12.5f, AppTheme.textSecondary(), false));
-        final Dialog d = dialog(body);
-        LinearLayout row = buttonRow();
-        row.addView(actionButton("CANCEL", AppTheme.textSecondary(), v -> d.dismiss()), weight());
-        row.addView(actionButton(positive, color, v -> { d.dismiss(); onYes.run(); }), weight());
-        body.addView(row);
-        d.show();
+    private View separator(int insetStartDp) {
+        View v = new View(act);
+        v.setBackgroundColor(AppTheme.outline());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, Math.max(1, dp(1) / 2));
+        lp.setMarginStart(dp(insetStartDp));
+        lp.setMarginEnd(dp(12));
+        v.setLayoutParams(lp);
+        return v;
     }
 
-    /** Poster for a movie or lookup result: local MediaCover url for library items, remoteUrl otherwise. */
-    private ImageView poster(JSONObject movie, int wDp, int hDp) {
-        final ImageView iv = new ImageView(act);
-        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        iv.setBackground(rounded(AppTheme.inner(), AppTheme.outline(), 6));
-        iv.setClipToOutline(true);
-        String url = null;
+    private TextView rowTitle(String s) {
+        return UiKit.singleLine(UiKit.text(act, s, 14f, AppTheme.text(), UiKit.MEDIUM));
+    }
+
+    private TextView rowMeta(String s) {
+        TextView t = UiKit.singleLine(UiKit.caption(act, s));
+        t.setPadding(0, dp(2), 0, 0);
+        return t;
+    }
+
+    private LinearLayout.LayoutParams textLp() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        lp.setMarginStart(dp(12));
+        lp.setMarginEnd(dp(8));
+        return lp;
+    }
+
+    private LinearLayout.LayoutParams posterLp(int wDp) {
+        return new LinearLayout.LayoutParams(dp(wDp), dp(wDp * 1.5f));
+    }
+
+    private LinearLayout.LayoutParams fullLp(int topDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.topMargin = dp(topDp);
+        return lp;
+    }
+
+    private Switch switchRow(LinearLayout parent, String title, String caption, boolean checked) {
+        LinearLayout row = UiKit.row(act);
+        row.setPadding(0, dp(10), 0, dp(4));
+        LinearLayout tx = UiKit.column(act);
+        tx.addView(UiKit.subtitle(act, title));
+        if (caption != null && !caption.isEmpty()) {
+            TextView c = UiKit.caption(act, caption);
+            c.setPadding(0, dp(2), 0, 0);
+            tx.addView(c);
+        }
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        tlp.setMarginEnd(dp(12));
+        row.addView(tx, tlp);
+        Switch sw = new Switch(act);
+        sw.setChecked(checked);
+        UiStyle.styleSwitch(act, sw);
+        row.addView(sw);
+        parent.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        return sw;
+    }
+
+    // ================================================================== posters
+
+    private static synchronized LruCache<String, Bitmap> cache() {
+        if (posterCache == null) {
+            long max = Math.min(Runtime.getRuntime().maxMemory() / 16, 16L * 1024 * 1024);
+            posterCache = new LruCache<String, Bitmap>((int) Math.max(2L * 1024 * 1024, max)) {
+                @Override protected int sizeOf(String k, Bitmap b) { return b.getByteCount(); }
+            };
+        }
+        return posterCache;
+    }
+
+    private static String posterUrl(JSONObject movie) {
         JSONArray imgs = movie.optJSONArray("images");
         for (int i = 0; imgs != null && i < imgs.length(); i++) {
             JSONObject im = imgs.optJSONObject(i);
             if (im == null || !"poster".equals(im.optString("coverType"))) continue;
-            String local = im.optString("url", "");
-            String remote = im.optString("remoteUrl", "");
-            url = movie.optInt("id") > 0 && !local.isEmpty() ? local : (!remote.isEmpty() ? remote : local);
-            break;
+            String local = RadarrApi.str(im, "url");
+            String remote = RadarrApi.str(im, "remoteUrl");
+            // Library items have cached local covers; lookup results only have the TMDb URL.
+            if (movie.optInt("id") > 0 && local.startsWith("/")) return local;
+            if (!remote.isEmpty()) return remote;
+            if (!local.isEmpty()) return local;
         }
-        if (url == null || url.isEmpty()) return iv;
-        final String u = url;
-        Bitmap cached = imgCache.get(u);
-        if (cached != null) { iv.setImageBitmap(cached); return iv; }
-        iv.setTag(u);
-        imgPool.execute(() -> {
-            try {
-                RadarrApi api = RadarrApi.get(act);
-                final Bitmap bmp = api.loadImage(u, 300);
-                if (bmp == null) return;
-                imgCache.put(u, bmp);
-                act.runOnUiThread(() -> { if (u.equals(iv.getTag())) iv.setImageBitmap(bmp); });
-            } catch (Throwable ignored) {}
-        });
+        String remotePoster = RadarrApi.str(movie, "remotePoster");
+        return remotePoster.isEmpty() ? null : remotePoster;
+    }
+
+    /** 2:3 poster, rounded 8dp, loaded off the UI thread into a bounded memory cache. */
+    private ImageView poster(JSONObject movie, int wDp) {
+        final ImageView iv = new ImageView(act);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackground(UiKit.shape(act, AppTheme.inner(), 0, 8));
+        iv.setClipToOutline(true);
+        iv.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        final String url = posterUrl(movie);
+        if (url == null) return iv;
+        final int px = dp(wDp);
+        final String key = url + "@" + px;
+        iv.setTag(key);
+        Bitmap hit = cache().get(key);
+        if (hit != null) {
+            iv.setImageBitmap(hit);
+            return iv;
+        }
+        List<ImageView> waiting = imgWaiting.get(key);
+        if (waiting != null) {
+            waiting.add(iv);
+            return iv;
+        }
+        waiting = new ArrayList<>();
+        waiting.add(iv);
+        imgWaiting.put(key, waiting);
+        try {
+            imgPool.execute(() -> {
+                Bitmap b = cache().get(key);
+                if (b == null) {
+                    try {
+                        b = RadarrApi.get(act).loadPoster(url, px);
+                    } catch (Throwable ignored) {
+                        b = null;
+                    }
+                    if (b != null) cache().put(key, b);
+                }
+                final Bitmap bmp = b;
+                ui(() -> {
+                    List<ImageView> ws = imgWaiting.remove(key);
+                    if (bmp == null || ws == null) return;
+                    for (ImageView x : ws) {
+                        if (key.equals(x.getTag())) x.setImageBitmap(bmp);
+                    }
+                });
+            });
+        } catch (RejectedExecutionException e) {
+            imgWaiting.remove(key);
+        }
         return iv;
     }
 
-    private void showMessage(String m) {
-        listContainer.removeAllViews();
-        TextView t = text(I18n.tr(m), 12f, AppTheme.textSecondary(), false);
-        t.setPadding(0, dp(16), 0, 0);
-        listContainer.addView(t);
+    // ================================================================== formatting
+
+    private static String titleYear(JSONObject m) {
+        if (m == null) return "?";
+        String t = m.optString("title", "?");
+        int y = m.optInt("year");
+        return y > 0 ? t + " (" + y + ")" : t;
     }
 
-    private void showError(Throwable err) {
-        listContainer.removeAllViews();
-        TextView t = text(msg(err), 12f, AppTheme.danger(), false);
-        t.setPadding(0, dp(16), 0, dp(8));
-        listContainer.addView(t);
-        listContainer.addView(actionButton("RETRY", AppTheme.accent(), v -> refresh()), new LinearLayout.LayoutParams(-1, dp(40)));
+    private static String qualityName(JSONObject withQuality) {
+        if (withQuality == null) return "";
+        JSONObject q = withQuality.optJSONObject("quality");
+        JSONObject qq = q == null ? null : q.optJSONObject("quality");
+        return qq == null ? "" : RadarrApi.str(qq, "name");
     }
 
-    private LinearLayout.LayoutParams weight() {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(34), 1.0f);
-        lp.setMarginEnd(dp(6));
-        return lp;
+    private static String statusLabel(String s) {
+        if ("tba".equalsIgnoreCase(s)) return "TBA";
+        if ("announced".equals(s)) return "Announced";
+        if ("inCinemas".equals(s)) return "In cinemas";
+        if ("released".equals(s)) return "Released";
+        if ("deleted".equals(s)) return "Removed from TMDb";
+        return capitalize(s);
     }
 
-    private LinearLayout.LayoutParams lpTop(int h, int topPx) {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, h);
-        lp.topMargin = topPx;
-        return lp;
-    }
-
-    private TextView pill(String label, boolean selected) {
-        TextView t = text(I18n.tr(label), 10f, selected ? AppTheme.onAccent() : AppTheme.textSecondary(), true);
-        t.setGravity(Gravity.CENTER);
-        t.setSingleLine(true);
-        t.setPadding(dp(14), 0, dp(14), 0);
-        t.setBackground(rounded(selected ? AppTheme.accent() : AppTheme.card(), AppTheme.outline(), 17));
-        t.setClickable(true);
-        return t;
-    }
-
-    private Button actionButton(String label, int c, View.OnClickListener l) {
-        Button b = new Button(act);
-        b.setText(I18n.tr(label));
-        b.setAllCaps(false);
-        b.setTextSize(10.5f);
-        b.setMinHeight(0);
-        b.setMinimumHeight(0);
-        b.setTypeface(Typeface.DEFAULT_BOLD);
-        b.setTextColor(c);
-        b.setBackground(rounded(Color.argb(25, Color.red(c), Color.green(c), Color.blue(c)),
-                Color.argb(80, Color.red(c), Color.green(c), Color.blue(c)), 8));
-        if (l != null) b.setOnClickListener(l);
-        return b;
-    }
-
-    private TextView text(String s, float size, int color, boolean bold) {
-        TextView t = new TextView(act);
-        t.setText(s);
-        t.setTextSize(size);
-        t.setTextColor(color);
-        if (bold) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        return t;
-    }
-
-    private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(fill);
-        g.setStroke(dp(1), stroke);
-        g.setCornerRadius(dp(radiusDp));
-        return g;
-    }
-
-    private int dp(int v) {
-        return Math.round(v * act.getResources().getDisplayMetrics().density);
-    }
-
-    private static String today() {
-        return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+    private static String availabilityLabel(String s) {
+        for (int i = 0; i < AVAIL_VALUES.length; i++) if (AVAIL_VALUES[i].equals(s)) return AVAIL_LABELS[i];
+        return statusLabel(s);
     }
 
     private static String capitalize(String s) {
         return s == null || s.isEmpty() ? "" : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+
+    private static String orDash(String s) {
+        return s == null || s.isEmpty() ? "-" : s;
+    }
+
+    private static String joinDot(String... parts) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : parts) {
+            if (p == null || p.trim().isEmpty()) continue;
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append(p.trim());
+        }
+        return sb.toString();
+    }
+
+    private static String joinSpace(String a, String b) {
+        return ((a == null ? "" : a) + " " + (b == null ? "" : b)).trim();
+    }
+
+    private static JSONObject copyWith(JSONObject o, String key, Object value) {
+        try {
+            JSONObject c = new JSONObject(o.toString());
+            c.put(key, value);
+            return c;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static String fmtSize(long bytes) {
@@ -1491,9 +2209,86 @@ public final class RadarrTabView {
         return String.format(Locale.US, "%.0f KB", bytes / 1024.0);
     }
 
+    private static String fmtRuntime(int minutes) {
+        if (minutes <= 0) return "";
+        if (minutes < 60) return trf("{0}m", minutes);
+        return trf("{0}h {1}m", minutes / 60, minutes % 60);
+    }
+
     private static String fmtAge(double minutes) {
-        if (minutes < 60) return (int) minutes + "m";
-        if (minutes < 2880) return (int) (minutes / 60) + "h";
-        return (int) (minutes / 1440) + "d";
+        if (minutes <= 0) return "";
+        if (minutes < 60) return trf("{0}m", (int) minutes);
+        if (minutes < 2880) return trf("{0}h", (int) (minutes / 60));
+        return trf("{0}d", (int) (minutes / 1440));
+    }
+
+    /** "1.02:03:04" / "00:12:34" (TimeSpan) to "1d 2h" / "12m". */
+    private static String fmtTimeLeft(String ts) {
+        if (ts == null || ts.isEmpty()) return "";
+        try {
+            int days = 0;
+            String rest = ts;
+            int dot = ts.indexOf('.');
+            int colon = ts.indexOf(':');
+            if (dot > 0 && (colon < 0 || dot < colon)) {
+                days = Integer.parseInt(ts.substring(0, dot));
+                rest = ts.substring(dot + 1);
+            }
+            String[] p = rest.split(":");
+            int h = p.length > 0 ? Integer.parseInt(p[0]) : 0;
+            int m = p.length > 1 ? Integer.parseInt(p[1]) : 0;
+            if (days > 0) return trf("{0}d {1}h", days, h);
+            if (h > 0) return trf("{0}h {1}m", h, m);
+            if (m > 0) return trf("{0}m", m);
+            return tr("<1m");
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** ISO-8601 UTC ("2024-05-01T12:34:56Z", fractions allowed) to epoch ms, 0 when unparseable. */
+    private static long parseIso(String iso) {
+        if (iso == null || iso.length() < 19) return 0L;
+        try {
+            SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
+            f.setTimeZone(TimeZone.getTimeZone("UTC"));
+            Date d = f.parse(iso.substring(0, 19));
+            return d == null ? 0L : d.getTime();
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    private static String fmtDateTime(String iso) {
+        long ms = parseIso(iso);
+        if (ms <= 0) return "";
+        return new SimpleDateFormat("d MMM yyyy, HH:mm", Locale.getDefault()).format(new Date(ms));
+    }
+
+    /** Release dates are calendar days: format the yyyy-MM-dd part without shifting time zones. */
+    private static String fmtDay(String iso) {
+        if (iso == null || iso.length() < 10) return "";
+        try {
+            SimpleDateFormat in = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
+            Date d = in.parse(iso.substring(0, 10));
+            if (d == null) return "";
+            return new SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault()).format(d);
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String relTime(long ms) {
+        if (ms <= 0) return "";
+        long diff = System.currentTimeMillis() - ms;
+        if (diff < 0) diff = 0;
+        long min = diff / 60000;
+        if (min < 1) return tr("just now");
+        if (min < 60) return trf("{0} min ago", min);
+        long h = min / 60;
+        if (h < 24) return trf("{0} h ago", h);
+        long d = h / 24;
+        if (d < 7) return trf("{0} d ago", d);
+        return new SimpleDateFormat("d MMM yyyy", Locale.getDefault()).format(new Date(ms));
     }
 }

@@ -1,4 +1,10 @@
-What's new in 2.0.4-beta.19 (beta)
+What's new in 2.0.4-beta.20 (beta)
+- Full redesign with one shared design system: consistent headers, cards, buttons, chips, lists and loading / empty / error states on every screen.
+- Sonarr, Radarr, Prowlarr and Transmission tabs reviewed against the official APIs and fixed (safer actions, live lists that keep their scroll position, clear 'not running' and login errors, faster cached posters).
+- Jellyfin Library signs in automatically with the unified account and recovers from expired logins without risking an account lockout.
+- Stability: heavy work moved off the main thread, leaks and duplicate refreshes removed, Arabic/RTL fixes, and the side-drawer swipe no longer fights horizontal lists.
+
+From 2.0.4-beta.19:
 - Fixed the unified account failing with HTTP 400 in Sonarr, Radarr and Prowlarr: existing logins are now updated and the new password is verified by a real login on every service.
 - Jellyfin password changes for an existing user now go through the Jellyfin API and are verified; errors now show the real reason instead of a URL.
 - The Transmission web page inside the app signs in automatically with the unified account.
