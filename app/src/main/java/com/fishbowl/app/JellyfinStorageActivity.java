@@ -1,6 +1,8 @@
 package com.fishbowl.app;
 
 import android.os.Bundle;
+
+import com.termux.R;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.ImageView;
