@@ -55,7 +55,7 @@ import org.json.JSONObject;
 /**
  * Fishbowl Media Storage Manager (v1.4.8-beta.1)
  *
- * Centralizes management of shared Internal Storage at /storage/emulated/0/FishbowlMedia/,
+ * Centralizes management of shared Internal Storage at /storage/emulated/0/JellyarrMedia/,
  * automatic directory scaffolding, read/write probing, legacy internal media migration,
  * and service path alignment across Transmission, Radarr, Sonarr, and Jellyfin.
  */
@@ -75,7 +75,7 @@ public final class MediaStorageManager {
     public static final String RETENTION_7_DAYS = "7d";
     public static final String RETENTION_MANUAL = "manual";
 
-    public static final String DEFAULT_MEDIA_ROOT = "/storage/emulated/0/FishbowlMedia";
+    public static final String DEFAULT_MEDIA_ROOT = "/storage/emulated/0/JellyarrMedia";
     public static final String LEGACY_MEDIA_ROOT = "/data/data/com.fishbowl.app/files/home/FishbowlMedia";
 
     // Required subdirectories according to specification
@@ -124,7 +124,7 @@ public final class MediaStorageManager {
     }
 
     /**
-     * Resolves the configured media root, defaulting to /storage/emulated/0/FishbowlMedia.
+     * Resolves the configured media root, defaulting to /storage/emulated/0/JellyarrMedia.
      */
     public File getMediaRoot() {
         String saved = prefs.getString(PREF_MEDIA_ROOT, DEFAULT_MEDIA_ROOT);
@@ -293,7 +293,7 @@ public final class MediaStorageManager {
         // Automatic startup recovery for any atomic files interrupted during prior OS kill
         recoverOrphanedAtomicBackups(root);
 
-        // Consolidate legacy separate folders (/sdcard/Fishbowl & /sdcard/Download/FishBowl_Backups) into FishbowlMedia
+        // Consolidate legacy separate folders (/sdcard/Fishbowl & /sdcard/Download/FishBowl_Backups) into JellyarrMedia
         consolidateLegacyExternalFolders();
 
         // Check and migrate legacy internal media if present
@@ -338,7 +338,7 @@ public final class MediaStorageManager {
 
     /**
      * Consolidates disparate legacy root folders (/sdcard/Fishbowl and /sdcard/Download/FishBowl_Backups)
-     * into the unified core root /sdcard/FishbowlMedia/.
+     * into the unified core root /sdcard/JellyarrMedia/.
      */
     public void consolidateLegacyExternalFolders() {
         try {
@@ -347,7 +347,7 @@ public final class MediaStorageManager {
                 mediaRoot.mkdirs();
             }
 
-            // 1. Migrate /sdcard/Fishbowl -> /sdcard/FishbowlMedia
+            // 1. Migrate /sdcard/Fishbowl -> /sdcard/JellyarrMedia
             File legacyFishbowl = new File(Environment.getExternalStorageDirectory(), "Fishbowl");
             if (legacyFishbowl.exists() && legacyFishbowl.isDirectory()) {
                 Log.i(TAG, "Legacy /sdcard/Fishbowl detected. Consolidating into " + mediaRoot.getAbsolutePath() + "...");
@@ -395,7 +395,7 @@ public final class MediaStorageManager {
                 Log.i(TAG, "Legacy /sdcard/Fishbowl consolidation complete.");
             }
 
-            // 2. Migrate /sdcard/Download/FishBowl_Backups -> /sdcard/FishbowlMedia/Backups
+            // 2. Migrate /sdcard/Download/FishBowl_Backups -> /sdcard/JellyarrMedia/Backups
             File legacyBackups = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FishBowl_Backups");
             if (legacyBackups.exists() && legacyBackups.isDirectory()) {
                 Log.i(TAG, "Legacy FishBowl_Backups in Downloads detected. Consolidating into " + mediaRoot.getAbsolutePath() + "/Backups...");
@@ -872,7 +872,7 @@ public final class MediaStorageManager {
         if (dir == null) return null;
         File curr = dir;
         while (curr != null) {
-            if ("FishbowlMedia".equals(curr.getName())) {
+            if ("JellyarrMedia".equals(curr.getName()) || "FishbowlMedia".equals(curr.getName())) {
                 return curr;
             }
             curr = curr.getParentFile();
@@ -914,21 +914,21 @@ public final class MediaStorageManager {
         OrphanFolderReport report = new OrphanFolderReport();
         if (!isStorageAccessReliable(mediaRoot)) return report;
         try {
-            // 1. Movies: /sdcard/FishbowlMedia/Movies/<MovieTitle>
+            // 1. Movies: /sdcard/JellyarrMedia/Movies/<MovieTitle>
             File moviesDir = new File(mediaRoot, SUB_MOVIES);
             cleanMediaSubfoldersInternal(moviesDir, false, report, mediaRoot);
 
-            // 2. TV Shows: /sdcard/FishbowlMedia/TV/<ShowTitle>/<Season>
+            // 2. TV Shows: /sdcard/JellyarrMedia/TV/<ShowTitle>/<Season>
             File tvDir = new File(mediaRoot, SUB_TV);
             cleanMediaSubfoldersInternal(tvDir, false, report, mediaRoot);
 
-            // 3. Staging downloads: /sdcard/FishbowlMedia/Downloads/radarr & sonarr
+            // 3. Staging downloads: /sdcard/JellyarrMedia/Downloads/radarr & sonarr
             File radarrDir = new File(mediaRoot, SUB_DOWNLOADS_RADARR);
             cleanMediaSubfoldersInternal(radarrDir, false, report, mediaRoot);
             File sonarrDir = new File(mediaRoot, SUB_DOWNLOADS_SONARR);
             cleanMediaSubfoldersInternal(sonarrDir, false, report, mediaRoot);
 
-            // 4. Music: /sdcard/FishbowlMedia/Music/<Artist>/<Album>
+            // 4. Music: /sdcard/JellyarrMedia/Music/<Artist>/<Album>
             File musicDir = new File(mediaRoot, SUB_MUSIC);
             cleanMediaSubfoldersInternal(musicDir, true, report, mediaRoot);
 
@@ -999,7 +999,7 @@ public final class MediaStorageManager {
 
     /**
      * Seamlessly migrates existing movies, TV, music, downloads, and torrents from
-     * /data/data/com.fishbowl.app/files/home/FishbowlMedia/ to /storage/emulated/0/FishbowlMedia/.
+     * /data/data/com.fishbowl.app/files/home/FishbowlMedia/ to /storage/emulated/0/JellyarrMedia/.
      * Old files are ONLY removed after each file is verified with matching size.
      */
     public synchronized MigrationResult performLegacyMigration() {

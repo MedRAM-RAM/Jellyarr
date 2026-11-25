@@ -2,589 +2,531 @@ package com.fishbowl.app;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.Context;
-import android.content.Intent;
-import android.os.StatFs;
 import android.view.View;
-import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.fishbowl.app.importer.DownloadDetectionManager;
-import com.fishbowl.app.importer.MovieImportActivity;
-import com.fishbowl.app.importer.MovieImportJournal;
-import com.fishbowl.app.permissions.AppPermissionManager;
+import com.fishbowl.app.model.ManagedService;
+import com.fishbowl.app.services.MediaServiceManager;
+import com.fishbowl.app.services.RadarrApi;
+import com.fishbowl.app.services.SonarrApi;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.HashSet;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
-import java.util.Set;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 
 /**
- * Media tab tools: a Media Storage card (free space, usage per library folder, retention policy) and a
- * Movie Importer card (download detection switches, journal statistics, quick actions).
+ * Media tab "File management": the file handling options of Radarr and Sonarr in one place.
  *
- * Folder sizes and journal statistics are computed off the UI thread; missing folders and missing
- * storage permission are shown as states instead of silently reading as 0 B.
+ * <ul>
+ *   <li>how imported files are named / renamed / hard-linked / cleaned up (Radarr and Sonarr media management
+ *       and naming settings, edited through their own APIs),</li>
+ *   <li>Organize: rename every existing file to the current naming format,</li>
+ *   <li>Import files from a folder with Move or Copy (Radarr / Sonarr "Manual Import").</li>
+ * </ul>
+ *
+ * Everything is delegated to the two services, so the result is exactly what their own web UIs would do.
+ * Network calls run off the UI thread; a service that is not installed is hidden and one that is not running
+ * shows a hint instead of failing.
  */
 public final class MediaToolsView {
 
-    private static final int MAX_FILES_PER_FOLDER = 60000;
-    private static final int MAX_DEPTH = 12;
-    private static final long SCAN_TTL_MS = 30000L;
-
-    private static final int ST_OK = 0;
-    private static final int ST_MISSING = 1;
-    private static final int ST_NO_ACCESS = 2;
-    private static final int ST_TRUNCATED = 3;
-
     private final Activity act;
     private final LinearLayout root;
-    private final ExecutorService scanBg = Executors.newSingleThreadExecutor();
-    private final ExecutorService statsBg = Executors.newSingleThreadExecutor();
-
-    private LinearLayout storageBody;
-    private Button refreshBtn;
-    private LinearLayout importerBody;
-    private long lastScan = 0;
-    private boolean scanning = false;
-    private int statsGen = 0;
+    private final ExecutorService bg = Executors.newSingleThreadExecutor();
+    private final List<Panel> panels = new ArrayList<>();
+    private long lastLoad = 0;
 
     public MediaToolsView(Activity activity) {
         this.act = activity;
         root = UiKit.column(act);
         root.setPadding(0, dp(12), 0, 0);
-        root.addView(buildStorageCard());
-        root.addView(buildImporterCard());
+        panels.add(new Panel(new RadarrArr()));
+        panels.add(new Panel(new SonarrArr()));
+        for (Panel p : panels) root.addView(p.card);
     }
 
     public View getView() {
         return root;
     }
 
-    /** Re-reads the importer statistics immediately and the storage sizes at most every 30 s (unless forced). */
+    /** Reloads the settings of every installed service (at most every 20 s unless forced). */
     public void refresh(boolean force) {
-        renderImporter();
         long now = System.currentTimeMillis();
-        if (force || now - lastScan > SCAN_TTL_MS) scanStorage();
+        if (!force && now - lastLoad < 20000) return;
+        lastLoad = now;
+        for (Panel p : panels) p.reload();
     }
 
-    private boolean dead() {
-        return act.isFinishing() || act.isDestroyed();
-    }
+    // ------------------------------------------------------------------ service adapters
 
-    // ------------------------------------------------------------------ storage card
-
-    private View buildStorageCard() {
-        LinearLayout c = UiKit.card(act);
-        LinearLayout head = UiKit.row(act);
-        TextView title = UiKit.overline(act, I18n.tr("Media storage"));
-        head.addView(title, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        refreshBtn = compact(UiKit.outline(act, I18n.tr("Refresh"), v -> {
-            showStorageLoading();
-            scanStorage();
-        }));
-        head.addView(refreshBtn, new LinearLayout.LayoutParams(-2, dp(32)));
-        c.addView(head);
-        storageBody = UiKit.column(act);
-        c.addView(storageBody, new LinearLayout.LayoutParams(-1, -2));
-        showStorageLoading();
-        return c;
-    }
-
-    private void showStorageLoading() {
-        storageBody.removeAllViews();
-        storageBody.addView(UiKit.loading(act, I18n.tr("Measuring folders…")));
-    }
-
-    private static final class Entry {
+    private static final class Field {
+        final boolean naming;
+        final String key;
         final String label;
-        final File dir;
-        long bytes;
-        long files;
-        int state = ST_OK;
+        final String hint;
+        final boolean bool;
 
-        Entry(String label, File dir) {
+        Field(boolean naming, String key, String label, String hint, boolean bool) {
+            this.naming = naming;
+            this.key = key;
             this.label = label;
-            this.dir = dir;
+            this.hint = hint;
+            this.bool = bool;
         }
     }
 
-    private static final class ScanResult {
-        Entry[] entries = new Entry[0];
-        long free = 0;
-        long total = 0;
-        String rootPath = "";
-        boolean rootExists = false;
-        String error = null;
+    /** What the panel needs from Radarr / Sonarr. All methods block: call them off the UI thread. */
+    private interface Arr {
+        String id();
+        String title();
+        String defaultImportFolder();
+        List<Field> fields();
+        JSONObject mediaManagement() throws Exception;
+        void saveMediaManagement(JSONObject o) throws Exception;
+        JSONObject naming() throws Exception;
+        void saveNaming(JSONObject o) throws Exception;
+        JSONArray candidates(String folder) throws Exception;
+        void doImport(JSONArray files, String mode) throws Exception;
+        int organize() throws Exception;
+        void rescanAll() throws Exception;
+        /** Turns one manual-import candidate into the command's file entry, or null when it cannot be imported. */
+        JSONObject toFile(JSONObject candidate);
     }
 
-    private void scanStorage() {
-        if (scanning) return;
-        final MediaStorageManager sm = MediaStorageManager.getInstance(act);
-        if (sm == null) return;
-        scanning = true;
-        setBusy(refreshBtn, true);
-        try {
-            scanBg.execute(() -> {
-                final ScanResult res = new ScanResult();
-                try {
-                    res.entries = new Entry[]{
-                            new Entry("Movies", sm.getMoviesDir()),
-                            new Entry("TV Shows", sm.getTvDir()),
-                            new Entry("Music", sm.getMusicDir()),
-                            new Entry("Books", sm.getBooksDir()),
-                            new Entry("Downloads", sm.getDownloadsDir()),
-                            new Entry("Backups", sm.getBackupsDir()),
-                    };
-                    for (Entry e : res.entries) measure(e);
-                    File mediaRoot = sm.getMediaRoot();
-                    res.rootPath = mediaRoot.getAbsolutePath();
-                    res.rootExists = mediaRoot.isDirectory();
-                    File probe = mediaRoot;
-                    while (probe != null && !probe.exists()) probe = probe.getParentFile();
-                    if (probe != null) {
-                        StatFs fs = new StatFs(probe.getAbsolutePath());
-                        res.free = fs.getAvailableBytes();
-                        res.total = fs.getTotalBytes();
-                    }
-                } catch (Throwable t) {
-                    res.error = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+    private static boolean hasPermanentRejection(JSONObject c) {
+        JSONArray rej = c.optJSONArray("rejections");
+        for (int i = 0; rej != null && i < rej.length(); i++) {
+            JSONObject r = rej.optJSONObject(i);
+            if (r != null && "permanent".equalsIgnoreCase(r.optString("type", "permanent"))) return true;
+        }
+        return false;
+    }
+
+    private static void copyKey(JSONObject from, JSONObject to, String key) throws Exception {
+        if (from.has(key) && !from.isNull(key)) to.put(key, from.get(key));
+    }
+
+    private final class RadarrArr implements Arr {
+        public String id() { return "radarr"; }
+        public String title() { return "Radarr · Movies"; }
+        public String defaultImportFolder() {
+            return MediaStorageManager.getInstance(act).getDownloadsDir().getAbsolutePath();
+        }
+        public List<Field> fields() {
+            List<Field> f = new ArrayList<>();
+            f.add(new Field(true, "renameMovies", "Rename movies on import", "Use the naming format below", true));
+            f.add(new Field(true, "replaceIllegalCharacters", "Replace illegal characters", "Needed for FAT / exFAT storage", true));
+            f.add(new Field(false, "copyUsingHardlinks", "Hardlink instead of copy", "Not supported on shared phone storage", true));
+            f.add(new Field(false, "deleteEmptyFolders", "Delete empty folders", "After a movie is moved out", true));
+            f.add(new Field(false, "importExtraFiles", "Import extra files", "Subtitles and other files next to the movie", true));
+            f.add(new Field(true, "standardMovieFormat", "File name format", "{Movie Title} ({Release Year})", false));
+            f.add(new Field(true, "movieFolderFormat", "Folder name format", "{Movie Title} ({Release Year})", false));
+            return f;
+        }
+        public JSONObject mediaManagement() throws Exception { return RadarrApi.get(act).mediaManagementConfig(); }
+        public void saveMediaManagement(JSONObject o) throws Exception { RadarrApi.get(act).saveMediaManagementConfig(o); }
+        public JSONObject naming() throws Exception { return RadarrApi.get(act).namingConfig(); }
+        public void saveNaming(JSONObject o) throws Exception { RadarrApi.get(act).saveNamingConfig(o); }
+        public JSONArray candidates(String folder) throws Exception { return RadarrApi.get(act).manualImportCandidates(folder); }
+        public void doImport(JSONArray files, String mode) throws Exception { RadarrApi.get(act).manualImport(files, mode); }
+        public int organize() throws Exception { return RadarrApi.get(act).renameAllMovies(); }
+        public void rescanAll() throws Exception { RadarrApi.get(act).simpleCommand("RescanMovie"); }
+        public JSONObject toFile(JSONObject c) {
+            try {
+                JSONObject movie = c.optJSONObject("movie");
+                String path = c.optString("path", "");
+                if (movie == null || path.isEmpty() || hasPermanentRejection(c)) return null;
+                JSONObject f = new JSONObject();
+                f.put("path", path);
+                f.put("movieId", movie.optInt("id"));
+                copyKey(c, f, "quality");
+                copyKey(c, f, "languages");
+                copyKey(c, f, "releaseGroup");
+                copyKey(c, f, "indexerFlags");
+                copyKey(c, f, "downloadId");
+                return f;
+            } catch (Throwable t) {
+                return null;
+            }
+        }
+    }
+
+    private final class SonarrArr implements Arr {
+        public String id() { return "sonarr"; }
+        public String title() { return "Sonarr · TV Shows"; }
+        public String defaultImportFolder() {
+            return MediaStorageManager.getInstance(act).getDownloadsDir().getAbsolutePath();
+        }
+        public List<Field> fields() {
+            List<Field> f = new ArrayList<>();
+            f.add(new Field(true, "renameEpisodes", "Rename episodes on import", "Use the naming format below", true));
+            f.add(new Field(true, "replaceIllegalCharacters", "Replace illegal characters", "Needed for FAT / exFAT storage", true));
+            f.add(new Field(false, "copyUsingHardlinks", "Hardlink instead of copy", "Not supported on shared phone storage", true));
+            f.add(new Field(false, "deleteEmptyFolders", "Delete empty folders", "After an episode is moved out", true));
+            f.add(new Field(false, "importExtraFiles", "Import extra files", "Subtitles and other files next to the episode", true));
+            f.add(new Field(true, "standardEpisodeFormat", "Episode file format", "{Series Title} - S{season:00}E{episode:00}", false));
+            f.add(new Field(true, "seasonFolderFormat", "Season folder format", "Season {season}", false));
+            f.add(new Field(true, "seriesFolderFormat", "Series folder format", "{Series Title}", false));
+            return f;
+        }
+        public JSONObject mediaManagement() throws Exception { return SonarrApi.get(act).mediaManagementConfig(); }
+        public void saveMediaManagement(JSONObject o) throws Exception { SonarrApi.get(act).saveMediaManagementConfig(o); }
+        public JSONObject naming() throws Exception { return SonarrApi.get(act).namingConfig(); }
+        public void saveNaming(JSONObject o) throws Exception { SonarrApi.get(act).saveNamingConfig(o); }
+        public JSONArray candidates(String folder) throws Exception { return SonarrApi.get(act).manualImportCandidates(folder); }
+        public void doImport(JSONArray files, String mode) throws Exception { SonarrApi.get(act).manualImport(files, mode); }
+        public int organize() throws Exception { return SonarrApi.get(act).renameAllSeries(); }
+        public void rescanAll() throws Exception { SonarrApi.get(act).simpleCommand("RescanSeries"); }
+        public JSONObject toFile(JSONObject c) {
+            try {
+                JSONObject series = c.optJSONObject("series");
+                JSONArray eps = c.optJSONArray("episodes");
+                String path = c.optString("path", "");
+                if (series == null || eps == null || eps.length() == 0 || path.isEmpty() || hasPermanentRejection(c)) return null;
+                JSONArray epIds = new JSONArray();
+                for (int i = 0; i < eps.length(); i++) {
+                    JSONObject e = eps.optJSONObject(i);
+                    if (e != null) epIds.put(e.optInt("id"));
                 }
-                act.runOnUiThread(() -> {
-                    scanning = false;
-                    setBusy(refreshBtn, false);
-                    if (dead()) return;
-                    lastScan = System.currentTimeMillis();
-                    renderStorage(res);
-                });
-            });
-        } catch (RejectedExecutionException e) {
-            scanning = false;
-            setBusy(refreshBtn, false);
-        }
-    }
-
-    private static void measure(Entry e) {
-        File d = e.dir;
-        if (d == null || !d.isDirectory()) {
-            e.state = ST_MISSING;
-            return;
-        }
-        if (d.listFiles() == null) {
-            e.state = ST_NO_ACCESS;
-            return;
-        }
-        long[] acc = new long[2];
-        walk(d, acc, 0, new HashSet<String>());
-        e.bytes = acc[0];
-        e.files = acc[1];
-        if (acc[1] > MAX_FILES_PER_FOLDER) e.state = ST_TRUNCATED;
-    }
-
-    /** Bounded recursive size; canonical paths stop symlink loops and double counting. */
-    private static void walk(File dir, long[] acc, int depth, Set<String> seen) {
-        if (acc[1] > MAX_FILES_PER_FOLDER || depth > MAX_DEPTH) return;
-        String canon;
-        try {
-            canon = dir.getCanonicalPath();
-        } catch (IOException ex) {
-            return;
-        }
-        if (!seen.add(canon)) return;
-        File[] kids = dir.listFiles();
-        if (kids == null) return;
-        for (File k : kids) {
-            if (acc[1] > MAX_FILES_PER_FOLDER) return;
-            if (k.isDirectory()) {
-                walk(k, acc, depth + 1, seen);
-            } else if (k.isFile()) {
-                acc[0] += k.length();
-                acc[1]++;
+                JSONObject f = new JSONObject();
+                f.put("path", path);
+                f.put("seriesId", series.optInt("id"));
+                f.put("episodeIds", epIds);
+                copyKey(c, f, "quality");
+                copyKey(c, f, "languages");
+                copyKey(c, f, "releaseGroup");
+                copyKey(c, f, "releaseType");
+                copyKey(c, f, "downloadId");
+                return f;
+            } catch (Throwable t) {
+                return null;
             }
         }
     }
 
-    private void renderStorage(ScanResult r) {
-        storageBody.removeAllViews();
-        final MediaStorageManager sm = MediaStorageManager.getInstance(act);
+    // ------------------------------------------------------------------ one service card
 
-        boolean perm = true;
-        try {
-            perm = AppPermissionManager.isStorageGranted(act);
-        } catch (Throwable ignored) {
-            // assume granted
-        }
-        if (!perm) {
-            storageBody.addView(UiKit.error(act, I18n.tr("Storage access is off"),
-                    I18n.tr("Folder sizes cannot be measured until Jellyarr may read your storage."),
-                    I18n.tr("Allow Access"), v -> {
-                        try {
-                            AppPermissionManager.requestStorage(act);
-                        } catch (Throwable t) {
-                            toast(String.valueOf(t.getMessage()));
-                        }
-                    }));
-        }
-        if (r.error != null) {
-            storageBody.addView(UiKit.error(act, I18n.tr("Could not measure storage"), r.error, I18n.tr("Retry"), v -> {
-                showStorageLoading();
-                scanStorage();
-            }));
-        }
+    private final class Panel {
+        final Arr arr;
+        final LinearLayout card;
+        final LinearLayout body;
+        final TextView stateBadge;
+        final Map<Field, View> inputs = new LinkedHashMap<>();
+        JSONObject mmCfg;
+        JSONObject namingCfg;
+        Button saveBtn;
+        int gen = 0;
 
-        long used = 0;
-        long max = 1;
-        for (Entry e : r.entries) {
-            used += e.bytes;
-            max = Math.max(max, e.bytes);
+        Panel(Arr arr) {
+            this.arr = arr;
+            card = UiKit.card(act);
+            LinearLayout head = UiKit.row(act);
+            head.addView(UiKit.overline(act, I18n.tr(arr.title())), new LinearLayout.LayoutParams(0, -2, 1.0f));
+            stateBadge = UiKit.caption(act, "");
+            head.addView(stateBadge);
+            card.addView(head);
+            body = UiKit.column(act);
+            card.addView(body, new LinearLayout.LayoutParams(-1, -2));
+            card.setVisibility(View.GONE);
+            reload();
         }
 
-        if (r.total > 0) {
-            storageBody.addView(UiKit.subtitle(act, tf("{0} free of {1}", fmt(r.free), fmt(r.total))));
-            int usedPct = (int) Math.max(0, Math.min(100, 100 * (r.total - r.free) / r.total));
-            int color = usedPct >= 95 ? AppTheme.danger() : usedPct >= 85 ? AppTheme.warning() : AppTheme.accent();
-            storageBody.addView(UiKit.progress(act, usedPct, color));
-            TextView u = UiKit.caption(act, tf("{0} in media folders", fmt(used)));
-            u.setPadding(0, dp(6), 0, 0);
-            storageBody.addView(u);
-        }
-        if (!r.rootPath.isEmpty()) {
-            TextView path = UiKit.mono(act, r.rootPath);
-            path.setTextSize(11.5f);
-            path.setTextColor(AppTheme.textMuted());
-            path.setPadding(0, dp(8), 0, dp(4));
-            storageBody.addView(path);
-        }
-        if (!r.rootExists && r.error == null) {
-            TextView miss = UiKit.caption(act, I18n.tr("The media folder does not exist yet. It is created when the services start."));
-            miss.setTextColor(AppTheme.warning());
-            miss.setPadding(0, 0, 0, dp(4));
-            storageBody.addView(miss);
-        }
-
-        LinearLayout list = UiKit.column(act);
-        list.setPadding(0, dp(6), 0, 0);
-        for (Entry e : r.entries) {
-            LinearLayout row = UiKit.column(act);
-            row.setPadding(dp(8), dp(10), dp(8), dp(10));
-            row.setBackground(UiKit.rowRipple(act));
-            row.setClickable(true);
-            row.setFocusable(true);
-            LinearLayout line = UiKit.row(act);
-            line.addView(UiKit.singleLine(UiKit.text(act, I18n.tr(e.label), 14f, AppTheme.text(), UiKit.MEDIUM)),
-                    new LinearLayout.LayoutParams(0, -2, 1.0f));
-            TextView meta;
-            if (e.state == ST_MISSING) {
-                meta = UiKit.caption(act, I18n.tr("Folder missing"));
-            } else if (e.state == ST_NO_ACCESS) {
-                meta = UiKit.caption(act, I18n.tr("No access"));
-                meta.setTextColor(AppTheme.warning());
-            } else {
-                String files = e.state == ST_TRUNCATED ? MAX_FILES_PER_FOLDER + "+" : String.valueOf(e.files);
-                meta = UiKit.caption(act, fmt(e.bytes) + " · " + (e.files == 1 ? I18n.tr("1 file") : tf("{0} files", files)));
+        private boolean installed() {
+            try {
+                ManagedService s = MediaServiceManager.getInstance(act).getService(arr.id());
+                return s != null && s.isInstalled();
+            } catch (Throwable t) {
+                return false;
             }
-            line.addView(meta);
-            row.addView(line);
-            int pct = e.state == ST_OK || e.state == ST_TRUNCATED ? (int) (100 * e.bytes / max) : 0;
-            row.addView(UiKit.progress(act, pct, e.state == ST_OK || e.state == ST_TRUNCATED ? AppTheme.accent() : AppTheme.textMuted()));
-            final String p = e.dir == null ? "" : e.dir.getAbsolutePath();
-            row.setOnClickListener(v -> copy(p));
-            list.addView(row, new LinearLayout.LayoutParams(-1, -2));
         }
-        storageBody.addView(list);
 
-        if (sm != null) {
-            View ret = UiKit.kv(act, I18n.tr("Staging retention"), I18n.tr(sm.getRetentionPolicyDisplayName()));
-            ret.setPadding(0, dp(10), 0, 0);
-            storageBody.addView(ret);
+        private boolean running() {
+            try {
+                ManagedService s = MediaServiceManager.getInstance(act).getService(arr.id());
+                return s != null && s.isRunning();
+            } catch (Throwable t) {
+                return false;
+            }
         }
-        Button retention = UiKit.outline(act, I18n.tr("Retention"), v -> showRetentionDialog());
-        Button manage = UiKit.outline(act, I18n.tr("Manage Storage"),
-                v -> act.startActivity(new Intent(act, JellyfinStorageActivity.class)));
-        storageBody.addView(UiKit.buttonRow(act, retention, manage));
-    }
 
-    private void showRetentionDialog() {
-        final MediaStorageManager sm = MediaStorageManager.getInstance(act);
-        if (sm == null) return;
-        final String[] values = {
-                MediaStorageManager.RETENTION_IMMEDIATE_ON_IMPORT,
-                MediaStorageManager.RETENTION_UNTIL_TORRENT_REMOVED,
-                MediaStorageManager.RETENTION_24_HOURS,
-                MediaStorageManager.RETENTION_3_DAYS,
-                MediaStorageManager.RETENTION_7_DAYS,
-                MediaStorageManager.RETENTION_MANUAL};
-        final String[] labels = {
-                "Immediately after import (no duplicates)",
-                "Until the torrent is removed",
-                "Keep for 24 hours",
-                "Keep for 3 days",
-                "Keep for 7 days",
-                "Manual cleanup"};
-        String cur = sm.getRetentionPolicy();
-
-        LinearLayout box = UiKit.column(act);
-        box.setPadding(dp(20), dp(18), dp(20), dp(16));
-        TextView t = UiKit.title(act, I18n.tr("Staging retention"));
-        t.setPadding(0, 0, 0, dp(4));
-        box.addView(t);
-        TextView hint = UiKit.body(act, I18n.tr("How long the copy in Downloads stays after a file is imported into the library."));
-        hint.setPadding(0, 0, 0, dp(8));
-        box.addView(hint);
-        ScrollView sv = new ScrollView(act);
-        sv.addView(box, new ViewGroup.LayoutParams(-1, -2));
-        final AlertDialog d = new AlertDialog.Builder(act).setView(I18n.attach(sv)).create();
-        if (d.getWindow() != null) {
-            d.getWindow().setBackgroundDrawable(UiKit.shape(act, AppTheme.card(), AppTheme.outline(), UiKit.R_CARD));
-        }
-        for (int i = 0; i < values.length; i++) {
-            final String val = values[i];
-            boolean sel = val.equals(cur);
-            TextView row = UiKit.text(act, (sel ? "✓  " : "") + I18n.tr(labels[i]), 14f,
-                    sel ? AppTheme.accent() : AppTheme.text(), sel ? UiKit.BOLD : UiKit.MEDIUM);
-            row.setPadding(dp(12), dp(12), dp(12), dp(12));
-            row.setBackground(UiKit.rowRipple(act));
-            row.setClickable(true);
-            row.setFocusable(true);
-            row.setOnClickListener(v -> {
-                sm.setRetentionPolicy(val);
-                try { d.dismiss(); } catch (Throwable ignored) { }
-                refresh(true);
-            });
-            box.addView(row, new LinearLayout.LayoutParams(-1, -2));
-        }
-        Button close = UiKit.outline(act, I18n.tr("Close"), v -> {
-            try { d.dismiss(); } catch (Throwable ignored) { }
-        });
-        box.addView(UiKit.buttonRow(act, close));
-        if (dead()) return;
-        try { d.show(); } catch (Throwable ignored) { }
-    }
-
-    // ------------------------------------------------------------------ importer card
-
-    private View buildImporterCard() {
-        LinearLayout c = UiKit.card(act);
-        c.addView(UiKit.overline(act, I18n.tr("Movie importer")));
-        importerBody = UiKit.column(act);
-        c.addView(importerBody, new LinearLayout.LayoutParams(-1, -2));
-        renderImporter();
-        return c;
-    }
-
-    private void renderImporter() {
-        if (importerBody == null) return;
-        importerBody.removeAllViews();
-        final DownloadDetectionManager det = DownloadDetectionManager.getInstance(act);
-
-        TextView desc = UiKit.body(act, I18n.tr("Organises downloaded video files into Jellyfin movie folders with automatic metadata matching."));
-        desc.setPadding(0, 0, 0, dp(10));
-        importerBody.addView(desc);
-
-        LinearLayout stats = UiKit.row(act);
-        final TextView pendingV = stat(stats, I18n.tr("Pending"), false);
-        final TextView doneV = stat(stats, I18n.tr("Imported"), true);
-        final TextView failedV = stat(stats, I18n.tr("Failed"), true);
-        importerBody.addView(stats, new LinearLayout.LayoutParams(-1, -2));
-        final TextView lastV = UiKit.singleLine(UiKit.caption(act, ""));
-        lastV.setPadding(0, dp(8), 0, 0);
-        lastV.setVisibility(View.GONE);
-        importerBody.addView(lastV);
-        loadStats(pendingV, doneV, failedV, lastV);
-
-        if (det == null) {
-            importerBody.addView(UiKit.error(act, I18n.tr("Importer unavailable"),
-                    I18n.tr("Download detection could not start."), null, null));
-            return;
-        }
-        importerBody.addView(switchRow(I18n.tr("Detect new downloads"),
-                I18n.tr("Watch for new videos and offer to import them."),
-                det.isDetectionEnabled(), on -> det.setDetectionEnabled(on)));
-        importerBody.addView(switchRow(I18n.tr("Keep the screen on while importing"),
-                I18n.tr("Prevents the phone from sleeping during long copies."),
-                det.isKeepScreenOnEnabled(), on -> det.setKeepScreenOnEnabled(on)));
-
-        final Button scan = UiKit.outline(act, I18n.tr("Scan Now"), null);
-        scan.setOnClickListener(v -> {
-            if (!det.isDetectionEnabled()) {
-                toast(I18n.tr("Turn on “Detect new downloads” first."));
+        void reload() {
+            if (!installed()) {
+                card.setVisibility(View.GONE);
                 return;
             }
+            card.setVisibility(View.VISIBLE);
+            final int my = ++gen;
+            body.removeAllViews();
+            if (!running()) {
+                stateBadge.setText(I18n.tr("Stopped"));
+                stateBadge.setTextColor(AppTheme.textMuted());
+                body.addView(UiKit.caption(act, I18n.tr("Start the service from Home to manage its files.")));
+                return;
+            }
+            stateBadge.setText(I18n.tr("Running"));
+            stateBadge.setTextColor(AppTheme.success());
+            body.addView(UiKit.loading(act, I18n.tr("Loading settings…")));
             try {
-                det.scanForNewDownloads();
-                toast(I18n.tr("Scanning for new downloads…"));
+                bg.execute(() -> {
+                    JSONObject mm = null;
+                    JSONObject nm = null;
+                    String err = null;
+                    try {
+                        mm = arr.mediaManagement();
+                        nm = arr.naming();
+                    } catch (Throwable t) {
+                        err = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                    }
+                    final JSONObject fmm = mm;
+                    final JSONObject fnm = nm;
+                    final String ferr = err;
+                    act.runOnUiThread(() -> {
+                        if (act.isFinishing() || act.isDestroyed() || my != gen) return;
+                        render(fmm, fnm, ferr);
+                    });
+                });
+            } catch (RejectedExecutionException e) {
+                // shutting down
+            }
+        }
+
+        private void render(JSONObject mm, JSONObject nm, String err) {
+            body.removeAllViews();
+            inputs.clear();
+            if (err != null || mm == null || nm == null) {
+                body.addView(UiKit.error(act, I18n.tr("Could not load settings"), err == null ? "" : err,
+                        I18n.tr("Retry"), v -> reload()));
+                return;
+            }
+            mmCfg = mm;
+            namingCfg = nm;
+
+            TextView sec = UiKit.caption(act, I18n.tr("How files are handled"));
+            sec.setPadding(0, dp(8), 0, dp(2));
+            body.addView(sec);
+            for (Field f : arr.fields()) {
+                JSONObject src = f.naming ? nm : mm;
+                if (!src.has(f.key)) continue;
+                body.addView(f.bool ? boolRow(f, src.optBoolean(f.key)) : textRow(f, src.optString(f.key, "")));
+            }
+
+            saveBtn = UiKit.primary(act, I18n.tr("Save"), v -> save());
+            Button organize = UiKit.outline(act, I18n.tr("Organize files"), v -> confirmOrganize());
+            body.addView(UiKit.buttonRow(act, saveBtn, organize));
+            Button importBtn = UiKit.tonal(act, I18n.tr("Import files…"), v -> showImportDialog());
+            Button rescan = UiKit.outline(act, I18n.tr("Rescan folders"), v -> runAction(
+                    I18n.tr("Rescan started"), () -> arr.rescanAll()));
+            body.addView(UiKit.buttonRow(act, importBtn, rescan));
+        }
+
+        private View boolRow(Field f, boolean value) {
+            LinearLayout row = UiKit.row(act);
+            row.setPadding(0, dp(8), 0, dp(8));
+            LinearLayout col = UiKit.column(act);
+            col.addView(UiKit.text(act, I18n.tr(f.label), 14f, AppTheme.text(), UiKit.MEDIUM));
+            col.addView(UiKit.caption(act, I18n.tr(f.hint)));
+            row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
+            Switch sw = new Switch(act);
+            sw.setChecked(value);
+            row.addView(sw);
+            inputs.put(f, sw);
+            return row;
+        }
+
+        private View textRow(Field f, String value) {
+            LinearLayout col = UiKit.column(act);
+            col.setPadding(0, dp(8), 0, dp(4));
+            col.addView(UiKit.text(act, I18n.tr(f.label), 14f, AppTheme.text(), UiKit.MEDIUM));
+            EditText e = UiKit.input(act, f.hint);
+            e.setText(value);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+            lp.topMargin = dp(4);
+            col.addView(e, lp);
+            inputs.put(f, e);
+            return col;
+        }
+
+        private void save() {
+            if (mmCfg == null || namingCfg == null) return;
+            final JSONObject mm = mmCfg;
+            final JSONObject nm = namingCfg;
+            final String mmBefore = mm.toString();
+            final String nmBefore = nm.toString();
+            try {
+                for (Map.Entry<Field, View> en : inputs.entrySet()) {
+                    Field f = en.getKey();
+                    JSONObject dst = f.naming ? nm : mm;
+                    if (f.bool) dst.put(f.key, ((Switch) en.getValue()).isChecked());
+                    else dst.put(f.key, ((EditText) en.getValue()).getText().toString().trim());
+                }
             } catch (Throwable t) {
                 toast(String.valueOf(t.getMessage()));
+                return;
             }
-            setBusy(scan, true);
-            importerBody.postDelayed(() -> {
-                setBusy(scan, false);
-                loadStats(pendingV, doneV, failedV, lastV);
-            }, 2500);
-        });
-        Button open = UiKit.primary(act, I18n.tr("Open Importer"),
-                v -> act.startActivity(new Intent(act, MovieImportActivity.class)));
-        importerBody.addView(UiKit.buttonRow(act, scan, open));
-    }
-
-    /** Journal statistics are read off the UI thread (the journal loads from disk on first use). */
-    private void loadStats(final TextView pendingV, final TextView doneV, final TextView failedV, final TextView lastV) {
-        final int g = ++statsGen;
-        try {
-            statsBg.execute(() -> {
-                int pending = 0, done = 0, failed = 0;
-                String last = null;
-                boolean ok = true;
-                try {
-                    MovieImportJournal j = MovieImportJournal.getInstance(act);
-                    List<MovieImportJournal.ImportRecord> all = j == null ? null : j.getAllRecords();
-                    if (all != null) {
-                        for (MovieImportJournal.ImportRecord r : all) {
-                            if (r == null || r.status == null) continue;
-                            if ("PENDING".equals(r.status) || "IN_PROGRESS".equals(r.status)) pending++;
-                            else if ("COMPLETED".equals(r.status)) {
-                                done++;
-                                if (last == null) {
-                                    last = r.movieTitle != null && !r.movieTitle.isEmpty() ? r.movieTitle : r.sourceFilename;
-                                }
-                            } else if ("FAILED".equals(r.status)) failed++;
-                        }
-                    }
-                } catch (Throwable t) {
-                    ok = false;
-                }
-                final int p = pending, d = done, f = failed;
-                final String l = last;
-                final boolean fine = ok;
-                act.runOnUiThread(() -> {
-                    if (g != statsGen || dead()) return;
-                    pendingV.setText(fine ? String.valueOf(p) : "—");
-                    pendingV.setTextColor(p > 0 ? AppTheme.warning() : AppTheme.text());
-                    doneV.setText(fine ? String.valueOf(d) : "—");
-                    doneV.setTextColor(d > 0 ? AppTheme.success() : AppTheme.text());
-                    failedV.setText(fine ? String.valueOf(f) : "—");
-                    failedV.setTextColor(f > 0 ? AppTheme.danger() : AppTheme.text());
-                    if (l != null && !l.isEmpty()) {
-                        lastV.setText(tf("Last import: {0}", l));
-                        lastV.setVisibility(View.VISIBLE);
-                    } else {
-                        lastV.setVisibility(View.GONE);
-                    }
-                });
+            final boolean mmChanged = !mm.toString().equals(mmBefore);
+            final boolean nmChanged = !nm.toString().equals(nmBefore);
+            if (!mmChanged && !nmChanged) {
+                toast(I18n.tr("Nothing changed"));
+                return;
+            }
+            runAction(I18n.tr("Saved"), () -> {
+                if (mmChanged) arr.saveMediaManagement(mm);
+                if (nmChanged) arr.saveNaming(nm);
             });
-        } catch (RejectedExecutionException ignored) {
-            // shut down
+        }
+
+        private void confirmOrganize() {
+            new AlertDialog.Builder(act)
+                    .setTitle(I18n.tr("Organize files"))
+                    .setMessage(I18n.tr("Rename every existing file and folder to the current naming format? Files stay where they are; only their names change."))
+                    .setPositiveButton(I18n.tr("Organize"), (d, w) -> runAction(null, () -> {
+                        final int n = arr.organize();
+                        act.runOnUiThread(() -> toast(n == 0
+                                ? I18n.tr("No files to rename")
+                                : I18n.tr("Renaming started for ") + n));
+                    }))
+                    .setNegativeButton(I18n.tr("Cancel"), null)
+                    .show();
+        }
+
+        // ---- manual import (Move / Copy)
+
+        private void showImportDialog() {
+            LinearLayout box = UiKit.column(act);
+            box.setPadding(dp(20), dp(8), dp(20), 0);
+            TextView hint = UiKit.caption(act, I18n.tr("Folder to import from (video files are matched to your library)"));
+            box.addView(hint);
+            final EditText path = UiKit.input(act, arr.defaultImportFolder());
+            path.setText(arr.defaultImportFolder());
+            LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, -2);
+            plp.topMargin = dp(6);
+            box.addView(path, plp);
+            final RadioGroup mode = new RadioGroup(act);
+            final RadioButton move = new RadioButton(act);
+            move.setText(I18n.tr("Move (the original is removed)"));
+            move.setTextColor(AppTheme.text());
+            move.setId(View.generateViewId());
+            final RadioButton copy = new RadioButton(act);
+            copy.setText(I18n.tr("Copy (the original stays)"));
+            copy.setTextColor(AppTheme.text());
+            copy.setId(View.generateViewId());
+            mode.addView(move);
+            mode.addView(copy);
+            mode.check(move.getId());
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(-1, -2);
+            mlp.topMargin = dp(10);
+            box.addView(mode, mlp);
+            new AlertDialog.Builder(act)
+                    .setTitle(I18n.tr("Import files"))
+                    .setView(box)
+                    .setPositiveButton(I18n.tr("Scan"), (d, w) -> scan(path.getText().toString().trim(),
+                            copy.isChecked() ? "copy" : "move"))
+                    .setNegativeButton(I18n.tr("Cancel"), null)
+                    .show();
+        }
+
+        private void scan(final String folder, final String mode) {
+            if (folder.isEmpty()) return;
+            toast(I18n.tr("Scanning…"));
+            try {
+                bg.execute(() -> {
+                    JSONArray files = new JSONArray();
+                    int total = 0;
+                    String err = null;
+                    try {
+                        JSONArray cands = arr.candidates(folder);
+                        total = cands.length();
+                        for (int i = 0; i < cands.length(); i++) {
+                            JSONObject c = cands.optJSONObject(i);
+                            JSONObject f = c == null ? null : arr.toFile(c);
+                            if (f != null) files.put(f);
+                        }
+                    } catch (Throwable t) {
+                        err = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                    }
+                    final JSONArray ff = files;
+                    final int ft = total;
+                    final String fe = err;
+                    act.runOnUiThread(() -> {
+                        if (act.isFinishing() || act.isDestroyed()) return;
+                        if (fe != null) {
+                            toast(fe);
+                            return;
+                        }
+                        if (ff.length() == 0) {
+                            toast(ft == 0 ? I18n.tr("No video files found in that folder")
+                                    : I18n.tr("Nothing could be matched to your library"));
+                            return;
+                        }
+                        confirmImport(ff, ft, mode);
+                    });
+                });
+            } catch (RejectedExecutionException e) {
+                // shutting down
+            }
+        }
+
+        private void confirmImport(final JSONArray files, int total, final String mode) {
+            boolean move = "move".equals(mode);
+            String msg = files.length() + " / " + total + " " + I18n.tr("files matched your library.")
+                    + (total > files.length() ? "\n" + I18n.tr("The rest are skipped.") : "");
+            new AlertDialog.Builder(act)
+                    .setTitle(I18n.tr(move ? "Move files" : "Copy files"))
+                    .setMessage(msg)
+                    .setPositiveButton(I18n.tr(move ? "Move" : "Copy"), (d, w) -> runAction(
+                            I18n.tr("Import started"), () -> arr.doImport(files, mode)))
+                    .setNegativeButton(I18n.tr("Cancel"), null)
+                    .show();
+        }
+
+        private void runAction(final String okMessage, final Call call) {
+            try {
+                bg.execute(() -> {
+                    String err = null;
+                    try {
+                        call.run();
+                    } catch (Throwable t) {
+                        err = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                    }
+                    final String fe = err;
+                    act.runOnUiThread(() -> {
+                        if (act.isFinishing() || act.isDestroyed()) return;
+                        if (fe != null) toast(fe);
+                        else if (okMessage != null) toast(okMessage);
+                    });
+                });
+            } catch (RejectedExecutionException e) {
+                // shutting down
+            }
         }
     }
 
-    // ------------------------------------------------------------------ small UI helpers
+    // ------------------------------------------------------------------ helpers
 
-    private interface Toggle {
-        void on(boolean checked);
-    }
-
-    private View switchRow(String label, String hint, boolean checked, final Toggle t) {
-        LinearLayout row = UiKit.row(act);
-        row.setPadding(0, dp(12), 0, 0);
-        LinearLayout col = UiKit.column(act);
-        col.addView(UiKit.text(act, label, 14f, AppTheme.text(), null));
-        TextView h = UiKit.caption(act, hint);
-        h.setPadding(0, dp(2), 0, 0);
-        col.addView(h);
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, -2, 1.0f);
-        clp.setMarginEnd(dp(12));
-        row.addView(col, clp);
-        final Switch sw = new Switch(act);
-        sw.setChecked(checked);
-        UiStyle.styleSwitch(act, sw);
-        sw.setOnCheckedChangeListener((b, on) -> {
-            try {
-                t.on(on);
-            } catch (Throwable e) {
-                toast(String.valueOf(e.getMessage()));
-            }
-        });
-        row.addView(sw);
-        row.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
-        return row;
-    }
-
-    /** Adds an inset statistic tile to the row and returns its value view. */
-    private TextView stat(LinearLayout parent, String label, boolean gap) {
-        LinearLayout c = UiKit.inset(act);
-        c.setGravity(android.view.Gravity.CENTER);
-        TextView v = UiKit.text(act, "—", 20f, AppTheme.text(), UiKit.BOLD);
-        v.setGravity(android.view.Gravity.CENTER);
-        c.addView(v, new LinearLayout.LayoutParams(-1, -2));
-        TextView l = UiKit.singleLine(UiKit.caption(act, label));
-        l.setGravity(android.view.Gravity.CENTER);
-        c.addView(l, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1.0f);
-        if (gap) lp.setMarginStart(dp(8));
-        parent.addView(c, lp);
-        return v;
-    }
-
-    private Button compact(Button b) {
-        b.setTextSize(12.5f);
-        b.setMinHeight(dp(32));
-        b.setMinimumHeight(dp(32));
-        b.setPadding(dp(12), 0, dp(12), 0);
-        return b;
-    }
-
-    private static void setBusy(View b, boolean busy) {
-        if (b == null) return;
-        b.setEnabled(!busy);
-        b.setAlpha(busy ? 0.5f : 1f);
+    private interface Call {
+        void run() throws Exception;
     }
 
     private void toast(String s) {
-        if (s == null || dead()) return;
-        Toast.makeText(act, s, Toast.LENGTH_SHORT).show();
-    }
-
-    private void copy(String s) {
-        if (s == null || s.isEmpty()) return;
-        try {
-            ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm == null) return;
-            cm.setPrimaryClip(ClipData.newPlainText("path", s));
-            toast(I18n.tr("Path copied"));
-        } catch (Throwable ignored) { }
-    }
-
-    private static String tf(String template, Object... args) {
-        String s = I18n.tr(template);
-        for (int i = 0; i < args.length; i++) s = s.replace("{" + i + "}", String.valueOf(args[i]));
-        return s;
+        if (s == null || act.isFinishing() || act.isDestroyed()) return;
+        Toast.makeText(act, s, Toast.LENGTH_LONG).show();
     }
 
     private int dp(float v) {
         return UiKit.dp(act, v);
-    }
-
-    private static String fmt(long b) {
-        if (b < 1024) return b + " B";
-        double v = b / 1024.0;
-        String[] u = {"KB", "MB", "GB", "TB"};
-        int i = 0;
-        while (v >= 1024 && i < u.length - 1) {
-            v /= 1024;
-            i++;
-        }
-        return String.format(Locale.US, v >= 100 ? "%.0f %s" : "%.1f %s", v, u[i]);
     }
 }

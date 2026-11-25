@@ -215,9 +215,10 @@ public final class UnifiedAccount {
             JSONObject host = new JSONObject(http("GET", base + "/config/host", key, null, null));
             sanitizeHostConfig(host, id);
             host.put("authenticationMethod", "forms");
-            // Same rule the app enforces in config.xml at every start: the phone itself (127.0.0.1) and the
-            // in-app tabs never need to log in; other devices on the network must use this account.
-            host.put("authenticationRequired", "disabledForLocalAddresses");
+            // Same rule the app enforces in config.xml at every start: with an account set, the web UI always asks
+            // for it (on the phone and on the network), so signing out really signs out. The in-app tabs talk to the
+            // service with its API key and are not affected.
+            host.put("authenticationRequired", "enabled");
             host.put("username", user);
             host.put("password", pass);
             host.put("passwordConfirmation", pass);

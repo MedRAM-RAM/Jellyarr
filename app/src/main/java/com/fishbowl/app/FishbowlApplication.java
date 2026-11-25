@@ -9,7 +9,7 @@ import com.termux.app.TermuxApplication;
  * Native Android Application class for FishBowl Media Server.
  *
  * Coordinates standalone application lifecycle, background runtime preparation,
- * external media storage initialization (/storage/emulated/0/FishbowlMedia),
+ * external media storage initialization (/storage/emulated/0/JellyarrMedia),
  * and non-root execution environment safety.
  */
 public class FishbowlApplication extends TermuxApplication {
@@ -30,11 +30,13 @@ public class FishbowlApplication extends TermuxApplication {
         Log.i(TAG, "Initializing Jellyarr standalone media server application");
 
         try { UpdateNotifier.schedule(context); } catch (Throwable ignored) {}
+        // Must run before the media folders are scaffolded and before any service starts.
+        MediaRootMigration.run(context);
         try {
             // Scaffold and ensure core unified external storage paths
             MediaStorageManager.getInstance(context).initializeOnLaunch(context);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to initialize unified FishbowlMedia storage directories", e);
+            Log.e(TAG, "Failed to initialize unified JellyarrMedia storage directories", e);
         }
     }
 }

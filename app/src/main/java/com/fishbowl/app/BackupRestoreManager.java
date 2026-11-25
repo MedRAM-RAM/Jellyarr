@@ -1097,7 +1097,7 @@ public final class BackupRestoreManager {
             }
         }
 
-        // Priority 2: Persistent mirrored db /sdcard/FishbowlMedia/data/jellyfin.db (and legacy /sdcard/Fishbowl/data/jellyfin.db)
+        // Priority 2: Persistent mirrored db /sdcard/JellyarrMedia/data/jellyfin.db (and legacy /sdcard/Fishbowl/data/jellyfin.db)
         List<File> mirroredCandidates = new ArrayList<>();
         mirroredCandidates.add(new File(MediaStorageManager.DEFAULT_MEDIA_ROOT, "data/jellyfin.db"));
         mirroredCandidates.add(new File(Environment.getExternalStorageDirectory(), "Fishbowl/data/jellyfin.db"));
@@ -1233,7 +1233,7 @@ public final class BackupRestoreManager {
                     return;
                 }
 
-                // 1. Primary destination: /sdcard/FishbowlMedia/data/jellyfin.db
+                // 1. Primary destination: /sdcard/JellyarrMedia/data/jellyfin.db
                 File fishbowlDataDir = new File(MediaStorageManager.DEFAULT_MEDIA_ROOT, "data");
                 if (!fishbowlDataDir.exists()) fishbowlDataDir.mkdirs();
 
