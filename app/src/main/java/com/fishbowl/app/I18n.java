@@ -295,7 +295,21 @@ public final class I18n {
         return sp.getSpans(0, sp.length(), Object.class).length == 0;
     }
 
+    /**
+     * In an RTL layout, Latin text (service names, versions, paths) is aligned left by the text engine while Arabic
+     * text sits right, so rows look ragged. Align every normally-aligned text to the view's start edge instead.
+     * Centered / end-gravity texts and buttons are left alone.
+     */
+    private static void alignToViewStart(TextView tv) {
+        if (!arabic || tv instanceof EditText) return;
+        int g = tv.getGravity() & android.view.Gravity.RELATIVE_HORIZONTAL_GRAVITY_MASK;
+        if ((g == 0 || g == android.view.Gravity.START) && tv.getTextAlignment() == View.TEXT_ALIGNMENT_GRAVITY) {
+            tv.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+        }
+    }
+
     private static void translateTextView(final TextView tv) {
+        alignToViewStart(tv);
         translateDescription(tv);
         CharSequence hint = tv.getHint();
         if (hint != null && isPlain(hint)) {

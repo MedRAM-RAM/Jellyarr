@@ -905,16 +905,7 @@ public final class BackupRestoreManager {
     }
 
     public static void copyFile(File src, File dst) throws Exception {
-        File parent = dst.getParentFile();
-        if (parent != null && !parent.exists()) parent.mkdirs();
-        try (InputStream in = new FileInputStream(src);
-             OutputStream out = new FileOutputStream(dst)) {
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = in.read(buf)) > 0) {
-                out.write(buf, 0, len);
-            }
-        }
+        com.fishbowl.app.util.Files.copy(src, dst);
     }
 
     public static String readFileToString(File file) throws Exception {
@@ -1298,16 +1289,7 @@ public final class BackupRestoreManager {
     }
 
     public static void deleteRecursively(File fileOrDir) {
-        if (fileOrDir == null || !fileOrDir.exists()) return;
-        if (fileOrDir.isDirectory()) {
-            File[] children = fileOrDir.listFiles();
-            if (children != null) {
-                for (File child : children) {
-                    deleteRecursively(child);
-                }
-            }
-        }
-        fileOrDir.delete();
+        com.fishbowl.app.util.Files.deleteRecursively(fileOrDir);
     }
 
     private static void flushDisk() {

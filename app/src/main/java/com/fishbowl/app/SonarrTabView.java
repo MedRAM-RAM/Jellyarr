@@ -2467,16 +2467,7 @@ public final class SonarrTabView {
     }
 
     private static String fmtSize(long bytes) {
-        if (bytes <= 0) return "0 B";
-        if (bytes < 1024) return bytes + " B";
-        double v = bytes / 1024.0;
-        String[] u = {"KB", "MB", "GB", "TB"};
-        int i = 0;
-        while (v >= 1024 && i < u.length - 1) {
-            v /= 1024;
-            i++;
-        }
-        return String.format(Locale.US, v >= 100 ? "%.0f %s" : "%.1f %s", v, u[i]);
+        return com.fishbowl.app.util.Fmt.bytes(bytes);
     }
 
     private static String fmtAge(double minutes) {

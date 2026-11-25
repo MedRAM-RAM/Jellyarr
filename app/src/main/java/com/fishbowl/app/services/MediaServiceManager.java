@@ -1388,7 +1388,9 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
     }
 
     public static boolean deleteRecursive(File f) {
-        if (f == null || !f.exists()) return true;
+        if (f == null || (!f.exists() && !com.fishbowl.app.util.Files.isSymlink(f))) return true;
+        // A link is removed as a link: never follow it into the folder it points to.
+        if (com.fishbowl.app.util.Files.isSymlink(f)) return f.delete();
         try {
             String canonical = f.getCanonicalPath();
             File home = TermuxConstants.TERMUX_HOME_DIR.getCanonicalFile();
@@ -2505,35 +2507,15 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
     }
 
     public static void copyFile(File src, File dst) {
-        try (FileInputStream in = new FileInputStream(src);
-             FileOutputStream out = new FileOutputStream(dst)) {
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = in.read(buf)) > 0) {
-                out.write(buf, 0, len);
-            }
-        } catch (Throwable ignored) {}
+        try { com.fishbowl.app.util.Files.copy(src, dst); } catch (Throwable ignored) {}
     }
 
     public static String readTextFile(File file) {
-        try (FileInputStream fis = new FileInputStream(file);
-             InputStreamReader isr = new InputStreamReader(fis, StandardCharsets.UTF_8);
-             BufferedReader br = new BufferedReader(isr)) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) {
-                sb.append(line).append("\n");
-            }
-            return sb.toString();
-        } catch (Throwable t) {
-            return null;
-        }
+        return com.fishbowl.app.util.Files.readText(file);
     }
 
     public static void writeTextFile(File file, String content) {
-        try (FileOutputStream fos = new FileOutputStream(file)) {
-            fos.write(content.getBytes(StandardCharsets.UTF_8));
-        } catch (Throwable ignored) {}
+        com.fishbowl.app.util.Files.writeText(file, content);
     }
 
     public ServiceHealthMonitor getHealthMonitor() {

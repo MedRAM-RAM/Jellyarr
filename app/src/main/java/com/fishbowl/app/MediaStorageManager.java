@@ -2553,10 +2553,7 @@ public final class MediaStorageManager {
     }
 
     public static String formatBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024 * 1024) return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
-        if (bytes < 1024 * 1024 * 1024) return String.format(Locale.US, "%.2f MB", bytes / (1024.0 * 1024.0));
-        return String.format(Locale.US, "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+        return com.fishbowl.app.util.Fmt.bytes(bytes);
     }
 
     public static class StorageDiagnosticResult {

@@ -7096,10 +7096,7 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     public static String formatBytes(long bytes) {
-        if (bytes <= 0) return "0 B";
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024 * 1024) return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
-        return String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0));
+        return com.fishbowl.app.util.Fmt.bytes(bytes);
     }
 
     public static String formatSpeed(double kbps) {
@@ -8827,51 +8824,25 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void deleteRecursive(File fileOrDir) {
-        if (fileOrDir.isDirectory()) {
-            File[] children = fileOrDir.listFiles();
-            if (children != null) {
-                for (File child : children) deleteRecursive(child);
-            }
-        }
-        fileOrDir.delete();
+        com.fishbowl.app.util.Files.deleteRecursively(fileOrDir);
     }
 
     private void copyFile(File src, File dst) {
-        try (java.io.FileInputStream in = new java.io.FileInputStream(src);
-             java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = in.read(buf)) > 0) {
-                out.write(buf, 0, len);
-            }
-        } catch (Throwable ignored) {}
+        try { com.fishbowl.app.util.Files.copy(src, dst); } catch (Throwable ignored) {}
     }
 
     private static String readTextFile(File file) {
-        try (java.io.FileInputStream fis = new java.io.FileInputStream(file);
-             java.io.InputStreamReader isr = new java.io.InputStreamReader(fis, java.nio.charset.StandardCharsets.UTF_8);
-             java.io.BufferedReader br = new java.io.BufferedReader(isr)) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) {
-                sb.append(line).append("\n");
-            }
-            return sb.toString();
-        } catch (Throwable t) {
-            return null;
-        }
+        return com.fishbowl.app.util.Files.readText(file);
     }
 
     private static void writeTextFile(File file, String content) {
-        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(file)) {
-            fos.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        } catch (Throwable ignored) {}
+        com.fishbowl.app.util.Files.writeText(file, content);
     }
 
     private void exportSanitizedDiagnostics() {
         StringBuilder sb = new StringBuilder();
         sb.append("=== Jellyarr System Diagnostics ===\n");
-        sb.append("App Version: ").append("1.4.8-beta.1 (101412)\n");
+        sb.append("App Version: ").append(com.termux.BuildConfig.VERSION_NAME).append(" (").append(com.termux.BuildConfig.VERSION_CODE).append(")\n");
         sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
         sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append("Architecture: ").append(Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown").append("\n");
@@ -10307,6 +10278,27 @@ public final class FishbowlActivity extends AppCompatActivity
 
     // -- AUTOMATION: Transmission auto-cleanup, auto-recheck & per-service Wi-Fi only ----------
 
+    /** One settings row: title + hint on the start side, switch on the end side (correct in LTR and RTL). */
+    private LinearLayout settingsSwitchRow(String title, String hint, boolean checked,
+                                           android.widget.CompoundButton.OnCheckedChangeListener l) {
+        LinearLayout row = UiKit.row(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(8), 0, dp(8));
+        LinearLayout text = UiKit.column(this);
+        text.addView(UiKit.text(this, I18n.tr(title), 13.5f, AppTheme.text(), UiKit.BOLD));
+        if (hint != null && !hint.isEmpty()) {
+            TextView h = UiKit.caption(this, I18n.tr(hint));
+            h.setPaddingRelative(0, dp(2), dp(8), 0);
+            text.addView(h);
+        }
+        row.addView(text, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Switch sw = new Switch(this);
+        sw.setChecked(checked);
+        sw.setOnCheckedChangeListener(l);
+        row.addView(sw);
+        return row;
+    }
+
     private View buildAutomationSection() {
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
@@ -10314,44 +10306,22 @@ public final class FishbowlActivity extends AppCompatActivity
 
         LinearLayout card = createSettingsSectionCard();
 
-        // --- Transmission auto-cleanup -------------------------------------------------
-        LinearLayout cleanRow = new LinearLayout(this);
-        cleanRow.setOrientation(LinearLayout.HORIZONTAL);
-        cleanRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout cleanText = new LinearLayout(this);
-        cleanText.setOrientation(LinearLayout.VERTICAL);
-        TextView cleanTitle = new TextView(this);
-        cleanTitle.setText("Transmission auto-cleanup");
-        cleanTitle.setTextSize(13.5f);
-        cleanTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        cleanTitle.setTextColor(AppTheme.text());
-        cleanText.addView(cleanTitle);
-        TextView cleanSub = new TextView(this);
-        cleanSub.setText("Remove finished torrents AND their downloaded files after the period below. Make sure Radarr/Sonarr have already imported them (or that they hard-link/copy), otherwise the files are lost.");
-        cleanSub.setTextSize(11f);
-        cleanSub.setTextColor(AppTheme.textMuted());
-        cleanSub.setPaddingRelative(0, dp(2), dp(8), 0);
-        cleanText.addView(cleanSub);
-        cleanRow.addView(cleanText, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Switch cleanSwitch = new Switch(this);
-        cleanSwitch.setChecked(com.fishbowl.app.services.AutomationPrefs.isCleanupEnabled(this));
-        cleanSwitch.setOnCheckedChangeListener((v, checked) -> {
-            com.fishbowl.app.services.AutomationPrefs.setCleanupEnabled(this, checked);
-            Toast.makeText(this, I18n.tr(checked ? "Auto-cleanup enabled." : "Auto-cleanup disabled."), Toast.LENGTH_SHORT).show();
-        });
-        cleanRow.addView(cleanSwitch);
-        card.addView(cleanRow);
+        // --- Downloads cleanup: one card for everything that deletes finished downloads ------
+        card.addView(UiKit.overline(this, I18n.tr("Downloads cleanup")));
+        card.addView(settingsSwitchRow("Delete finished downloads",
+                "Removes finished torrents AND their files after the time below. Radarr / Sonarr must have imported them first (or hard-link / copy), otherwise the files are lost.",
+                com.fishbowl.app.services.AutomationPrefs.isCleanupEnabled(this),
+                (v, checked) -> {
+                    com.fishbowl.app.services.AutomationPrefs.setCleanupEnabled(this, checked);
+                    Toast.makeText(this, I18n.tr(checked ? "Auto-cleanup enabled." : "Auto-cleanup disabled."), Toast.LENGTH_SHORT).show();
+                }));
 
         // Period (hours)
-        LinearLayout periodRow = new LinearLayout(this);
-        periodRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout periodRow = UiKit.row(this);
         periodRow.setGravity(Gravity.CENTER_VERTICAL);
-        periodRow.setPadding(0, dp(10), 0, dp(4));
-        TextView periodLabel = new TextView(this);
-        periodLabel.setText("Delete after (hours)");
-        periodLabel.setTextSize(12.5f);
-        periodLabel.setTextColor(AppTheme.text());
-        periodRow.addView(periodLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        periodRow.setPadding(0, dp(6), 0, dp(4));
+        periodRow.addView(UiKit.text(this, I18n.tr("Delete after (hours)"), 12.5f, AppTheme.text(), UiKit.MEDIUM),
+                new LinearLayout.LayoutParams(0, -2, 1.0f));
         final android.widget.EditText hoursInput = new android.widget.EditText(this);
         hoursInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
         hoursInput.setText(String.valueOf(com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this)));
@@ -10363,13 +10333,6 @@ public final class FishbowlActivity extends AppCompatActivity
         Button btnSaveHours = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
         btnSaveHours.setTextSize(10f);
         btnSaveHours.setPadding(dp(10), 0, dp(10), 0);
-        btnSaveHours.setOnClickListener(v -> {
-            int h = com.fishbowl.app.services.AutomationPrefs.DEFAULT_CLEANUP_HOURS;
-            try { h = Integer.parseInt(hoursInput.getText().toString().trim()); } catch (Throwable ignored) {}
-            com.fishbowl.app.services.AutomationPrefs.setCleanupHours(this, h);
-            hoursInput.setText(String.valueOf(com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this)));
-            Toast.makeText(this, I18n.tr("Saved: " + com.fishbowl.app.services.AutomationPrefs.getCleanupHours(this) + " h"), Toast.LENGTH_SHORT).show();
-        });
         LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(-2, dp(32));
         saveLp.setMarginStart(dp(8));
         periodRow.addView(btnSaveHours, saveLp);
@@ -10385,14 +10348,14 @@ public final class FishbowlActivity extends AppCompatActivity
         });
         card.addView(periodRow);
 
-        // Preview + run now
-        final TextView statusText = new TextView(this);
-        statusText.setTextSize(11f);
-        statusText.setTextColor(AppTheme.textSecondary());
+        // Last run + preview / run now
+        final TextView statusText = UiKit.caption(this, "");
         statusText.setPadding(0, dp(4), 0, dp(6));
         long lastRun = com.fishbowl.app.services.AutomationPrefs.getCleanupLastRun(this);
         statusText.setText(lastRun > 0
-                ? "Last run: " + new java.util.Date(lastRun) + "\n" + com.fishbowl.app.services.AutomationPrefs.getCleanupLastSummary(this)
+                ? I18n.tr("Last run") + ": " + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT,
+                        I18n.isArabic() ? new java.util.Locale("ar") : java.util.Locale.getDefault()).format(new java.util.Date(lastRun))
+                        + "\n" + com.fishbowl.app.services.AutomationPrefs.getCleanupLastSummary(this)
                 : "Checks every 30 minutes while Transmission is running. Not run yet.");
         card.addView(statusText);
 
@@ -10411,89 +10374,13 @@ public final class FishbowlActivity extends AppCompatActivity
         btnRow.addView(btnRunNow, b2);
         card.addView(btnRow);
 
-        card.addView(createSettingsDivider());
-
-        // --- Transmission auto-recheck on error ----------------------------------------
-        LinearLayout recheckRow = new LinearLayout(this);
-        recheckRow.setOrientation(LinearLayout.HORIZONTAL);
-        recheckRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout recheckText = new LinearLayout(this);
-        recheckText.setOrientation(LinearLayout.VERTICAL);
-        TextView recheckTitle = new TextView(this);
-        recheckTitle.setText("Auto-recheck on download error");
-        recheckTitle.setTextSize(13.5f);
-        recheckTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        recheckTitle.setTextColor(AppTheme.text());
-        recheckText.addView(recheckTitle);
-        TextView recheckSub = new TextView(this);
-        recheckSub.setText("When a torrent reports any error, Jellyarr re-verifies its data and resumes it. Retries back off (5, 10, 20, 40, 80 min) and stop after 5 attempts until the error clears.");
-        recheckSub.setTextSize(11f);
-        recheckSub.setTextColor(AppTheme.textMuted());
-        recheckSub.setPaddingRelative(0, dp(2), dp(8), 0);
-        recheckText.addView(recheckSub);
-        recheckRow.addView(recheckText, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Switch recheckSwitch = new Switch(this);
-        recheckSwitch.setChecked(com.fishbowl.app.services.AutomationPrefs.isAutoRecheckEnabled(this));
-        recheckSwitch.setOnCheckedChangeListener((v, checked) -> {
-            com.fishbowl.app.services.AutomationPrefs.setAutoRecheckEnabled(this, checked);
-            Toast.makeText(this, I18n.tr(checked ? "Auto-recheck enabled." : "Auto-recheck disabled."), Toast.LENGTH_SHORT).show();
-        });
-        recheckRow.addView(recheckSwitch);
-        card.addView(recheckRow);
-
-        card.addView(createSettingsDivider());
-
-        // --- Per-service Wi-Fi only ----------------------------------------------------
-        TextView wifiTitle = new TextView(this);
-        wifiTitle.setText("Wi-Fi only (per service)");
-        wifiTitle.setTextSize(13.5f);
-        wifiTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
-        wifiTitle.setTextColor(AppTheme.text());
-        card.addView(wifiTitle);
-        TextView wifiSub = new TextView(this);
-        wifiSub.setText("A service switched on here is stopped while the phone uses mobile data and starts again automatically when Wi-Fi/Ethernet returns. Going offline does not stop it.");
-        wifiSub.setTextSize(11f);
-        wifiSub.setTextColor(AppTheme.textMuted());
-        wifiSub.setPadding(0, dp(2), 0, dp(8));
-        card.addView(wifiSub);
-
-        com.fishbowl.app.services.MediaServiceManager msm = com.fishbowl.app.services.MediaServiceManager.getInstance();
-        if (msm != null) {
-            for (com.fishbowl.app.model.ManagedService svc : msm.getAllServices()) {
-                final String svcId = svc.getId();
-                LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.HORIZONTAL);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setPadding(0, dp(4), 0, dp(4));
-                TextView name = new TextView(this);
-                name.setText(svc.getManifest().getDisplayName());
-                name.setTextSize(12.5f);
-                name.setTextColor(AppTheme.text());
-                row.addView(name, new LinearLayout.LayoutParams(0, -2, 1.0f));
-                Switch sw = new Switch(this);
-                sw.setChecked(com.fishbowl.app.services.AutomationPrefs.isWifiOnly(this, svcId));
-                sw.setOnCheckedChangeListener((v, checked) -> {
-                    com.fishbowl.app.services.AutomationPrefs.setWifiOnly(this, svcId, checked);
-                    com.fishbowl.app.services.NetworkPolicyEnforcer.reevaluate();
-                });
-                row.addView(sw);
-                card.addView(row);
-            }
-        } else {
-            TextView none = new TextView(this);
-            none.setText("Service manager not ready yet - reopen this tab in a moment.");
-            none.setTextSize(11f);
-            none.setTextColor(AppTheme.textMuted());
-            card.addView(none);
-        }
-
-        // --- Download staging retention (moved here from the old storage card) -----------
-        card.addView(createSettingsDivider());
+        // Copy kept in Downloads after import (staging retention): same feature family, same card.
         final TextView retValue = UiKit.caption(this, "");
         LinearLayout retRow = UiKit.row(this);
-        retRow.setPadding(0, dp(8), 0, dp(4));
+        retRow.setGravity(Gravity.CENTER_VERTICAL);
+        retRow.setPadding(0, dp(14), 0, dp(4));
         LinearLayout retText = UiKit.column(this);
-        retText.addView(UiKit.text(this, I18n.tr("Downloads retention"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        retText.addView(UiKit.text(this, I18n.tr("Keep the copy in Downloads"), 13.5f, AppTheme.text(), UiKit.BOLD));
         TextView retHint = UiKit.caption(this, I18n.tr("How long the copy in Downloads stays after Radarr / Sonarr imported it."));
         retText.addView(retHint);
         retText.addView(retValue);
@@ -10506,8 +10393,50 @@ public final class FishbowlActivity extends AppCompatActivity
         showRet.run();
         Button retBtn = UiKit.outline(this, I18n.tr("Change"), v -> showRetentionDialog(showRet));
         retBtn.setTextSize(12f);
-        retRow.addView(retBtn, new LinearLayout.LayoutParams(-2, dp(34)));
+        LinearLayout.LayoutParams retLp = new LinearLayout.LayoutParams(-2, dp(34));
+        retLp.setMarginStart(dp(8));
+        retRow.addView(retBtn, retLp);
         card.addView(retRow);
+
+        card.addView(createSettingsDivider());
+
+        // --- Transmission auto-recheck on error ----------------------------------------
+        card.addView(settingsSwitchRow("Auto-recheck on download error",
+                "When a torrent reports any error, Jellyarr re-verifies its data and resumes it. Retries back off (5, 10, 20, 40, 80 min) and stop after 5 attempts until the error clears.",
+                com.fishbowl.app.services.AutomationPrefs.isAutoRecheckEnabled(this),
+                (v, checked) -> {
+                    com.fishbowl.app.services.AutomationPrefs.setAutoRecheckEnabled(this, checked);
+                    Toast.makeText(this, I18n.tr(checked ? "Auto-recheck enabled." : "Auto-recheck disabled."), Toast.LENGTH_SHORT).show();
+                }));
+
+        card.addView(createSettingsDivider());
+
+        // --- Per-service Wi-Fi only ----------------------------------------------------
+        card.addView(UiKit.overline(this, I18n.tr("Wi-Fi only (per service)")));
+        TextView wifiSub = UiKit.caption(this, I18n.tr("A service switched on here is stopped while the phone uses mobile data and starts again automatically when Wi-Fi/Ethernet returns. Going offline does not stop it."));
+        wifiSub.setPadding(0, dp(4), 0, dp(6));
+        card.addView(wifiSub);
+
+        com.fishbowl.app.services.MediaServiceManager msm = com.fishbowl.app.services.MediaServiceManager.getInstance();
+        if (msm != null) {
+            boolean first = true;
+            for (com.fishbowl.app.model.ManagedService svc : msm.getAllServices()) {
+                boolean isJellyfin = "jellyfin".equalsIgnoreCase(svc.getId());
+                if (!isJellyfin && !svc.isInstalled()) continue;
+                final String svcId = svc.getId();
+                if (!first) card.addView(UiKit.divider(this));
+                first = false;
+                String state = svc.isRunning() ? "Running" : svc.isStarting() ? "Starting" : "Stopped";
+                card.addView(settingsSwitchRow(isJellyfin ? "Jellyfin" : svc.getManifest().getDisplayName(), state,
+                        com.fishbowl.app.services.AutomationPrefs.isWifiOnly(this, svcId),
+                        (v, checked) -> {
+                            com.fishbowl.app.services.AutomationPrefs.setWifiOnly(this, svcId, checked);
+                            com.fishbowl.app.services.NetworkPolicyEnforcer.reevaluate();
+                        }));
+            }
+        } else {
+            card.addView(UiKit.caption(this, I18n.tr("Service manager not ready yet - reopen this tab in a moment.")));
+        }
 
         section.addView(card);
         return section;
