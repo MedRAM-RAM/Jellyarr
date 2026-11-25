@@ -340,7 +340,7 @@ public final class MediaToolsView {
             col.addView(UiKit.text(act, I18n.tr(f.label), 14f, AppTheme.text(), UiKit.MEDIUM));
             col.addView(UiKit.caption(act, I18n.tr(f.hint)));
             row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
-            Switch sw = new Switch(act);
+            Switch sw = UiStyle.newSwitch(act);
             sw.setChecked(value);
             row.addView(sw);
             inputs.put(f, sw);

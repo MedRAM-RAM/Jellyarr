@@ -2,6 +2,9 @@ package com.fishbowl.app;
 
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
+import android.widget.CheckBox;
 import android.os.Build;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -23,13 +26,80 @@ public final class UiStyle {
                 new int[]{checked, unchecked});
     }
 
+    private static GradientDrawable pill(int fill, int stroke, int widthPx, int heightPx, int strokePx) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.RECTANGLE);
+        g.setCornerRadius(heightPx);
+        g.setColor(fill);
+        if (stroke != 0) g.setStroke(strokePx, stroke);
+        g.setSize(widthPx, heightPx);
+        return g;
+    }
+
+    private static GradientDrawable circle(int fill, int sizePx) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(fill);
+        g.setSize(sizePx, sizePx);
+        return g;
+    }
+
+    /**
+     * Clear ON / OFF look that follows the theme accent (explicit drawables, so it does not depend on tint support):
+     *  ON  = accent track, high-contrast thumb;  OFF = dim outlined track, small muted thumb;
+     *  disabled = same shapes at low contrast.
+     */
     public static void styleSwitch(Context c, Switch s) {
-        if (Build.VERSION.SDK_INT < 23) return;
         try {
-            // Material 3 switch: on = accent track + on-accent thumb; off = outlined muted track.
-            s.setThumbTintList(states(AppTheme.onAccent(), AppTheme.textMuted()));
-            s.setTrackTintList(states(AppTheme.accent(), AppTheme.inner()));
+            float d = c.getResources().getDisplayMetrics().density;
+            int trackW = (int) (46 * d), trackH = (int) (26 * d), stroke = Math.max(1, (int) (1.5f * d));
+            int thumbOn = (int) (20 * d), thumbOff = (int) (14 * d);
+
+            int accent = AppTheme.accent();
+            int onThumb = AppTheme.contrastOn(accent);
+            int offTrack = AppTheme.inner();
+            int offStroke = AppTheme.outlineStrong();
+            int offThumb = AppTheme.textMuted();
+
+            StateListDrawable track = new StateListDrawable();
+            track.addState(new int[]{-android.R.attr.state_enabled, android.R.attr.state_checked},
+                    pill(AppTheme.withAlpha(accent, 0x55), 0, trackW, trackH, stroke));
+            track.addState(new int[]{-android.R.attr.state_enabled},
+                    pill(offTrack, AppTheme.withAlpha(offStroke, 0x55), trackW, trackH, stroke));
+            track.addState(new int[]{android.R.attr.state_checked}, pill(accent, accent, trackW, trackH, stroke));
+            track.addState(new int[]{}, pill(offTrack, offStroke, trackW, trackH, stroke));
+
+            StateListDrawable thumb = new StateListDrawable();
+            thumb.addState(new int[]{-android.R.attr.state_enabled, android.R.attr.state_checked},
+                    circle(AppTheme.withAlpha(onThumb, 0x99), thumbOn));
+            thumb.addState(new int[]{-android.R.attr.state_enabled}, circle(AppTheme.withAlpha(offThumb, 0x66), thumbOff));
+            thumb.addState(new int[]{android.R.attr.state_checked}, circle(onThumb, thumbOn));
+            thumb.addState(new int[]{}, circle(offThumb, thumbOff));
+
+            s.setTrackDrawable(track);
+            s.setThumbDrawable(thumb);
+            s.setSwitchMinWidth(trackW);
+            s.setThumbTextPadding(0);
+            s.setShowText(false);
+        } catch (Throwable ignored) {
+            // keep the platform look if anything is unsupported
+        }
+    }
+
+    /** A Switch that already has the themed look. */
+    public static Switch newSwitch(Context c) {
+        Switch s = new Switch(c);
+        styleSwitch(c, s);
+        return s;
+    }
+
+    /** Check box with the accent colour when checked. */
+    public static CheckBox newCheckBox(Context c) {
+        CheckBox cb = new CheckBox(c);
+        try {
+            cb.setButtonTintList(states(AppTheme.accent(), AppTheme.textMuted()));
         } catch (Throwable ignored) {}
+        return cb;
     }
 
     public static void styleAllSwitches(Context c, View root) {

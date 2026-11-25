@@ -1243,7 +1243,7 @@ public final class TransmissionTabView {
             view = UiKit.row(act);
             view.setPadding(dp(8), dp(10), dp(8), dp(10));
 
-            sw = new Switch(act);
+            sw = UiStyle.newSwitch(act);
             UiStyle.styleSwitch(act, sw);
             view.addView(sw);
 
@@ -2101,7 +2101,7 @@ public final class TransmissionTabView {
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
         tlp.setMarginEnd(dp(12));
         row.addView(tx, tlp);
-        Switch sw = new Switch(act);
+        Switch sw = UiStyle.newSwitch(act);
         sw.setChecked(checked);
         UiStyle.styleSwitch(act, sw);
         row.addView(sw);
