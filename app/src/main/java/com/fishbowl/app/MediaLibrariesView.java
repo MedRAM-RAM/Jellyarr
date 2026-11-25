@@ -791,14 +791,6 @@ public final class MediaLibrariesView {
     }
 
     static String fmt(long b) {
-        if (b < 1024) return b + " B";
-        double v = b / 1024.0;
-        String[] u = {"KB", "MB", "GB", "TB"};
-        int i = 0;
-        while (v >= 1024 && i < u.length - 1) {
-            v /= 1024;
-            i++;
-        }
-        return String.format(Locale.US, v >= 100 ? "%.0f %s" : "%.1f %s", v, u[i]);
+        return com.fishbowl.app.util.Fmt.bytes(b);
     }
 }

@@ -2201,12 +2201,7 @@ public final class RadarrTabView {
     }
 
     private static String fmtSize(long bytes) {
-        if (bytes <= 0) return "0 B";
-        double gb = bytes / 1073741824.0;
-        if (gb >= 1) return String.format(Locale.US, "%.1f GB", gb);
-        double mb = bytes / 1048576.0;
-        if (mb >= 1) return String.format(Locale.US, "%.0f MB", mb);
-        return String.format(Locale.US, "%.0f KB", bytes / 1024.0);
+        return com.fishbowl.app.util.Fmt.bytes(bytes);
     }
 
     private static String fmtRuntime(int minutes) {

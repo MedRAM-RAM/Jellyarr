@@ -1,4 +1,14 @@
-What's new in 2.0.4-beta.22 (beta)
+What's new in 2.1.0 (stable)
+- First stable release of the new Jellyarr line: everything from the 2.0.4 betas, tested and consolidated.
+- Smaller and lighter: the runtime bundle is 137 MB instead of 219 MB, unpacking no longer needs a temporary copy, and about 5,000 lines of unused code were removed.
+- New Media storage tool: drives with free space, every Jellyfin Movies and TV library with its folders, sizes and drives, and safe moves of a library folder to another folder or drive (Jellyfin, Radarr and Sonarr follow automatically).
+- File management for Radarr and Sonarr (naming, Organize, import with Move or Copy) replaces the old movie importer. The shared folder is now JellyarrMedia (renamed automatically).
+- Settings > Automation: the two download-deletion options were merged into one "Downloads cleanup" card, and the Wi-Fi only list is clearer.
+- Deleting folders never follows symbolic links any more, so a link can not wipe the folder it points to.
+- More of the app is translated into Arabic (updates, cleanup, storage, file management), and Arabic layouts are aligned consistently.
+- Radarr, Sonarr and Prowlarr ask for the unified account when you open their web UI, so signing out works.
+
+From 2.0.4-beta.22:
 - New Media storage tool (Media tab, and Settings > Storage): your drives with free space, then every Jellyfin Movies and TV library with each of its folders, size, file count and drive, and whether Radarr or Sonarr save there.
 - Move a library folder to another folder or another drive (SD card, USB). Same-drive moves are instant; cross-drive moves are copied, verified, then removed, and can be stopped and resumed. Jellyfin, Radarr and Sonarr are pointed to the new folder automatically.
 - Problems are found for you: missing or unreadable folders, and Radarr / Sonarr folders that no Jellyfin library shows (one tap adds them). Add a folder to a library, remove one (files stay) or create a missing Movies / TV library.

@@ -54,22 +54,14 @@ public final class TransmissionAutoCleanup {
                         eligible, checked, hours, formatBytes(eligibleBytes));
             }
             return String.format(Locale.US,
-                    "Removed %d of %d torrent(s) finished more than %d h ago (%s freed)%s.",
-                    removed, checked, hours, formatBytes(removedBytes),
-                    failed > 0 ? ", " + failed + " failed" : "");
+                    "Removed %d of %d torrent(s) finished more than %d h ago (%s freed).",
+                    removed, checked, hours, formatBytes(removedBytes))
+                    + (failed > 0 ? "\nFailed: " + failed : "");
         }
     }
 
     public static String formatBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        double v = bytes / 1024.0;
-        String[] units = {"KB", "MB", "GB", "TB"};
-        int i = 0;
-        while (v >= 1024 && i < units.length - 1) {
-            v /= 1024.0;
-            i++;
-        }
-        return String.format(Locale.US, "%.1f %s", v, units[i]);
+        return com.fishbowl.app.util.Fmt.bytes(bytes);
     }
 
     /**

@@ -65,9 +65,7 @@ public class JellyfinBootstrapper {
     }
 
     private static String formatSize(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        int z = (63 - Long.numberOfLeadingZeros(bytes)) / 10;
-        return String.format(java.util.Locale.US, "%.1f %cB", (double) bytes / (1L << (z * 10)), " KMGTPE".charAt(z));
+        return com.fishbowl.app.util.Fmt.bytes(bytes);
     }
 
     private static final Object EXTRACT_LOCK = new Object();
@@ -124,21 +122,7 @@ public class JellyfinBootstrapper {
     }
 
     private static boolean deleteRecursively(File fileOrDir) {
-        if (fileOrDir == null || !fileOrDir.exists()) {
-            return true;
-        }
-        try {
-            fileOrDir.setWritable(true, false);
-        } catch (Exception ignored) {}
-        if (fileOrDir.isDirectory()) {
-            File[] children = fileOrDir.listFiles();
-            if (children != null) {
-                for (File child : children) {
-                    deleteRecursively(child);
-                }
-            }
-        }
-        return fileOrDir.delete();
+        return com.fishbowl.app.util.Files.deleteRecursively(fileOrDir);
     }
 
     private static void ensureParentWritable(File file) {
