@@ -510,11 +510,23 @@ public final class JellyfinLibraryClient {
 
     /** Authenticated request; on 401 the token is dropped and the request retried once with a fresh sign-in. */
     private static String request(Context ctx, String method, String pathAndQuery) throws ApiException {
+        return request(ctx, method, pathAndQuery, null);
+    }
+
+    /** Same as {@link #request(Context, String, String)} with an optional JSON body. */
+    private static String request(Context ctx, String method, String pathAndQuery, String jsonBody) throws ApiException {
         for (int attempt = 0; attempt < 2; attempt++) {
             String t = getToken(ctx);
             HttpURLConnection c = null;
             try {
                 c = open(pathAndQuery, method, t);
+                if (jsonBody != null) {
+                    c.setDoOutput(true);
+                    c.setRequestProperty("Content-Type", "application/json");
+                    try (java.io.OutputStream os = c.getOutputStream()) {
+                        os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+                    }
+                }
                 int code = c.getResponseCode();
                 if (code == 401) {
                     invalidate(ctx, t);
@@ -813,5 +825,54 @@ public final class JellyfinLibraryClient {
             Log.w(TAG, "deleteItem failed: " + e.getMessage());
             return false;
         }
+    }
+
+    // ------------------------------------------------------------------ libraries (virtual folders)
+
+    /** Jellyfin libraries: [{Name, CollectionType, Locations[], ItemId}, ...]. */
+    public static org.json.JSONArray virtualFolders(Context ctx) throws ApiException {
+        String r = get(ctx, "/Library/VirtualFolders");
+        try {
+            return r == null || r.trim().isEmpty() ? new org.json.JSONArray() : new org.json.JSONArray(r);
+        } catch (org.json.JSONException e) {
+            throw new ApiException("Unexpected answer from Jellyfin.");
+        }
+    }
+
+    private static String q(String s) {
+        try {
+            return java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20");
+        } catch (Exception e) {
+            return s;
+        }
+    }
+
+    /** Adds a folder to an existing library (no scan; call {@link #refreshLibraries}). */
+    public static void addLibraryPath(Context ctx, String library, String path) throws ApiException {
+        String body;
+        try {
+            body = new org.json.JSONObject().put("Name", library)
+                    .put("PathInfo", new org.json.JSONObject().put("Path", path)).toString();
+        } catch (org.json.JSONException e) {
+            throw new ApiException("Invalid library request.");
+        }
+        request(ctx, "POST", "/Library/VirtualFolders/Paths?refreshLibrary=false", body);
+    }
+
+    /** Removes a folder from a library. Files on disk are not touched. */
+    public static void removeLibraryPath(Context ctx, String library, String path) throws ApiException {
+        request(ctx, "DELETE", "/Library/VirtualFolders/Paths?name=" + q(library) + "&path=" + q(path)
+                + "&refreshLibrary=false", null);
+    }
+
+    /** Creates a library ("movies" or "tvshows") with one folder and starts its scan. */
+    public static void createLibrary(Context ctx, String name, String collectionType, String path) throws ApiException {
+        request(ctx, "POST", "/Library/VirtualFolders?name=" + q(name) + "&collectionType=" + q(collectionType)
+                + "&paths=" + q(path) + "&refreshLibrary=true", "{\"LibraryOptions\":{}}");
+    }
+
+    /** Starts a scan of every library. */
+    public static void refreshLibraries(Context ctx) throws ApiException {
+        request(ctx, "POST", "/Library/Refresh", null);
     }
 }

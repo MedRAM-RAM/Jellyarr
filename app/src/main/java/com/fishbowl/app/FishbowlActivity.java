@@ -401,6 +401,7 @@ public final class FishbowlActivity extends AppCompatActivity
     private Button masterStackToggleBtn;
     private View masterStackGap;
     private MediaToolsView mediaToolsView;
+    private MediaLibrariesView mediaLibrariesView;
     private TextView homeServicesCountBadge;
     private LinearLayout homeServicesRow;
     private boolean isAvailableServicesDrawerOpen = false;
@@ -1237,6 +1238,7 @@ public final class FishbowlActivity extends AppCompatActivity
         } else if (activeTab == 1) {
             refreshServicesTabUI();
             if (mediaToolsView != null) mediaToolsView.refresh(false);
+            if (mediaLibrariesView != null) mediaLibrariesView.refresh(false);
         } else if (activeTab == 2) {
             refreshLogServiceChips();
             updateLogLevelChips();
@@ -5060,6 +5062,11 @@ public final class FishbowlActivity extends AppCompatActivity
         servicesCardsContainer.setLayoutParams(scParams);
         layout.addView(servicesCardsContainer);
 
+        mediaLibrariesView = new MediaLibrariesView(this);
+        LinearLayout.LayoutParams mlLp = new LinearLayout.LayoutParams(-1, -2);
+        mlLp.topMargin = dp(12);
+        layout.addView(mediaLibrariesView.getView(), mlLp);
+
         mediaToolsView = new MediaToolsView(this);
         layout.addView(mediaToolsView.getView());
 
@@ -8728,7 +8735,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
         TextView what = new TextView(this);
         what.setText("What gets synchronized:\n"
-                + "• Media storage: download folders and library folders (Movies / Series / Music)\n"
+                + "• Download folders and media library folders (Movies / Series)\n"
                 + "• Transmission as the download client in Radarr and Sonarr\n"
                 + "• Prowlarr indexers pushed to Radarr and Sonarr\n"
                 + "• Existing media imported into Radarr / Sonarr\n"
@@ -8737,13 +8744,6 @@ public final class FishbowlActivity extends AppCompatActivity
         what.setTextSize(12f);
         what.setTextColor(AppTheme.textSecondary());
         content.addView(what);
-
-        // Media storage lives here too: free space, usage per library folder and the retention policy.
-        final MediaStoragePanel storagePanel = new MediaStoragePanel(this);
-        LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(-1, -2);
-        spLp.topMargin = dp(12);
-        content.addView(storagePanel.getView(), spLp);
-        storagePanel.refresh(true);
 
         TextView status = new TextView(this);
         status.setTextSize(12.5f);
@@ -10487,8 +10487,60 @@ public final class FishbowlActivity extends AppCompatActivity
             card.addView(none);
         }
 
+        // --- Download staging retention (moved here from the old storage card) -----------
+        card.addView(createSettingsDivider());
+        final TextView retValue = UiKit.caption(this, "");
+        LinearLayout retRow = UiKit.row(this);
+        retRow.setPadding(0, dp(8), 0, dp(4));
+        LinearLayout retText = UiKit.column(this);
+        retText.addView(UiKit.text(this, I18n.tr("Downloads retention"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView retHint = UiKit.caption(this, I18n.tr("How long the copy in Downloads stays after Radarr / Sonarr imported it."));
+        retText.addView(retHint);
+        retText.addView(retValue);
+        retRow.addView(retText, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        final Runnable showRet = () -> {
+            MediaStorageManager sm = MediaStorageManager.getInstance(this);
+            retValue.setText(I18n.tr(sm.getRetentionPolicyDisplayName()));
+            retValue.setTextColor(AppTheme.accent());
+        };
+        showRet.run();
+        Button retBtn = UiKit.outline(this, I18n.tr("Change"), v -> showRetentionDialog(showRet));
+        retBtn.setTextSize(12f);
+        retRow.addView(retBtn, new LinearLayout.LayoutParams(-2, dp(34)));
+        card.addView(retRow);
+
         section.addView(card);
         return section;
+    }
+
+    private void showRetentionDialog(final Runnable onChanged) {
+        final MediaStorageManager sm = MediaStorageManager.getInstance(this);
+        final String[] values = {
+                MediaStorageManager.RETENTION_IMMEDIATE_ON_IMPORT,
+                MediaStorageManager.RETENTION_UNTIL_TORRENT_REMOVED,
+                MediaStorageManager.RETENTION_24_HOURS,
+                MediaStorageManager.RETENTION_3_DAYS,
+                MediaStorageManager.RETENTION_7_DAYS,
+                MediaStorageManager.RETENTION_MANUAL};
+        final String[] labels = {
+                I18n.tr("Immediately after import (no duplicates)"),
+                I18n.tr("Until the torrent is removed"),
+                I18n.tr("Keep for 24 hours"),
+                I18n.tr("Keep for 3 days"),
+                I18n.tr("Keep for 7 days"),
+                I18n.tr("Manual cleanup")};
+        int checked = 0;
+        String cur = sm.getRetentionPolicy();
+        for (int i = 0; i < values.length; i++) if (values[i].equals(cur)) checked = i;
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(I18n.tr("Downloads retention"))
+                .setSingleChoiceItems(labels, checked, (d, which) -> {
+                    sm.setRetentionPolicy(values[which]);
+                    try { d.dismiss(); } catch (Throwable ignored) {}
+                    if (onChanged != null) onChanged.run();
+                })
+                .setNegativeButton(I18n.tr("Cancel"), null)
+                .show();
     }
 
     private void runCleanupAsync(final boolean dryRun, final TextView statusText) {

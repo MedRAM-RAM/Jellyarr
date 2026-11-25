@@ -560,6 +560,44 @@ public final class RadarrApi {
     }
 
     /** Renames every movie file to the current naming format (the "Organize" action). Returns how many movies were queued. */
+    /**
+     * Points every movie stored under {@code oldRoot} to {@code newRoot} without moving files (the files were
+     * already moved). Adds {@code newRoot} as a root folder and removes {@code oldRoot} when it was one.
+     * Returns how many movies were updated.
+     */
+    public int repointRoot(String oldRoot, String newRoot) throws Exception {
+        String prefix = oldRoot.endsWith("/") ? oldRoot : oldRoot + "/";
+        JSONArray all = movies();
+        JSONArray ids = new JSONArray();
+        for (int i = 0; i < all.length(); i++) {
+            JSONObject m = all.optJSONObject(i);
+            if (m != null && m.optString("path", "").startsWith(prefix)) ids.put(m.optInt("id"));
+        }
+        boolean haveNew = false;
+        int oldId = -1;
+        JSONArray roots = rootFolders();
+        for (int i = 0; i < roots.length(); i++) {
+            JSONObject r = roots.optJSONObject(i);
+            if (r == null) continue;
+            String p = trimSlash(r.optString("path", ""));
+            if (p.equals(trimSlash(newRoot))) haveNew = true;
+            if (p.equals(trimSlash(oldRoot))) oldId = r.optInt("id", -1);
+        }
+        if (!haveNew && (ids.length() > 0 || oldId >= 0)) addRootFolder(newRoot);
+        if (ids.length() > 0) {
+            JSONObject body = new JSONObject().put("movieIds", ids).put("rootFolderPath", newRoot).put("moveFiles", false);
+            call("PUT", "/movie/editor", body.toString(), 120000);
+        }
+        if (oldId >= 0) {
+            try { deleteRootFolder(oldId); } catch (Throwable ignored) { /* still referenced: harmless */ }
+        }
+        return ids.length();
+    }
+
+    private static String trimSlash(String p) {
+        return p.endsWith("/") && p.length() > 1 ? p.substring(0, p.length() - 1) : p;
+    }
+
     public int renameAllMovies() throws Exception {
         JSONArray all = movies();
         JSONArray ids = new JSONArray();

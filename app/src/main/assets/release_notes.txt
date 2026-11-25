@@ -1,4 +1,10 @@
-What's new in 2.0.4-beta.21 (beta)
+What's new in 2.0.4-beta.22 (beta)
+- New Media storage tool (Media tab, and Settings > Storage): your drives with free space, then every Jellyfin Movies and TV library with each of its folders, size, file count and drive, and whether Radarr or Sonarr save there.
+- Move a library folder to another folder or another drive (SD card, USB). Same-drive moves are instant; cross-drive moves are copied, verified, then removed, and can be stopped and resumed. Jellyfin, Radarr and Sonarr are pointed to the new folder automatically.
+- Problems are found for you: missing or unreadable folders, and Radarr / Sonarr folders that no Jellyfin library shows (one tap adds them). Add a folder to a library, remove one (files stay) or create a missing Movies / TV library.
+- Media storage is no longer part of SYNC STACK. Downloads retention moved to Settings > Automation.
+
+From 2.0.4-beta.21:
 - Smaller app: the runtime bundle shrank from 219 MB to 137 MB (duplicate .NET 9 runtime and unused files removed, xz compression, arm64-only libraries) and first-run unpacking no longer needs a temporary copy.
 - The shared media folder is now JellyarrMedia. Existing data is renamed in place on first launch and every stored path (Radarr, Sonarr, Prowlarr, Jellyfin, Transmission) is updated.
 - Radarr, Sonarr and Prowlarr now always ask for the unified account when opening their web UI, so signing out works. Without an account the local network stays open.
