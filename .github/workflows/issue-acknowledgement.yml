@@ -29,8 +29,8 @@ jobs:
               ? issue.labels.map(l => (typeof l === 'string' ? l : (l && l.name) ? l.name : '')).filter(Boolean)
               : [];
 
-            const bugAck = "Thanks for reporting this bug! Your report has been received by the Fishbowl maintainers. We'll review the details and may request additional logs or information if needed.";
-            const featureAck = "Thanks for suggesting an improvement! Your idea has been received. We'll review its usefulness, feasibility, and compatibility with Fishbowl.";
+            const bugAck = "Thanks for reporting this bug! Your report has been received by the Jellyarr maintainers. We'll review the details and may request additional logs or information if needed.";
+            const featureAck = "Thanks for suggesting an improvement! Your idea has been received. We'll review its usefulness, feasibility, and compatibility with Jellyarr.";
 
             let ackMessage = null;
             if (labels.includes('bug')) {

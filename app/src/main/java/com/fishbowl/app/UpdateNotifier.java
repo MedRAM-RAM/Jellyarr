@@ -76,7 +76,7 @@ public final class UpdateNotifier {
             conn = (HttpURLConnection) new URL(RELEASES_URL).openConnection();
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(10000);
-            conn.setRequestProperty("User-Agent", "Fishbowl-Updater");
+            conn.setRequestProperty("User-Agent", "Jellyarr-Updater");
             conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
             if (conn.getResponseCode() != 200) throw new java.io.IOException("HTTP " + conn.getResponseCode());
             BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));

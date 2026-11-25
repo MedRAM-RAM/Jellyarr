@@ -35,11 +35,11 @@ jobs:
             });
 
             const firstTimeWelcome = [
-              "**Welcome, and thanks for contributing to Fishbowl!**",
+              "**Welcome, and thanks for contributing to Jellyarr!**",
               "",
               "Before review, please ensure:",
               "- Changes follow the existing project architecture.",
-              "- UI follows Fishbowl's Pure Dark Mode design.",
+              "- UI follows Jellyarr's Pure Dark Mode design.",
               "- No unnecessary emojis or unrelated changes.",
               "- Changes remain focused and avoid unrelated modifications.",
               "- The project builds successfully.",
@@ -52,7 +52,7 @@ jobs:
 
             const alreadyCommented = comments.some(c =>
               c.body && (
-                c.body.includes("Welcome, and thanks for contributing to Fishbowl!") ||
+                c.body.includes("Welcome, and thanks for contributing to Jellyarr!") ||
                 c.body.includes("Thanks for opening this pull request!")
               )
             );

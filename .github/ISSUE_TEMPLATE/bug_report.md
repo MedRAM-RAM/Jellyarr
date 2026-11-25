@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug to help us improve Fishbowl
+about: Report a bug to help us improve Jellyarr
 title: "[BUG] "
 labels: bug
 assignees: ''
@@ -19,7 +19,7 @@ Describe what went wrong.
 What did you expect, and what happened?
 
 ## Device Information
-Automatically detected by Fishbowl.
+Automatically detected by Jellyarr.
 
 ## Logs / Screenshots
 Attach if available.

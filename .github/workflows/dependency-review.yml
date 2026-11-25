@@ -16,7 +16,7 @@ jobs:
     name: Dependency Review & Vulnerability Check
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.repository == 'Suz41/Fishbowl'
+    if: github.repository == 'MedRAM-RAM/Jellyarr'
     permissions:
       contents: read
       pull-requests: write

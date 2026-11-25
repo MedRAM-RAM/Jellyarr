@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Propose an architecture or feature enhancement for Fishbowl
+about: Propose an architecture or feature enhancement for Jellyarr
 title: "[FEATURE] "
 labels: enhancement
 assignees: ''

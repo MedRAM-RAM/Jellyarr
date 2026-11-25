@@ -387,7 +387,7 @@ public final class UpdateManager {
                 conn.setConnectTimeout(10000);
                 conn.setReadTimeout(10000);
                 conn.setRequestMethod("GET");
-                conn.setRequestProperty("User-Agent", "Fishbowl-Updater");
+                conn.setRequestProperty("User-Agent", "Jellyarr-Updater");
                 conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
 
                 int responseCode = conn.getResponseCode();
@@ -773,7 +773,7 @@ public final class UpdateManager {
                     conn = (HttpURLConnection) new URL(url).openConnection();
                     conn.setConnectTimeout(15000);
                     conn.setReadTimeout(30000);
-                    conn.setRequestProperty("User-Agent", "Fishbowl-Updater");
+                    conn.setRequestProperty("User-Agent", "Jellyarr-Updater");
                     if (offset > 0) conn.setRequestProperty("Range", "bytes=" + offset + "-");
                     int rc = conn.getResponseCode();
                     boolean append = false;

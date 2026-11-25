@@ -1,13 +1,13 @@
-# Contributing to Fishbowl
+# Contributing to Jellyarr
 
-Thank you for your interest in contributing to Fishbowl. We welcome contributions from developers, testers, designers, and documentation contributors.
+Thank you for your interest in contributing to Jellyarr. We welcome contributions from developers, testers, designers, and documentation contributors.
 
 ---
 
 ## Community & Upstream Notice
 
-- **Unofficial Community Project:** Fishbowl is an independent, unofficial community project and is not affiliated with, maintained by, or endorsed by the official Jellyfin project or its core developers.
-- **Do Not Contact Upstream Jellyfin:** Please do not submit bug reports, support tickets, or inquiries regarding Fishbowl to official Jellyfin forums, issue trackers, or Discord servers. Direct all contributions, questions, and issues exclusively to this repository.
+- **Unofficial Community Project:** Jellyarr is an independent, unofficial community project and is not affiliated with, maintained by, or endorsed by the official Jellyfin project or its core developers.
+- **Do Not Contact Upstream Jellyfin:** Please do not submit bug reports, support tickets, or inquiries regarding Jellyarr to official Jellyfin forums, issue trackers, or Discord servers. Direct all contributions, questions, and issues exclusively to this repository.
 - **Tone & Code Hygiene:** This project enforces a strict zero-emoji policy across all code, commit messages, documentation, UI strings, and issue templates.
 
 ---
@@ -35,7 +35,7 @@ Contributions to project documentation, technical guides, and code comments are 
 - Expand hardware transcoding and network architecture documentation
 
 ### Submit Code Changes
-To contribute code to Fishbowl:
+To contribute code to Jellyarr:
 
 1. **Fork the Repository:** Create your own fork on GitHub.
 2. **Branch from main:** `git checkout -b feature/your-feature-name`
@@ -63,8 +63,8 @@ To contribute code to Fishbowl:
 ### Build and Verification Commands
 ```bash
 # Clone the repository
-git clone https://github.com/Suz41/Fishbowl.git
-cd Fishbowl
+git clone https://github.com/MedRAM-RAM/Jellyarr.git
+cd Jellyarr
 
 # Download Termux bootstrap packages
 ./gradlew downloadBootstraps
@@ -82,7 +82,7 @@ cd Fishbowl
 ./gradlew assembleDebug
 
 # Install directly to connected device
-adb install -r -d app/build/outputs/apk/debug/Fishbowl-*-debug-*.apk
+adb install -r -d app/build/outputs/apk/debug/Jellyarr-*-debug-*.apk
 
 # Compile production release universal APK
 ./gradlew assembleRelease
