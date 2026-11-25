@@ -31,8 +31,8 @@ import java.nio.charset.StandardCharsets
  */
 object BugReportHelper {
 
-    const val GITHUB_REPO_URL = "https://github.com/Suz41/Fishbowl"
-    const val GITHUB_NEW_ISSUE_URL = "https://github.com/Suz41/Fishbowl/issues/new"
+    const val GITHUB_REPO_URL = "https://github.com/MedRAM-RAM/Jellyarr"
+    const val GITHUB_NEW_ISSUE_URL = "https://github.com/MedRAM-RAM/Jellyarr/issues/new"
     const val MAX_SAFE_URL_LENGTH = 1800
 
     data class DeviceInfo(

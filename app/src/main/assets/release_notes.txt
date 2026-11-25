@@ -1,4 +1,14 @@
-What's new in 2.1.0 (stable)
+What's new in 2.1.1 (stable)
+- Switches now light up clearly when ON (accent track, bright thumb) and dim when OFF or disabled, in every screen.
+- Faster theme changes and screens: the Library / Sonarr / Radarr / Transmission / Prowlarr screens are now built on demand in the background instead of all at start-up, and a theme change fades instead of freezing.
+- Home: the start-up progress now also covers Transmission, Prowlarr, Radarr and Sonarr, and sits at the bottom of the Services card.
+- INSTALL / UNINSTALL moved to Settings > Companion services; each is disabled when there is nothing to do.
+- Report a bug now opens the Jellyarr page on GitHub.
+- Update bar: stays at the top until you close it, even after leaving and re-opening the app. A "!" next to the close button shows the update details. The "update available" popup only appears when automatic download is off; the "ready to install" popup appears only after the bar is closed, and again on every start until the update is installed.
+- Activity: level filters and the Auto-scroll / Copy / Clear buttons are on separate rows, so nothing hides under anything.
+- The bottom navigation bar now floats above the content instead of being docked.
+
+From 2.1.0:
 - First stable release of the new Jellyarr line: everything from the 2.0.4 betas, tested and consolidated.
 - Smaller and lighter: the runtime bundle is 137 MB instead of 219 MB, unpacking no longer needs a temporary copy, and about 5,000 lines of unused code were removed.
 - New Media storage tool: drives with free space, every Jellyfin Movies and TV library with its folders, sizes and drives, and safe moves of a library folder to another folder or drive (Jellyfin, Radarr and Sonarr follow automatically).

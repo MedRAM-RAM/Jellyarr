@@ -574,7 +574,7 @@ public final class MediaLibrariesView {
         final TextView info = UiKit.caption(act, "");
         info.setPadding(0, dp(8), 0, 0);
         box.addView(info);
-        final CheckBox update = new CheckBox(act);
+        final CheckBox update = UiStyle.newCheckBox(act);
         update.setText(I18n.tr("Update Jellyfin, Radarr and Sonarr to the new folder"));
         update.setTextColor(AppTheme.text());
         update.setChecked(true);

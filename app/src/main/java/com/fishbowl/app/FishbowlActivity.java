@@ -272,6 +272,9 @@ public final class FishbowlActivity extends AppCompatActivity
     private ProgressBar startupProgressBar;
     private TextView txtStage1, txtStage2, txtStage3, txtStage4, txtStage5;
     private long startupCompletedTimeMs = 0;
+    private long lastStartupActivityMs = 0;
+    private LinearLayout startupCompanionsContainer;
+    private final java.util.LinkedHashMap<String, TextView> startupCompanionRows = new java.util.LinkedHashMap<>();
     private final Runnable startupProgressPoller = () -> renderCurrentState();
 
     // Transcoding & Hardware Dashboard References
@@ -401,6 +404,8 @@ public final class FishbowlActivity extends AppCompatActivity
     private Button masterStackToggleBtn;
     private View masterStackGap;
     private MediaToolsView mediaToolsView;
+    private Button companionInstallBtn;
+    private Button companionUninstallBtn;
     private MediaLibrariesView mediaLibrariesView;
     private TextView homeServicesCountBadge;
     private LinearLayout homeServicesRow;
@@ -549,6 +554,7 @@ public final class FishbowlActivity extends AppCompatActivity
         PasswordResetManager.registerListener(passwordResetListener);
 
         setContentView(I18n.attach(buildMainPixelShell()));
+        schedulePrebuildServiceTabs();
         // Initialize native Chromium in-app Cloudflare solver (headless WebView on port 8191)
         com.fishbowl.app.services.NativeFlareSolver.getInstance().init(this);
         setupSystemBarsAndInsets();
@@ -664,7 +670,13 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private final MediaServiceManager.ServiceListener serviceListener = (id, state) -> {
-        runOnUiThread(this::requestThrottledServicesTabRefresh);
+        runOnUiThread(() -> {
+            requestThrottledServicesTabRefresh();
+            if (activeTab == 0) {
+                mainHandler.removeCallbacks(startupProgressPoller);
+                mainHandler.postDelayed(startupProgressPoller, 150);   // companion startup rows follow service states
+            }
+        });
     };
 
     @Override
@@ -696,8 +708,10 @@ public final class FishbowlActivity extends AppCompatActivity
         refreshUpdateUI();
         UpdateNotifier.schedule(this);
         UpdateManager.getInstance(this).restoreSavedState(this);
+        refreshUpdateBanner();
         maybeShowWhatsNewAfterUpdate();
         runStartupUpdateCheck();
+        updateUiHandler.postDelayed(this::maybeShowInstallReadyPrompt, 1800);
         handleUpdateIntent(getIntent());
         refreshHomeServicesBadge();
         restartHealthPolling();
@@ -786,7 +800,7 @@ public final class FishbowlActivity extends AppCompatActivity
         if (AppTheme.getMode(this) == AppTheme.MODE_SYSTEM) {
             boolean nightNow = (newConfig.uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
                     == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-            if (nightNow != AppTheme.isDark()) recreate();
+            if (nightNow != AppTheme.isDark() && !themeRestarting) recreate();
         }
     }
 
@@ -858,7 +872,11 @@ public final class FishbowlActivity extends AppCompatActivity
             applyTopInsets();
             applyDrawerInsets(statusBarInset.top, navBarInset.bottom);
             if (bottomNavLayout != null) {
-                bottomNavLayout.setPadding(dp(8), dp(8), dp(8), navBarInset.bottom + dp(8));
+                ViewGroup.LayoutParams blp = bottomNavLayout.getLayoutParams();
+                if (blp instanceof FrameLayout.LayoutParams) {
+                    ((FrameLayout.LayoutParams) blp).bottomMargin = navBarInset.bottom + dp(10);
+                    bottomNavLayout.setLayoutParams(blp);
+                }
             }
             if (setupOverlayContainer != null) {
                 setupOverlayContainer.setPadding(dp(24), statusBarInset.top + dp(28), dp(24), navBarInset.bottom + dp(24));
@@ -882,12 +900,20 @@ public final class FishbowlActivity extends AppCompatActivity
         updateContentInsetsForTab();
     }
 
+    /** Height the floating bottom bar takes from the content area (0 while it is hidden). */
+    private int floatingNavInset() {
+        if (bottomNavLayout == null || bottomNavLayout.getVisibility() != View.VISIBLE) return 0;
+        int h = bottomNavLayout.getHeight() > 0 ? bottomNavLayout.getHeight() : dp(72);
+        return h + dp(10) + statusBarInsetBottom + dp(6);
+    }
+
     private void updateContentInsetsForTab() {
         if (contentContainer == null) return;
+        int bottom = floatingNavInset();
         if (activeTab == 0 || isUpdateBannerShown()) {
-            contentContainer.setPadding(0, 0, 0, 0);
+            contentContainer.setPadding(0, 0, 0, bottom);
         } else {
-            contentContainer.setPadding(0, statusBarInsetTop > 0 ? statusBarInsetTop : dp(24), 0, 0);
+            contentContainer.setPadding(0, statusBarInsetTop > 0 ? statusBarInsetTop : dp(24), 0, bottom);
         }
     }
 
@@ -986,36 +1012,8 @@ public final class FishbowlActivity extends AppCompatActivity
         contentContainer.addView(cachedLogsView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        libraryTabView = new LibraryTabView(this);
-        cachedLibraryView = libraryTabView.getView();
-        cachedLibraryView.setVisibility(View.GONE);
-        contentContainer.addView(cachedLibraryView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        sonarrTabView = new SonarrTabView(this);
-        cachedSonarrView = sonarrTabView.getView();
-        cachedSonarrView.setVisibility(View.GONE);
-        contentContainer.addView(cachedSonarrView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        radarrTabView = new RadarrTabView(this);
-        cachedRadarrView = radarrTabView.getView();
-        cachedRadarrView.setVisibility(View.GONE);
-        contentContainer.addView(cachedRadarrView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        transmissionTabView = new TransmissionTabView(this);
-        transmissionTabView.setCenterView(buildDownloadCenterCard(), this::refreshDownloadCenter);
-        cachedTransmissionView = transmissionTabView.getView();
-        cachedTransmissionView.setVisibility(View.GONE);
-        contentContainer.addView(cachedTransmissionView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        prowlarrTabView = new ProwlarrTabView(this);
-        cachedProwlarrView = prowlarrTabView.getView();
-        cachedProwlarrView.setVisibility(View.GONE);
-        contentContainer.addView(cachedProwlarrView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        // Library / Sonarr / Radarr / Transmission / Prowlarr screens are built on demand (see ensureServiceTab),
+        // which keeps start-up and theme changes fast.
 
         cachedPlaceholderView = buildPlaceholderView();
         cachedPlaceholderView.setVisibility(View.GONE);
@@ -1027,22 +1025,23 @@ public final class FishbowlActivity extends AppCompatActivity
         contentContainer.addView(setupOverlayView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // Bottom Navigation Bar (4 Destinations: Home, Services, Activity, Settings)
-        navDivider = new View(this);
-        navDivider.setBackgroundColor(AppTheme.outline());
-        rootLayout.addView(navDivider, new LinearLayout.LayoutParams(-1, dp(1)));
-
+        // Floating bottom navigation bar (Menu, Home, Media, Activity, Settings): an overlay above the content.
         bottomNavLayout = buildBottomNavBar();
         bottomNavLayout.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob) -> {
-            if (b - t != ob - ot) syncDrawerBottomMargin();
+            if (b - t != ob - ot) {
+                syncDrawerBottomMargin();
+                updateContentInsetsForTab();
+            }
         });
-        rootLayout.addView(bottomNavLayout);
 
         // Initial tab render
         renderActiveTab();
 
         FrameLayout shell = new FrameLayout(this);
         shell.addView(rootLayout, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout.LayoutParams navLp = new FrameLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
+        navLp.setMargins(dp(14), 0, dp(14), dp(10) + statusBarInsetBottom);
+        shell.addView(bottomNavLayout, navLp);
         buildSideDrawer(shell);
         return shell;
     }
@@ -1096,8 +1095,9 @@ public final class FishbowlActivity extends AppCompatActivity
     private LinearLayout buildBottomNavBar() {
         LinearLayout nav = new LinearLayout(this);
         nav.setOrientation(LinearLayout.HORIZONTAL);
-        nav.setBackgroundColor(AppTheme.card());
+        nav.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outlineStrong(), UiKit.R_PILL));
         nav.setPadding(dp(8), dp(8), dp(8), dp(8));
+        nav.setElevation(dp(10));
 
         populateNavTabs(nav);
         return nav;
@@ -1195,7 +1195,50 @@ public final class FishbowlActivity extends AppCompatActivity
 
     // -- Tab View Router (Cached & Zero-Recreation) ---------------------------
 
+    /** Builds a service screen the first time it is needed and adds it under the setup overlay. */
+    private void ensureServiceTab(int tab) {
+        View v = null;
+        if (tab == 5 && libraryTabView == null) {
+            libraryTabView = new LibraryTabView(this);
+            v = cachedLibraryView = libraryTabView.getView();
+        } else if (tab == 6 && sonarrTabView == null) {
+            sonarrTabView = new SonarrTabView(this);
+            v = cachedSonarrView = sonarrTabView.getView();
+        } else if (tab == TAB_RADARR && radarrTabView == null) {
+            radarrTabView = new RadarrTabView(this);
+            v = cachedRadarrView = radarrTabView.getView();
+        } else if (tab == TAB_TRANSMISSION && transmissionTabView == null) {
+            transmissionTabView = new TransmissionTabView(this);
+            transmissionTabView.setCenterView(buildDownloadCenterCard(), this::refreshDownloadCenter);
+            v = cachedTransmissionView = transmissionTabView.getView();
+        } else if (tab == TAB_PROWLARR && prowlarrTabView == null) {
+            prowlarrTabView = new ProwlarrTabView(this);
+            v = cachedProwlarrView = prowlarrTabView.getView();
+        }
+        if (v == null || contentContainer == null) return;
+        v.setVisibility(View.GONE);
+        int idx = setupOverlayView != null ? contentContainer.indexOfChild(setupOverlayView) : -1;
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        if (idx >= 0) contentContainer.addView(v, idx, lp); else contentContainer.addView(v, lp);
+        I18n.attach(v);
+    }
+
+    private int prebuildStep = 0;
+
+    /** After start-up, builds the remaining service screens one at a time while the UI is idle. */
+    private void schedulePrebuildServiceTabs() {
+        final int[] order = {6, TAB_RADARR, TAB_TRANSMISSION, TAB_PROWLARR, 5};
+        if (prebuildStep >= order.length) return;
+        mainHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            if (prebuildStep < order.length) ensureServiceTab(order[prebuildStep++]);
+            schedulePrebuildServiceTabs();
+        }, 700);
+    }
+
     private void renderActiveTab() {
+        ensureServiceTab(activeTab);
         updateBottomNavSelection();
 
         if (setupOverlayView != null && setupOverlayView.getVisibility() == View.VISIBLE) {
@@ -1879,10 +1922,9 @@ public final class FishbowlActivity extends AppCompatActivity
         // 1. Hero Status Section (Clean, Unboxed)
         layout.addView(buildServerHeroSection());
 
-        // 2. Alerts first: startup progress and error diagnostics are what you need to see
-        //    right under the server status, not below the tools (cards hide themselves when idle).
-        startupProgressCard = buildRealStartupProgressCard();
-        layout.addView(startupProgressCard);
+        // 2. Error diagnostics right under the server status (the startup progress sits at the bottom of the
+        //    Services card). Cards hide themselves when idle.
+        startupProgressCard = buildRealStartupProgressCard();   // shown at the bottom of the Services card
 
         errorDiagnosticCard = buildErrorDiagnosticCard();
         layout.addView(errorDiagnosticCard);
@@ -1901,6 +1943,7 @@ public final class FishbowlActivity extends AppCompatActivity
         // 4. Services Control Plane (Horizontal Icon Row)
         LinearLayout servicesCard = UiKit.card(this);
         servicesCard.addView(buildServicesControlPlaneSection());
+        servicesCard.addView(startupProgressCard);
         layout.addView(servicesCard);
 
         scroll.addView(layout);
@@ -2754,7 +2797,51 @@ public final class FishbowlActivity extends AppCompatActivity
         card.addView(txtStage4);
         card.addView(txtStage5);
 
+        // Companion services (Transmission, Prowlarr, Radarr, Sonarr): one row each while they start
+        startupCompanionsContainer = new LinearLayout(this);
+        startupCompanionsContainer.setOrientation(LinearLayout.VERTICAL);
+        startupCompanionsContainer.setPadding(0, dp(8), 0, 0);
+        card.addView(startupCompanionsContainer);
+
         return card;
+    }
+
+    /**
+     * Updates one startup row per installed companion service. Returns {0 = any starting, 1 = any still waiting}
+     * as booleans in a 2-element array.
+     */
+    private boolean[] updateStartupCompanionRows() {
+        boolean anyStarting = false;
+        boolean anyWaiting = false;
+        if (startupCompanionsContainer == null) return new boolean[]{false, false};
+        java.util.List<ManagedService> installed = new java.util.ArrayList<>();
+        try {
+            for (ManagedService s : MediaServiceManager.getInstance(this).getAllServices()) {
+                if ("jellyfin".equalsIgnoreCase(s.getId()) || !s.isInstalled()) continue;
+                installed.add(s);
+            }
+        } catch (Throwable ignored) {}
+        // Rebuild the rows only when the set of installed services changed.
+        boolean same = installed.size() == startupCompanionRows.size();
+        if (same) for (ManagedService s : installed) if (!startupCompanionRows.containsKey(s.getId())) { same = false; break; }
+        if (!same) {
+            startupCompanionsContainer.removeAllViews();
+            startupCompanionRows.clear();
+            for (ManagedService s : installed) {
+                TextView row = createStageText(s.getManifest().getDisplayName());
+                startupCompanionRows.put(s.getId(), row);
+                startupCompanionsContainer.addView(row);
+            }
+        }
+        for (ManagedService s : installed) {
+            boolean running = s.isRunning();
+            boolean starting = s.isStarting();
+            if (starting) anyStarting = true;
+            if (!running && !starting) anyWaiting = true;
+            updateStageRow(startupCompanionRows.get(s.getId()), s.getManifest().getDisplayName(), running, starting);
+        }
+        startupCompanionsContainer.setVisibility(installed.isEmpty() ? View.GONE : View.VISIBLE);
+        return new boolean[]{anyStarting, anyWaiting};
     }
 
     private TextView createStageText(String text) {
@@ -3247,12 +3334,7 @@ public final class FishbowlActivity extends AppCompatActivity
         hParams.bottomMargin = dp(8);
         layout.addView(hScrollServices, hParams);
 
-        // Controls toolbar: level filters (start) + actions (end)
-        LinearLayout controlsRow = new LinearLayout(this);
-        controlsRow.setOrientation(LinearLayout.HORIZONTAL);
-        controlsRow.setGravity(Gravity.CENTER_VERTICAL);
-        controlsRow.setPadding(0, 0, 0, dp(10));
-
+        // Level filters on their own row...
         logLevelChipsContainer = new LinearLayout(this);
         logLevelChipsContainer.setOrientation(LinearLayout.HORIZONTAL);
         String[] levels = {"ALL", "ERROR", "WARNING", "INFO"};
@@ -3270,12 +3352,20 @@ public final class FishbowlActivity extends AppCompatActivity
             logLevelChipsContainer.addView(lvlChip, UiKit.chipLp(this));
         }
         HorizontalScrollView levelScroll = UiKit.chipScroller(this, logLevelChipsContainer);
-        controlsRow.addView(levelScroll, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        LinearLayout.LayoutParams levelLp = new LinearLayout.LayoutParams(-1, -2);
+        levelLp.bottomMargin = dp(8);
+        layout.addView(levelScroll, levelLp);
 
-        // Auto-scroll toggle
+        // ...and the three actions share one row with equal widths (nothing is squeezed or hidden).
+        LinearLayout actionsRow = new LinearLayout(this);
+        actionsRow.setOrientation(LinearLayout.HORIZONTAL);
+        actionsRow.setGravity(Gravity.CENTER_VERTICAL);
+        actionsRow.setPadding(0, 0, 0, dp(10));
+
         btnToggleAutoScroll = UiKit.button(this, I18n.tr("Auto-scroll"), AppTheme.card(), AppTheme.textSecondary(), AppTheme.outline(), null);
         btnToggleAutoScroll.setTextSize(12f);
-        btnToggleAutoScroll.setPadding(dp(10), 0, dp(10), 0);
+        btnToggleAutoScroll.setSingleLine(true);
+        btnToggleAutoScroll.setPadding(dp(6), 0, dp(6), 0);
         styleAutoScrollButton();
         btnToggleAutoScroll.setOnClickListener(v -> {
             autoScrollEnabled = !autoScrollEnabled;
@@ -3284,14 +3374,12 @@ public final class FishbowlActivity extends AppCompatActivity
                 logsScrollView.post(() -> logsScrollView.fullScroll(View.FOCUS_DOWN));
             }
         });
-        LinearLayout.LayoutParams pAuto = new LinearLayout.LayoutParams(-2, dp(34));
-        pAuto.setMarginStart(dp(8));
-        controlsRow.addView(btnToggleAutoScroll, pAuto);
+        actionsRow.addView(btnToggleAutoScroll, new LinearLayout.LayoutParams(0, dp(40), 1.0f));
 
-        // Copy Button
         Button btnCopy = UiKit.outline(this, buttonLabel("COPY"), null);
         btnCopy.setTextSize(12f);
-        btnCopy.setPadding(dp(10), 0, dp(10), 0);
+        btnCopy.setSingleLine(true);
+        btnCopy.setPadding(dp(6), 0, dp(6), 0);
         btnCopy.setOnClickListener(v -> {
             String content = (logsOutputText != null) ? logsOutputText.getText().toString() : "";
             if (!content.isEmpty()) {
@@ -3302,14 +3390,14 @@ public final class FishbowlActivity extends AppCompatActivity
                 }
             }
         });
-        LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(-2, dp(34));
-        pCopy.setMarginStart(dp(6));
-        controlsRow.addView(btnCopy, pCopy);
+        LinearLayout.LayoutParams pCopy = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+        pCopy.setMarginStart(dp(8));
+        actionsRow.addView(btnCopy, pCopy);
 
-        // Clear Button
         Button btnClear = UiKit.danger(this, buttonLabel("CLEAR"), null);
         btnClear.setTextSize(12f);
-        btnClear.setPadding(dp(10), 0, dp(10), 0);
+        btnClear.setSingleLine(true);
+        btnClear.setPadding(dp(6), 0, dp(6), 0);
         btnClear.setOnClickListener(v -> {
             if ("ALL".equalsIgnoreCase(selectedLogService)) {
                 if (controller != null) controller.clearDisplayedLogs();
@@ -3328,11 +3416,11 @@ public final class FishbowlActivity extends AppCompatActivity
             refreshUnifiedLogsDisplay();
             Toast.makeText(this, I18n.tr("Cleared " + selectedLogService + " logs"), Toast.LENGTH_SHORT).show();
         });
-        LinearLayout.LayoutParams pClear = new LinearLayout.LayoutParams(-2, dp(34));
-        pClear.setMarginStart(dp(6));
-        controlsRow.addView(btnClear, pClear);
+        LinearLayout.LayoutParams pClear = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+        pClear.setMarginStart(dp(8));
+        actionsRow.addView(btnClear, pClear);
 
-        layout.addView(controlsRow);
+        layout.addView(actionsRow);
 
         // Monospace Terminal Box Container (takes remaining height via weight=1.0)
         logsScrollView = new ScrollView(this);
@@ -4652,7 +4740,7 @@ public final class FishbowlActivity extends AppCompatActivity
     /** Keeps the drawer and its scrim above the bottom navigation bar so they never cover it. */
     private void syncDrawerBottomMargin() {
         if (sideDrawerPanel == null || sideDrawerScrim == null || bottomNavLayout == null) return;
-        int h = bottomNavLayout.getVisibility() == View.VISIBLE ? bottomNavLayout.getHeight() : 0;
+        int h = floatingNavInset();
         View[] vs = {sideDrawerPanel, sideDrawerScrim};
         for (View v : vs) {
             ViewGroup.LayoutParams lp = v.getLayoutParams();
@@ -4989,7 +5077,7 @@ public final class FishbowlActivity extends AppCompatActivity
         scroll.setSmoothScrollingEnabled(true);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(getBgColor());
-        scroll.setPadding(dp(16), dp(12), dp(16), dp(125));
+        scroll.setPadding(dp(16), dp(12), dp(16), dp(24));
         scroll.setClipToPadding(false);
 
         LinearLayout layout = new LinearLayout(this);
@@ -5031,19 +5119,6 @@ public final class FishbowlActivity extends AppCompatActivity
         cardsTitle.setText("COMPANION SERVICES");
         styleSectionLabel(cardsTitle);
         cardsHeader.addView(cardsTitle, new LinearLayout.LayoutParams(0, -2, 1.0f));
-
-        Button btnInstallBatch = UiKit.tonal(this, buttonLabel("INSTALL"), v -> showSelectiveInstallDialog());
-        btnInstallBatch.setTextSize(12f);
-        btnInstallBatch.setPadding(dp(12), 0, dp(12), 0);
-        cardsHeader.addView(btnInstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
-
-        View batchGap = new View(this);
-        cardsHeader.addView(batchGap, new LinearLayout.LayoutParams(dp(8), 1));
-
-        Button btnUninstallBatch = UiKit.danger(this, buttonLabel("UNINSTALL"), v -> showSelectiveUninstallDialog());
-        btnUninstallBatch.setTextSize(12f);
-        btnUninstallBatch.setPadding(dp(12), 0, dp(12), 0);
-        cardsHeader.addView(btnUninstallBatch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
 
         header.addView(cardsHeader);
 
@@ -5093,6 +5168,7 @@ public final class FishbowlActivity extends AppCompatActivity
     }
 
     private void refreshServicesTabUI() {
+        refreshCompanionButtons();
         if (servicesCardsContainer == null) return;
         // Skip all work while the tab is hidden; it is refreshed when the tab is opened.
         if (activeTab != 1 && servicesCardsContainer.getChildCount() > 0) {
@@ -8341,7 +8417,7 @@ public final class FishbowlActivity extends AppCompatActivity
         sacLp.bottomMargin = dp(10);
         selectAllCard.setLayoutParams(sacLp);
 
-        CheckBox selectAllCb = new CheckBox(this);
+        CheckBox selectAllCb = UiStyle.newCheckBox(this);
         selectAllCb.setChecked(true);
         selectAllCard.addView(selectAllCb);
 
@@ -8408,7 +8484,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
             itemCard.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-            CheckBox cb = new CheckBox(this);
+            CheckBox cb = UiStyle.newCheckBox(this);
             cb.setChecked(true);
             cb.setOnCheckedChangeListener((btn, isChecked) -> {
                 if (isChecked) {
@@ -8537,7 +8613,7 @@ public final class FishbowlActivity extends AppCompatActivity
         sacLp.bottomMargin = dp(10);
         selectAllCard.setLayoutParams(sacLp);
 
-        CheckBox selectAllCb = new CheckBox(this);
+        CheckBox selectAllCb = UiStyle.newCheckBox(this);
         selectAllCb.setChecked(true);
         selectAllCard.addView(selectAllCb);
 
@@ -8602,7 +8678,7 @@ public final class FishbowlActivity extends AppCompatActivity
 
             itemCard.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-            CheckBox cb = new CheckBox(this);
+            CheckBox cb = UiStyle.newCheckBox(this);
             cb.setChecked(true);
             cb.setOnCheckedChangeListener((btn, isChecked) -> {
                 if (isChecked) {
@@ -8639,7 +8715,7 @@ public final class FishbowlActivity extends AppCompatActivity
         pcLp.topMargin = dp(8);
         purgeCard.setLayoutParams(pcLp);
 
-        CheckBox purgeCb = new CheckBox(this);
+        CheckBox purgeCb = UiStyle.newCheckBox(this);
         purgeCb.setChecked(false);
         purgeCard.addView(purgeCb);
 
@@ -8963,7 +9039,7 @@ public final class FishbowlActivity extends AppCompatActivity
         menuScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
         settingsMenu = new LinearLayout(this);
         settingsMenu.setOrientation(LinearLayout.VERTICAL);
-        settingsMenu.setPadding(dp(16), dp(12), dp(16), dp(110));
+        settingsMenu.setPadding(dp(16), dp(12), dp(16), dp(24));
 
         settingsMenu.addView(UiKit.header(this, "Settings", "Tap a section to open it.", null));
 
@@ -8973,6 +9049,7 @@ public final class FishbowlActivity extends AppCompatActivity
         addSettingsGroupHeader("SERVER");
         addSettingsMenuRow("General & Startup", "Auto-start, keep screen on, media stack", buildGeneralSection());
         addSettingsMenuRow("Automation", "Transmission cleanup, auto-recheck, Wi-Fi only", buildAutomationSection());
+        addSettingsMenuRow("Companion services", "Install or uninstall Radarr, Sonarr, Prowlarr and Transmission", buildCompanionServicesSection());
         addSettingsMenuRow("Playback & Streaming", "Codecs and transcoding", buildStreamingSection());
 
         addSettingsGroupHeader("DEVICE & SECURITY");
@@ -9043,7 +9120,7 @@ public final class FishbowlActivity extends AppCompatActivity
         settingsDetailScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
         settingsDetailBody = new LinearLayout(this);
         settingsDetailBody.setOrientation(LinearLayout.VERTICAL);
-        settingsDetailBody.setPadding(dp(16), dp(8), dp(16), dp(110));
+        settingsDetailBody.setPadding(dp(16), dp(8), dp(16), dp(24));
         settingsDetailScroll.addView(settingsDetailBody);
         settingsDetail.addView(settingsDetailScroll, new LinearLayout.LayoutParams(-1, 0, 1.0f));
         settingsRoot.addView(settingsDetail, new FrameLayout.LayoutParams(-1, -1));
@@ -9924,7 +10001,7 @@ public final class FishbowlActivity extends AppCompatActivity
         asAppTextCol.addView(asAppSub);
         autoStartAppRow.addView(asAppTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        Switch autoStartAppSwitch = new Switch(this);
+        Switch autoStartAppSwitch = UiStyle.newSwitch(this);
         SharedPreferences prefs = getFishbowlPrefs();
         boolean appLaunchDefault = prefs.getBoolean("auto_start_app", prefs.getBoolean("auto_start", false));
         autoStartAppSwitch.setChecked(appLaunchDefault);
@@ -9961,7 +10038,7 @@ public final class FishbowlActivity extends AppCompatActivity
         asCompTextCol.addView(asCompSub);
         autoStartCompRow.addView(asCompTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        Switch autoStartCompSwitch = new Switch(this);
+        Switch autoStartCompSwitch = UiStyle.newSwitch(this);
         boolean compAutoStart = MediaServiceManager.getInstance(this).isCompanionAutoStartEnabled();
         autoStartCompSwitch.setChecked(compAutoStart);
         autoStartCompSwitch.setOnCheckedChangeListener((v, checked) -> {
@@ -9995,7 +10072,7 @@ public final class FishbowlActivity extends AppCompatActivity
         msTextCol.addView(msSub);
         mediaStackRow.addView(msTextCol, new LinearLayout.LayoutParams(0, -2, 1.0f));
 
-        Switch mediaStackSwitch = new Switch(this);
+        Switch mediaStackSwitch = UiStyle.newSwitch(this);
         mediaStackSwitch.setChecked(isMediaStackEnabled());
         mediaStackSwitch.setOnCheckedChangeListener((v, checked) -> {
             setMediaStackEnabled(checked);
@@ -10066,9 +10143,13 @@ public final class FishbowlActivity extends AppCompatActivity
 
     /** Colours are baked into the programmatic views, so a theme change rebuilds the activity. */
     private void restartForTheme() {
+        themeRestarting = true;
         AppTheme.applyNightMode();
         recreate();
+        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
     }
+
+    private boolean themeRestarting = false;
 
     private TextView appearanceTitle(String text) {
         TextView t = new TextView(this);
@@ -10210,7 +10291,7 @@ public final class FishbowlActivity extends AppCompatActivity
         swRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView swLabel = appearanceTitle("Switch");
         swRow.addView(swLabel, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Switch swOn = new Switch(this);
+        Switch swOn = UiStyle.newSwitch(this);
         swOn.setChecked(true);
         swRow.addView(swOn);
         previewCard.addView(swRow);
@@ -10278,6 +10359,50 @@ public final class FishbowlActivity extends AppCompatActivity
 
     // -- AUTOMATION: Transmission auto-cleanup, auto-recheck & per-service Wi-Fi only ----------
 
+    /** Settings > Companion services: install / uninstall, each disabled when there is nothing to do. */
+    private View buildCompanionServicesSection() {
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+        section.addView(createSettingsSectionHeader("COMPANION SERVICES"));
+        LinearLayout card = createSettingsSectionCard();
+
+        card.addView(UiKit.text(this, I18n.tr("Install"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView ih = UiKit.caption(this, I18n.tr("Choose the services to add to your media stack."));
+        ih.setPadding(0, dp(2), 0, dp(8));
+        card.addView(ih);
+        companionInstallBtn = UiKit.primary(this, buttonLabel("INSTALL SERVICES"), v -> showSelectiveInstallDialog());
+        card.addView(companionInstallBtn, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        card.addView(createSettingsDivider());
+
+        card.addView(UiKit.text(this, I18n.tr("Uninstall"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView uh = UiKit.caption(this, I18n.tr("Remove installed services and free their storage. Your settings are kept."));
+        uh.setPadding(0, dp(2), 0, dp(8));
+        card.addView(uh);
+        companionUninstallBtn = UiKit.danger(this, buttonLabel("UNINSTALL SERVICES"), v -> showSelectiveUninstallDialog());
+        card.addView(companionUninstallBtn, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        section.addView(card);
+        refreshCompanionButtons();
+        return section;
+    }
+
+    private void refreshCompanionButtons() {
+        if (companionInstallBtn == null || companionUninstallBtn == null) return;
+        boolean canInstall = false;
+        boolean canUninstall = false;
+        try {
+            for (ManagedService s : MediaServiceManager.getInstance(this).getAllServices()) {
+                if ("jellyfin".equalsIgnoreCase(s.getId())) continue;
+                if (s.isInstalled()) canUninstall = true; else canInstall = true;
+            }
+        } catch (Throwable ignored) {}
+        companionInstallBtn.setEnabled(canInstall);
+        companionInstallBtn.setAlpha(canInstall ? 1f : 0.38f);
+        companionUninstallBtn.setEnabled(canUninstall);
+        companionUninstallBtn.setAlpha(canUninstall ? 1f : 0.38f);
+    }
+
     /** One settings row: title + hint on the start side, switch on the end side (correct in LTR and RTL). */
     private LinearLayout settingsSwitchRow(String title, String hint, boolean checked,
                                            android.widget.CompoundButton.OnCheckedChangeListener l) {
@@ -10292,7 +10417,7 @@ public final class FishbowlActivity extends AppCompatActivity
             text.addView(h);
         }
         row.addView(text, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Switch sw = new Switch(this);
+        Switch sw = UiStyle.newSwitch(this);
         sw.setChecked(checked);
         sw.setOnCheckedChangeListener(l);
         row.addView(sw);
@@ -13220,16 +13345,29 @@ public final class FishbowlActivity extends AppCompatActivity
 
             boolean isJustReady = (state == JellyfinController.State.RUNNING && stage == JellyfinController.StartupStage.READY
                     && startupCompletedTimeMs > 0 && (System.currentTimeMillis() - startupCompletedTimeMs < readyGraceMs));
-            boolean showStartupProgress = isStarting || isJustReady;
+            boolean[] comp = updateStartupCompanionRows();
+            boolean companionsStarting = comp[0];
+            long nowMs = System.currentTimeMillis();
+            if (isStarting || companionsStarting) lastStartupActivityMs = nowMs;
+            // Companions are started one after the other: stay visible while some still wait their turn.
+            long graceMs = comp[1] ? 8000L : readyGraceMs;
+            boolean sessionGrace = lastStartupActivityMs > 0 && nowMs - lastStartupActivityMs < graceMs;
+            boolean anyBusy = isStarting || companionsStarting || (sessionGrace && comp[1]);
+            boolean showStartupProgress = isStarting || isJustReady || companionsStarting || sessionGrace;
 
             startupProgressCard.setVisibility(showStartupProgress ? View.VISIBLE : View.GONE);
+            int jfRows = (isStarting || isJustReady) ? View.VISIBLE : View.GONE;
+            for (TextView sr : new TextView[]{txtStage1, txtStage2, txtStage3, txtStage4, txtStage5}) {
+                if (sr != null) sr.setVisibility(jfRows);
+            }
 
             if (showStartupProgress && txtStage1 != null) {
                 if (startupProgressHeader != null) {
-                    startupProgressHeader.setText(isJustReady ? "Jellyarr Server Ready" : "Starting Jellyarr Server...");
+                    startupProgressHeader.setText(isStarting ? "Starting Jellyarr Server..."
+                            : anyBusy ? "Starting companion services..." : "Jellyarr Server Ready");
                 }
                 if (startupProgressBar != null) {
-                    if (isJustReady) {
+                    if (!anyBusy && !isStarting) {
                         startupProgressBar.setIndeterminate(false);
                         startupProgressBar.setProgress(100);
                     } else {
@@ -13260,11 +13398,11 @@ public final class FishbowlActivity extends AppCompatActivity
                 updateStageRow(txtStage5, "5. Ready (Server running)", isServerReady, false);
             }
 
-            if (isStarting) {
+            if (isStarting || companionsStarting || anyBusy) {
                 mainHandler.removeCallbacks(startupProgressPoller);
                 mainHandler.postDelayed(startupProgressPoller, 500);
-            } else if (isJustReady) {
-                long remaining = readyGraceMs - (System.currentTimeMillis() - startupCompletedTimeMs);
+            } else if (showStartupProgress) {
+                long remaining = graceMs - (System.currentTimeMillis() - lastStartupActivityMs);
                 mainHandler.removeCallbacks(startupProgressPoller);
                 mainHandler.postDelayed(startupProgressPoller, Math.max(100, remaining + 50));
             }
@@ -13895,7 +14033,7 @@ public final class FishbowlActivity extends AppCompatActivity
         st.setPaddingRelative(0, dp(2), dp(8), 0);
         col.addView(st);
         row.addView(col, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Switch sw = new Switch(this);
+        Switch sw = UiStyle.newSwitch(this);
         sw.setChecked(on);
         sw.setOnCheckedChangeListener((v, checked) -> sink.set(checked));
         row.addView(sw);
@@ -13968,9 +14106,12 @@ public final class FishbowlActivity extends AppCompatActivity
                         }
                     }
                     if (isFinishing()) return;
+                    // "Update available" popup: only when automatic download is off (otherwise the bar shows the
+                    // download); a finished download is handled by the install prompt.
+                    if (um.isAutoDownloadEnabled()) return;
                     for (String ch : new String[]{UpdateManager.CHANNEL_STABLE, UpdateManager.CHANNEL_BETA}) {
                         UpdateNotifier.Latest l = r.get(ch);
-                        if (l.found() && l.code > cur && UpdateNotifier.inAppNotify(this, ch)
+                        if (l.found() && l.code > cur && !um.isReadyToInstall(l.code) && UpdateNotifier.inAppNotify(this, ch)
                                 && UpdateNotifier.dismissedCode(this, ch) < l.code) {
                             showUpdateNotice(ch, l);
                             break;
@@ -14024,9 +14165,8 @@ public final class FishbowlActivity extends AppCompatActivity
     private TextView updateBannerText;
     private ProgressBar updateBannerProgress;
     private Button updateBannerInstallBtn;
-    private boolean updateBannerDismissed = false;
-    private UpdateManager.State updateBannerLastState = null;
     private int updateBannerLastPct = -1;
+    private boolean installPromptHandled = false;
 
     private View buildUpdateBanner() {
         updateBannerBar = new LinearLayout(this);
@@ -14051,16 +14191,33 @@ public final class FishbowlActivity extends AppCompatActivity
         updateBannerInstallBtn.setOnClickListener(v -> UpdateManager.getInstance(this).installUpdate(this));
         row.addView(updateBannerInstallBtn, new LinearLayout.LayoutParams(-2, dp(34)));
 
+        // "!" : always there, opens the update details
+        TextView info = new TextView(this);
+        info.setText("!");
+        info.setTextSize(15f);
+        info.setTypeface(Typeface.DEFAULT_BOLD);
+        info.setGravity(Gravity.CENTER);
+        info.setTextColor(AppTheme.accent());
+        info.setBackground(UiKit.shape(this, AppTheme.accentContainer(), 0, UiKit.R_PILL));
+        info.setContentDescription(I18n.tr("Update details"));
+        info.setOnClickListener(v -> showUpdateDetailsDialog());
+        LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(dp(28), dp(28));
+        infoLp.setMarginStart(dp(8));
+        row.addView(info, infoLp);
+
         TextView close = new TextView(this);
         close.setText("✕");
         close.setTextSize(16f);
         close.setGravity(Gravity.CENTER);
         close.setTextColor(AppTheme.textSecondary());
-        close.setContentDescription("Close");
+        close.setContentDescription(I18n.tr("Close"));
         close.setOnClickListener(v -> {
-            updateBannerDismissed = true;
+            UpdateManager.getInstance(this).closeBanner();
             updateBannerBar.setVisibility(View.GONE);
             applyTopInsets();
+            // With the bar gone, a finished download asks for the install right away.
+            installPromptHandled = false;
+            maybeShowInstallReadyPrompt();
         });
         row.addView(close, new LinearLayout.LayoutParams(dp(40), dp(34)));
         updateBannerBar.addView(row);
@@ -14072,7 +14229,10 @@ public final class FishbowlActivity extends AppCompatActivity
         return updateBannerBar;
     }
 
-    /** Shows download percent, then an install button; remains visible until the user taps X. */
+    /**
+     * The update bar is pinned by the download (see UpdateManager.pinBanner) and survives leaving and re-opening the
+     * app; only its close button removes it. It shows the download percent, then an install button.
+     */
     private void refreshUpdateBanner() {
         refreshUpdateBannerInner();
         applyTopInsets();
@@ -14081,19 +14241,17 @@ public final class FishbowlActivity extends AppCompatActivity
     private void refreshUpdateBannerInner() {
         if (updateBannerBar == null) return;
         UpdateManager mgr = UpdateManager.getInstance(this);
-        UpdateManager.State st = mgr.getCurrentState();
-        boolean downloading = st == UpdateManager.State.DOWNLOADING;
-        boolean verifying = st == UpdateManager.State.VERIFYING;
-        boolean ready = st == UpdateManager.State.DOWNLOAD_COMPLETE || st == UpdateManager.State.VERIFICATION_SUCCESSFUL;
-        // A new download cycle re-opens a bar that was closed earlier
-        if (downloading && updateBannerLastState != UpdateManager.State.DOWNLOADING) updateBannerDismissed = false;
-        updateBannerLastState = st;
-
-        if (!(downloading || verifying || ready) || updateBannerDismissed) {
-            if (!(downloading || verifying || ready)) updateBannerLastPct = -1;
+        int pinned = mgr.getBannerCode();
+        if (pinned <= 0 || pinned <= mgr.getCurrentVersionCode(this)) {
+            updateBannerLastPct = -1;
             updateBannerBar.setVisibility(View.GONE);
             return;
         }
+        UpdateManager.State st = mgr.getCurrentState();
+        boolean downloading = st == UpdateManager.State.DOWNLOADING;
+        boolean verifying = st == UpdateManager.State.VERIFYING;
+        boolean ready = mgr.isReadyToInstall(pinned)
+                || st == UpdateManager.State.DOWNLOAD_COMPLETE || st == UpdateManager.State.VERIFICATION_SUCCESSFUL;
         String ver = mgr.getLatestVersionName();
         String v = (ver == null || ver.isEmpty()) ? "" : " v" + ver;
         if (downloading) {
@@ -14110,12 +14268,50 @@ public final class FishbowlActivity extends AppCompatActivity
             updateBannerText.setText(I18n.tr("Verifying update") + v + "...");
             updateBannerProgress.setVisibility(View.GONE);
             updateBannerInstallBtn.setVisibility(View.GONE);
-        } else {
+        } else if (ready) {
             updateBannerText.setText(I18n.tr("Update") + v + " " + I18n.tr("ready to install") + " — 100%");
             updateBannerProgress.setVisibility(View.GONE);
             updateBannerInstallBtn.setVisibility(View.VISIBLE);
+        } else {
+            long partial = mgr.getPartialBytes(this);
+            updateBannerText.setText(I18n.tr("Update") + v + " " + I18n.tr(partial > 0 ? "download paused" : "available"));
+            updateBannerProgress.setVisibility(View.GONE);
+            updateBannerInstallBtn.setVisibility(View.GONE);
         }
         updateBannerBar.setVisibility(View.VISIBLE);
+    }
+
+    /** Details of the pending update (version, channel, release notes) from the "!" in the bar. */
+    private void showUpdateDetailsDialog() {
+        final UpdateManager mgr = UpdateManager.getInstance(this);
+        int code = mgr.getBannerCode() > 0 ? mgr.getBannerCode() : mgr.getLatestVersionCode();
+        String ver = mgr.getLatestVersionName();
+        String notes = mgr.getLatestReleaseNotes();
+        if (notes == null || notes.trim().isEmpty()) notes = "No release notes.";
+        String label = UpdateManager.CHANNEL_BETA.equals(mgr.getUpdateChannel()) ? "Beta" : "Stable";
+        final boolean ready = mgr.isReadyToInstall(code);
+        showOledDialog("Update available (" + label + ")", "Jellyarr v" + (ver == null ? "" : ver),
+                notesView(notes), ready ? I18n.tr("Install Update") : null, getAccentColor(),
+                ready ? () -> mgr.installUpdate(this) : null, "CLOSE", null);
+    }
+
+    /**
+     * Asks to install a finished download, but only while the update bar is closed (an open bar already has the
+     * install button). Asked again on every app start until the update is installed.
+     */
+    private void maybeShowInstallReadyPrompt() {
+        if (installPromptHandled || isFinishing()) return;
+        final UpdateManager mgr = UpdateManager.getInstance(this);
+        final int ready = mgr.getReadyCode();
+        if (ready <= mgr.getCurrentVersionCode(this) || !mgr.isReadyToInstall(ready)) return;
+        if (mgr.getBannerCode() == ready) return;   // bar still open: no popup
+        installPromptHandled = true;
+        String ver = mgr.getLatestVersionName();
+        showOledDialog("Update ready to install", "Jellyarr v" + (ver == null ? "" : ver),
+                notesView(mgr.getLatestReleaseNotes() == null || mgr.getLatestReleaseNotes().trim().isEmpty()
+                        ? "No release notes." : mgr.getLatestReleaseNotes()),
+                I18n.tr("Install Update"), getAccentColor(), () -> mgr.installUpdate(this),
+                "LATER", null);
     }
 
     private final UpdateManager.UpdateListener updateListener = new UpdateManager.UpdateListener() {

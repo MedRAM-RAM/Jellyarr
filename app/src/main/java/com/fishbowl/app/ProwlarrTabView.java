@@ -1108,7 +1108,7 @@ public final class ProwlarrTabView {
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
         tlp.setMarginEnd(dp(12));
         row.addView(tx, tlp);
-        Switch sw = new Switch(act);
+        Switch sw = UiStyle.newSwitch(act);
         sw.setChecked(value);
         UiStyle.styleSwitch(act, sw);
         sw.setOnCheckedChangeListener((b, checked) -> sink.set(checked));

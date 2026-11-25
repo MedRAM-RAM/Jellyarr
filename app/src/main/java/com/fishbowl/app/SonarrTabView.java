@@ -836,7 +836,7 @@ public final class SonarrTabView {
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
         tlp.setMarginEnd(dp(12));
         top.addView(tx, tlp);
-        final Switch sw = new Switch(act);
+        final Switch sw = UiStyle.newSwitch(act);
         sw.setChecked(seasonObj.optBoolean("monitored"));
         UiStyle.styleSwitch(act, sw);
         top.addView(sw);
@@ -930,7 +930,7 @@ public final class SonarrTabView {
         tlp.setMarginEnd(dp(8));
         row.addView(tx, tlp);
 
-        final Switch sw = new Switch(act);
+        final Switch sw = UiStyle.newSwitch(act);
         sw.setChecked(e.optBoolean("monitored"));
         UiStyle.styleSwitch(act, sw);
         row.addView(sw);
@@ -2274,7 +2274,7 @@ public final class SonarrTabView {
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
         tlp.setMarginEnd(dp(12));
         row.addView(tx, tlp);
-        Switch sw = new Switch(act);
+        Switch sw = UiStyle.newSwitch(act);
         sw.setChecked(checked);
         UiStyle.styleSwitch(act, sw);
         row.addView(sw);

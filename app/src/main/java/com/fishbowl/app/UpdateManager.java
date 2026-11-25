@@ -53,6 +53,8 @@ public final class UpdateManager {
     private static final String KEY_SHA_URL = "latest_sha_url";
     private static final String KEY_READY_CODE = "ready_code";
     private static final String KEY_READY_NAME = "ready_name";
+    private static final String KEY_BANNER_CODE = "banner_code";
+    private static final String KEY_BANNER_CLOSED_CODE = "banner_closed_code";
     private static final String KEY_AUTO_DOWNLOAD = "auto_download";
     private static final String KEY_AUTO_WIFI_ONLY = "auto_download_wifi_only";
     public static final String CHANNEL_STABLE = "stable";
@@ -158,6 +160,28 @@ public final class UpdateManager {
 
     public synchronized boolean isDownloadInProgress() { return isDownloading; }
 
+    /** Version code of the update whose top bar is pinned (0 = no bar). The bar stays until the user closes it. */
+    public int getBannerCode() { return prefs.getInt(KEY_BANNER_CODE, 0); }
+
+    /** Version code of a downloaded + verified update that is not installed yet (0 = none). */
+    public int getReadyCode() { return prefs.getInt(KEY_READY_CODE, 0); }
+
+    /**
+     * Pins the update bar for {@code code}. An automatic download does not bring back a bar the user closed for the
+     * same version; {@code force} (a download the user asked for) always does.
+     */
+    public void pinBanner(int code, boolean force) {
+        if (code <= 0) return;
+        if (!force && prefs.getInt(KEY_BANNER_CLOSED_CODE, 0) == code) return;
+        prefs.edit().putInt(KEY_BANNER_CODE, code).remove(KEY_BANNER_CLOSED_CODE).apply();
+    }
+
+    /** The user closed the bar: it stays away for this version. */
+    public void closeBanner() {
+        int c = prefs.getInt(KEY_BANNER_CODE, 0);
+        prefs.edit().remove(KEY_BANNER_CODE).putInt(KEY_BANNER_CLOSED_CODE, c).apply();
+    }
+
     public boolean isReadyToInstall(int code) {
         return code > 0 && prefs.getInt(KEY_READY_CODE, 0) == code;
     }
@@ -187,6 +211,8 @@ public final class UpdateManager {
                     if (code <= cur) f.delete();   // already installed -> remove
                 }
             }
+            if (prefs.getInt(KEY_BANNER_CODE, 0) <= cur) prefs.edit().remove(KEY_BANNER_CODE).apply();
+            if (prefs.getInt(KEY_BANNER_CLOSED_CODE, 0) <= cur) prefs.edit().remove(KEY_BANNER_CLOSED_CODE).apply();
             int ready = prefs.getInt(KEY_READY_CODE, 0);
             if (ready > 0 && ready <= cur) {
                 prefs.edit().remove(KEY_READY_CODE).remove(KEY_READY_NAME).apply();
@@ -200,6 +226,7 @@ public final class UpdateManager {
                         latestVersionCode = ready;
                         latestVersionName = prefs.getString(KEY_READY_NAME, latestVersionName);
                     }
+                    pinBanner(ready, false);
                     notifyStateChanged(State.VERIFICATION_SUCCESSFUL);
                     return;
                 }
@@ -212,7 +239,7 @@ public final class UpdateManager {
             if (latest > cur && url != null && url.startsWith("https://")
                     && partApk(app, latest).exists() && isNetworkAllowedForAuto(app)) {
                 notifyStateChanged(State.UPDATE_AVAILABLE);
-                startDownload(app);
+                startDownload(app, false);
             }
         } catch (Throwable t) {
             Log.w(TAG, "restoreSavedState failed", t);
@@ -642,6 +669,11 @@ public final class UpdateManager {
 
     /** UI download: resumes from the saved partial file when there is one. */
     public void startDownload(Context context) {
+        startDownload(context, true);
+    }
+
+    /** {@code userInitiated} false = automatic resume: a bar the user closed for this version stays closed. */
+    public void startDownload(Context context, boolean userInitiated) {
         final Context app = context.getApplicationContext();
         final String url; final String sha; final int code;
         synchronized (this) { url = apkUrl; sha = sha256Url; code = latestVersionCode; }
@@ -651,6 +683,7 @@ public final class UpdateManager {
             return;
         }
         if (!beginDownload()) return;
+        pinBanner(code, userInitiated);
         notifyStateChanged(State.DOWNLOADING);
         executor.execute(() -> {
             try {
@@ -675,6 +708,7 @@ public final class UpdateManager {
             }
             prefs.edit().putInt(KEY_LATEST_VER_CODE, code).putString(KEY_LATEST_VER_NAME, name)
                     .putString(KEY_APK_URL, url).putString(KEY_SHA_URL, sha == null ? "" : sha).apply();
+            pinBanner(code, false);
             notifyStateChanged(State.DOWNLOADING);
             return downloadCore(app, code, url, sha);
         } finally {

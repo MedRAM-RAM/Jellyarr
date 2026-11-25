@@ -738,7 +738,7 @@ public final class LibraryTabView {
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, -2, 1.0f);
         tlp.setMarginEnd(dp(12));
         top.addView(tx, tlp);
-        Switch sw = new Switch(act);
+        Switch sw = UiStyle.newSwitch(act);
         sw.setChecked(on);
         UiStyle.styleSwitch(act, sw);
         sw.setOnCheckedChangeListener((v, checked) -> {
