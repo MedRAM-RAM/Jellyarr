@@ -1,4 +1,9 @@
-What's new in 2.1.1 (stable)
+What's new in 2.1.2 (old package com.fishbowl.app, backup fix only)
+- This update is only for moving to Jellyarr 3.x. It fixes the backup: it now also saves the Jellyfin libraries (root folder), plugins and artwork. Before, only jellyfin.db was saved, so a restored Jellyfin looked empty.
+- The Sonarr / Radarr / Prowlarr log databases are no longer included (tens of MB, not needed).
+- How to move: stop all services, make a new backup (Settings > Backup & Restore), install Jellyarr 3.x, restore that backup there, then uninstall this app.
+
+From 2.1.1:
 - Switches now light up clearly when ON (accent track, bright thumb) and dim when OFF or disabled, in every screen.
 - Faster theme changes and screens: the Library / Sonarr / Radarr / Transmission / Prowlarr screens are now built on demand in the background instead of all at start-up, and a theme change fades instead of freezing.
 - Home: the start-up progress now also covers Transmission, Prowlarr, Radarr and Sonarr, and sits at the bottom of the Services card.

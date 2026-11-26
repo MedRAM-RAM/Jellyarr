@@ -25,8 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      FISHBOWL_VERSION_CODE: ${{ vars.FISHBOWL_VERSION_CODE || '101461' }}
-      FISHBOWL_VERSION_NAME: ${{ vars.FISHBOWL_VERSION_NAME || '2.1.1' }}
+      FISHBOWL_VERSION_CODE: ${{ vars.FISHBOWL_VERSION_CODE || '101462' }}
+      FISHBOWL_VERSION_NAME: ${{ vars.FISHBOWL_VERSION_NAME || '2.1.2' }}
 
     steps:
       - name: Checkout
@@ -113,7 +113,7 @@ jobs:
             echo "sha256: ${SHA}"
           } > /tmp/release_body.md
           FLAGS="--prerelease"
-          if [ "${{ inputs.channel }}" = "stable" ]; then FLAGS="--latest"; fi
+          if [ "${{ inputs.channel }}" = "stable" ]; then FLAGS="--latest=false"; fi
           gh release create "$TAG" "$APK" "${APK}.sha256" \
             --target "$GITHUB_SHA" \
             $FLAGS \

@@ -234,6 +234,20 @@ public final class BackupRestoreManager {
                     }
                 }
 
+                // 2c. Jellyfin libraries (root/default/<library>), plugins and artwork (metadata). Without root a
+                // restored server has no libraries and looks empty even though jellyfin.db came back.
+                File jfShare = new File(homeDir, ".local/share/jellyfin");
+                for (String sub : JELLYFIN_SHARE_DIRS) {
+                    File src = new File(jfShare, sub);
+                    if (!src.isDirectory()) continue;
+                    postProgress(callback, "Backing up Jellyfin " + sub + "...");
+                    try {
+                        totalCount += stageAllFiles(src, new File(stagingDir, "jellyfin_share/" + sub), "jellyfin_share/" + sub, itemsArray, 0);
+                    } catch (Throwable shareEx) {
+                        Log.w(TAG, "Jellyfin " + sub + " staging problem: " + shareEx.getMessage());
+                    }
+                }
+
                 // 3. Create Metadata Manifest with dynamic application version info
                 String appVersion = com.termux.BuildConfig.VERSION_NAME;
                 long appVersionCode = com.termux.BuildConfig.VERSION_CODE;
@@ -423,6 +437,43 @@ public final class BackupRestoreManager {
     /**
      * Recursively stages config files filtering out large caches/logs.
      */
+    /** Jellyfin data folders (under ~/.local/share/jellyfin) kept in a backup besides data/. */
+    static final String[] JELLYFIN_SHARE_DIRS = {"root", "plugins", "metadata"};
+
+    /** Copies every regular file (any type) under source; symbolic links are skipped. */
+    private static int stageAllFiles(File source, File dest, String relativeParent, org.json.JSONArray itemsArray, int depth) {
+        int count = 0;
+        if (depth > 32) return 0;
+        File[] files = source.listFiles();
+        if (files == null) return 0;
+        for (File f : files) {
+            try {
+                if (java.nio.file.Files.isSymbolicLink(f.toPath())) continue;
+            } catch (Throwable ignored) {}
+            if (f.isDirectory()) {
+                count += stageAllFiles(f, new File(dest, f.getName()), relativeParent + "/" + f.getName(), itemsArray, depth + 1);
+            } else if (f.isFile()) {
+                try {
+                    if (!dest.exists()) dest.mkdirs();
+                    File destFile = new File(dest, f.getName());
+                    copyFile(f, destFile);
+                    count++;
+                    if (itemsArray != null) {
+                        JSONObject itemObj = new JSONObject();
+                        itemObj.put("path", relativeParent + "/" + f.getName());
+                        itemObj.put("size", destFile.length());
+                        itemObj.put("sha256", computeSHA256(destFile));
+                        itemObj.put("component", "jellyfin");
+                        itemsArray.put(itemObj);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "Failed to stage " + f.getName() + ": " + t.getMessage());
+                }
+            }
+        }
+        return count;
+    }
+
     private static int stageConfigDir(File source, File dest, String relativeParent, org.json.JSONArray itemsArray) {
         int count = 0;
         File[] files = source.listFiles();
@@ -431,6 +482,7 @@ public final class BackupRestoreManager {
         for (File f : files) {
             String nameLower = f.getName().toLowerCase(Locale.ROOT);
             if (IGNORED_NAMES.contains(nameLower)) continue;
+            if (nameLower.startsWith("logs.db")) continue;
 
             if (f.isDirectory()) {
                 File subDest = new File(dest, f.getName());
