@@ -75,6 +75,18 @@ public final class UnifiedAccount {
         e.apply();
     }
 
+    static final String RESTORE_MARKER = "unified_account_recheck";
+
+    /** Called at start-up: a restore leaves a marker, then all services go back to "pending" and are re-checked. */
+    public static void afterRestoreIfNeeded(Context c) {
+        java.io.File marker = new java.io.File(c.getFilesDir(), RESTORE_MARKER);
+        if (!marker.exists()) return;
+        SharedPreferences.Editor e = sp(c).edit();
+        for (String s : SERVICES) e.putString("status_" + s, "pending").remove("msg_" + s).remove("sig_" + s);
+        e.commit();
+        marker.delete();
+    }
+
     /** Forgets the stored account (services keep whatever login they already have). */
     public static void clear(Context c) {
         SharedPreferences.Editor e = sp(c).edit().remove(K_USER).remove(K_PASS);

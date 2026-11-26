@@ -285,6 +285,7 @@ public final class JellyfinWebActivity extends AppCompatActivity implements Jell
                 if (!isLocalServiceUrl(url)) {
                     return;
                 }
+                maybeAutoSignInJellyfin(view, url);
 
                 view.evaluateJavascript(
                     "(function() {" +
@@ -467,7 +468,7 @@ public final class JellyfinWebActivity extends AppCompatActivity implements Jell
                     loaded = true;
                     loadingView.setVisibility(View.GONE);
                     web.setVisibility(View.VISIBLE);
-                    web.loadUrl(url != null ? url : customUrl);
+                    loadWithAutoSignIn(url != null ? url : customUrl);
                 }
 
                 @Override
@@ -501,7 +502,7 @@ public final class JellyfinWebActivity extends AppCompatActivity implements Jell
                             loaded = true;
                             loadingView.setVisibility(View.GONE);
                             web.setVisibility(View.VISIBLE);
-                            web.loadUrl(customUrl);
+                            loadWithAutoSignIn(customUrl);
                         });
                         loadingActionBox.addView(forceBtn);
 
@@ -529,6 +530,72 @@ public final class JellyfinWebActivity extends AppCompatActivity implements Jell
             loadingView.setVisibility(View.GONE);
             web.setVisibility(View.VISIBLE);
             web.loadUrl(customUrl);
+        }
+    }
+
+    private int jellyfinAutoSignInAttempts = 0;
+
+    /**
+     * Sonarr / Radarr / Prowlarr use Forms login: post the unified account to /login first, so the web view gets its
+     * session cookie and lands on the page that was asked for instead of the login form.
+     */
+    private void loadWithAutoSignIn(String url) {
+        try {
+            Uri u = Uri.parse(url);
+            int port = u.getPort();
+            boolean arr = port == 8989 || port == 7878 || port == 9696;
+            if (arr && isLocalOrLanHost(u.getHost()) && UnifiedAccount.isConfigured(this)) {
+                String path = u.getEncodedPath();
+                if (path == null || path.isEmpty()) path = "/";
+                String base = u.getScheme() + "://" + u.getHost() + ":" + port;
+                String form = "username=" + java.net.URLEncoder.encode(UnifiedAccount.getUsername(this), "UTF-8")
+                        + "&password=" + java.net.URLEncoder.encode(UnifiedAccount.getPassword(this), "UTF-8")
+                        + "&rememberMe=on";
+                web.postUrl(base + "/login?returnUrl=" + java.net.URLEncoder.encode(path, "UTF-8"),
+                        form.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                return;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "auto sign-in skipped: " + t.getMessage());
+        }
+        web.loadUrl(url);
+    }
+
+    /**
+     * Jellyfin web keeps its own login: when its sign-in page shows, fill in the unified account and submit it once
+     * (twice at most per screen, so a wrong password never loops). Uses the web client's own login, so the session
+     * belongs to this web view like a normal sign-in.
+     */
+    private void maybeAutoSignInJellyfin(WebView view, String url) {
+        try {
+            if (url == null || !url.contains(":8096") || jellyfinAutoSignInAttempts >= 2) return;
+            if (!UnifiedAccount.isConfigured(this)) return;
+            jellyfinAutoSignInAttempts++;
+            String u = org.json.JSONObject.quote(UnifiedAccount.getUsername(this));
+            String p = org.json.JSONObject.quote(UnifiedAccount.getPassword(this));
+            view.evaluateJavascript(
+                "(function(u,p){" +
+                "  if (window._jaAutoLogin) return; window._jaAutoLogin = true;" +
+                "  var n = 0;" +
+                "  function setVal(el, v){ el.value = v; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }" +
+                "  var t = setInterval(function(){" +
+                "    n++; if (n > 60) { clearInterval(t); return; }" +
+                "    var name = document.querySelector('#txtManualName');" +
+                "    var pw = document.querySelector('#txtManualPassword');" +
+                "    if (name && pw && name.offsetParent !== null) {" +
+                "      clearInterval(t);" +
+                "      setVal(name, u); setVal(pw, p);" +
+                "      var f = name.closest('form');" +
+                "      var b = f ? f.querySelector('button[type=submit]') : null;" +
+                "      if (b) b.click(); else if (f && f.requestSubmit) f.requestSubmit();" +
+                "      return;" +
+                "    }" +
+                "    var manual = document.querySelector('.btnManual');" +
+                "    if (manual && manual.offsetParent !== null && !window._jaManual) { window._jaManual = true; manual.click(); }" +
+                "  }, 400);" +
+                "})(" + u + "," + p + ");", null);
+        } catch (Throwable t) {
+            Log.w(TAG, "Jellyfin auto sign-in skipped: " + t.getMessage());
         }
     }
 

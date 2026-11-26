@@ -1,4 +1,13 @@
-What's new in 3.0.1 (stable)
+What's new in 3.0.2 (stable)
+- Backups now include the Jellyfin libraries (root folder), plugins and artwork. Before, only jellyfin.db was saved, so a restored Jellyfin had no libraries and looked empty. Make a NEW backup to get them (old app: update to 2.1.2 first).
+- Restore waits until every service has really stopped before writing, removes stale database journals, then restarts Jellyarr so the restored settings and account are used. After a restore every service is checked again with the account.
+- Sign-in: opening Sonarr, Radarr or Prowlarr inside the app signs in with the unified account, and the Jellyfin web screen fills in and submits its login form for you.
+- Transmission installs again: an outdated miniupnpc package pin was fixed, and the package index lookup also works when only the plain index is available.
+- Service screens from the side menu (Library, Sonarr, Radarr, Transmission, Prowlarr) show "Not installed, tap to install" or "Not running, tap to start" instead of empty settings, and open by themselves once the service is ready.
+- Settings: tapping Settings in the bottom bar inside a section scrolls to the top; tapping it again goes back to the list.
+- Backups no longer include the Sonarr / Radarr / Prowlarr log databases (tens of MB each).
+
+From 3.0.1:
 - Restore fixed: backups whose Jellyfin library has names with accented letters (for example "Iva Šebková") were refused with "SQLite integrity check failed ... missing from index IX_Peoples_NameLower". The database was healthy: Android's SQLite lowercases accented letters differently from Jellyfin's own SQLite. The check now refuses only real damage, so these backups restore normally.
 
 From 3.0.0:

@@ -30,6 +30,8 @@ public class JellyarrApplication extends TermuxApplication {
         Log.i(TAG, "Initializing Jellyarr standalone media server application");
 
         try { UpdateNotifier.schedule(context); } catch (Throwable ignored) {}
+        // After a restore every service is checked again with the restored account (statuses in the backup are stale).
+        try { UnifiedAccount.afterRestoreIfNeeded(context); } catch (Throwable ignored) {}
         // Must run before the media folders are scaffolded and before any service starts.
         MediaRootMigration.run(context);
         try {

@@ -1139,6 +1139,10 @@ public final class JellyarrActivity extends AppCompatActivity
                 toggleSideDrawer();
                 return;
             }
+            if (activeTab == tabIndex) {
+                onNavTabReselected(tabIndex);
+                return;
+            }
             if (activeTab != tabIndex) {
                 final long t0 = SystemClock.elapsedRealtime();
                 activeTab = tabIndex;
@@ -1174,6 +1178,22 @@ public final class JellyarrActivity extends AppCompatActivity
         tab.addView(labelView, lp);
 
         parent.addView(tab, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+    }
+
+    /**
+     * Tapping the item of the screen you are on: inside a Settings section the first tap scrolls to the top and the
+     * next one goes back to the Settings list; on the list itself it scrolls to the top.
+     */
+    private void onNavTabReselected(int tabIndex) {
+        if (tabIndex != 3) return;
+        if (settingsSectionOpen && settingsDetailScroll != null) {
+            if (settingsDetailScroll.getScrollY() > 0) settingsDetailScroll.smoothScrollTo(0, 0);
+            else closeSettingsSection();
+            return;
+        }
+        if (settingsMenu != null && settingsMenu.getParent() instanceof ScrollView) {
+            ((ScrollView) settingsMenu.getParent()).smoothScrollTo(0, 0);
+        }
     }
 
     private void updateBottomNavSelection() {
@@ -1247,6 +1267,156 @@ public final class JellyarrActivity extends AppCompatActivity
         I18n.attach(v);
     }
 
+    // -- Service gate: a service screen opened while its service is missing or stopped -----------------
+
+    private LinearLayout serviceGateView;
+    private String serviceGateKey = "";
+    private final Runnable serviceGatePoll = this::updateServiceGate;
+
+    private static String serviceIdForTab(int tab) {
+        if (tab == 5) return "jellyfin";
+        if (tab == 6) return "sonarr";
+        if (tab == TAB_RADARR) return "radarr";
+        if (tab == TAB_TRANSMISSION) return "transmission";
+        if (tab == TAB_PROWLARR) return "prowlarr";
+        return null;
+    }
+
+    private View serviceTabViewFor(int tab) {
+        if (tab == 5) return cachedLibraryView;
+        if (tab == 6) return cachedSonarrView;
+        if (tab == TAB_RADARR) return cachedRadarrView;
+        if (tab == TAB_TRANSMISSION) return cachedTransmissionView;
+        if (tab == TAB_PROWLARR) return cachedProwlarrView;
+        return null;
+    }
+
+    /** 0 = ready, 1 = not installed, 2 = stopped, 3 = starting, 4 = blocked. */
+    private int serviceGateState(String sid) {
+        try {
+            if ("jellyfin".equals(sid)) {
+                JellyfinController.State js = controller != null ? controller.getState() : JellyfinController.State.STOPPED;
+                if (js == JellyfinController.State.RUNNING) return 0;
+                if (js == JellyfinController.State.STARTING || js == JellyfinController.State.INITIALIZING) return 3;
+                return 2;
+            }
+            ManagedService svc = MediaServiceManager.getInstance(this).getService(sid);
+            if (svc == null) return 1;
+            if (svc.isBlocked()) return 4;
+            if (!svc.isInstalled()) return 1;
+            if (svc.isRunning()) return 0;
+            if (svc.isStarting() || svc.getState() == com.jellyarr.app.model.ServiceState.RECOVERING) return 3;
+            return 2;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /**
+     * A service screen only shows its settings while the service is installed and running. Otherwise it shows one
+     * clear message with the action that fixes it: install, or start. The screen comes back by itself once ready.
+     */
+    private void updateServiceGate() {
+        mainHandler.removeCallbacks(serviceGatePoll);
+        if (contentContainer == null) return;
+        String sid = serviceIdForTab(activeTab);
+        boolean overlay = setupOverlayView != null && setupOverlayView.getVisibility() == View.VISIBLE;
+        int state = (sid == null || overlay) ? 0 : serviceGateState(sid);
+        View tabView = serviceTabViewFor(activeTab);
+        if (state == 0) {
+            boolean wasGated = serviceGateView != null && serviceGateView.getVisibility() == View.VISIBLE;
+            if (serviceGateView != null) serviceGateView.setVisibility(View.GONE);
+            serviceGateKey = "";
+            if (sid != null && tabView != null && !overlay) {
+                tabView.setVisibility(View.VISIBLE);
+                if (wasGated) {
+                    if (activeTab == 5 && libraryTabView != null) libraryTabView.refresh();
+                    else if (activeTab == 6 && sonarrTabView != null) sonarrTabView.refresh();
+                    else if (activeTab == TAB_RADARR && radarrTabView != null) radarrTabView.refresh();
+                    else if (activeTab == TAB_TRANSMISSION && transmissionTabView != null) transmissionTabView.refresh();
+                    else if (activeTab == TAB_PROWLARR && prowlarrTabView != null) prowlarrTabView.refresh();
+                }
+            }
+            return;
+        }
+        if (tabView != null) tabView.setVisibility(View.GONE);
+        if (serviceGateView == null) {
+            serviceGateView = UiKit.column(this);
+            serviceGateView.setGravity(Gravity.CENTER);
+            serviceGateView.setBackgroundColor(getBgColor());
+            serviceGateView.setClickable(true);
+            int idx = setupOverlayView != null ? contentContainer.indexOfChild(setupOverlayView) : -1;
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1, -1);
+            if (idx >= 0) contentContainer.addView(serviceGateView, idx, lp); else contentContainer.addView(serviceGateView, lp);
+        }
+        serviceGateView.setVisibility(View.VISIBLE);
+        serviceGateView.bringToFront();
+        if (setupOverlayView != null) setupOverlayView.bringToFront();
+        serviceGateView.setPadding(dp(32), dp(24), dp(32), floatingNavInset() + dp(24));
+
+        String key = sid + ":" + state;
+        if (!key.equals(serviceGateKey)) {
+            serviceGateKey = key;
+            serviceGateView.removeAllViews();
+            ManagedService gs = "jellyfin".equals(sid) ? null : MediaServiceManager.getInstance(this).getService(sid);
+            String name = gs != null ? gs.getDisplayName()
+                    : sid.substring(0, 1).toUpperCase(Locale.ROOT) + sid.substring(1);
+
+            ImageView logo = new ImageView(this);
+            logo.setImageResource(getServiceIconRes(sid));
+            logo.setAlpha(state == 3 ? 1f : 0.55f);
+            serviceGateView.addView(logo, new LinearLayout.LayoutParams(dp(64), dp(64)));
+
+            TextView title = UiKit.title(this, name);
+            title.setGravity(Gravity.CENTER);
+            title.setPadding(0, dp(16), 0, dp(6));
+            serviceGateView.addView(title, new LinearLayout.LayoutParams(-2, -2));
+
+            String msg;
+            if (state == 1) msg = I18n.tr("Not installed. Tap to install it.");
+            else if (state == 2) msg = I18n.tr("Not running. Tap to start it.");
+            else if (state == 3) msg = I18n.tr("Starting… this screen opens by itself when it is ready.");
+            else msg = I18n.tr("This service is not compatible with this phone.");
+            TextView body = UiKit.body(this, msg);
+            body.setGravity(Gravity.CENTER);
+            serviceGateView.addView(body, new LinearLayout.LayoutParams(-2, -2));
+
+            if (state == 3) {
+                ProgressBar pb = new ProgressBar(this);
+                pb.setIndeterminate(true);
+                pb.setIndeterminateTintList(ColorStateList.valueOf(AppTheme.accent()));
+                LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(dp(28), dp(28));
+                plp.topMargin = dp(20);
+                serviceGateView.addView(pb, plp);
+            } else if (state == 1 || state == 2) {
+                final String id = sid;
+                Button action = UiKit.primary(this, buttonLabel(state == 1 ? "INSTALL" : "START"), v -> {
+                    if (state == 1) {
+                        ManagedService svc = MediaServiceManager.getInstance(this).getService(id);
+                        if (svc != null) showServiceInstallCompatibilityDialog(svc);
+                    } else if ("jellyfin".equals(id)) {
+                        triggerServerAction(JellyfinServerService.ACTION_START);
+                    } else {
+                        MediaServiceManager.getInstance(this).startService(id);
+                    }
+                    mainHandler.postDelayed(this::updateServiceGate, 600);
+                });
+                LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(200), dp(44));
+                blp.topMargin = dp(20);
+                serviceGateView.addView(action, blp);
+                serviceGateView.setOnClickListener(v -> action.performClick());
+            }
+            I18n.attach(serviceGateView);
+        }
+        if (state == 1 || state == 2) {
+            // the whole screen is the button; keep watching in case the service is started elsewhere
+            mainHandler.postDelayed(serviceGatePoll, 2500);
+        } else {
+            serviceGateView.setOnClickListener(null);
+            mainHandler.postDelayed(serviceGatePoll, 1200);
+        }
+    }
+
     private int prebuildStep = 0;
 
     /** After start-up, builds the remaining service screens one at a time while the UI is idle. */
@@ -1295,6 +1465,7 @@ public final class JellyarrActivity extends AppCompatActivity
             cachedPlaceholderView.setVisibility(ph ? View.VISIBLE : View.GONE);
             if (ph) showPlaceholderFor(activeTab);
         }
+        updateServiceGate();
 
         if (activeTab == 0) {
             refreshLanAddress();
@@ -7526,7 +7697,7 @@ public final class JellyarrActivity extends AppCompatActivity
         TERMUX_POOL_MAP.put("transmission", "pool/main/t/transmission/transmission_4.1.4_aarch64.deb");
         TERMUX_POOL_MAP.put("libpsl", "pool/main/libp/libpsl/libpsl_0.23.3_aarch64.deb");
         TERMUX_POOL_MAP.put("libidn2", "pool/main/libi/libidn2/libidn2_2.3.8-1_aarch64.deb");
-        TERMUX_POOL_MAP.put("miniupnpc", "pool/main/m/miniupnpc/miniupnpc_2.3.3-1_aarch64.deb");
+        TERMUX_POOL_MAP.put("miniupnpc", "pool/main/m/miniupnpc/miniupnpc_2.3.5_aarch64.deb");
         TERMUX_POOL_MAP.put("natpmpc", "pool/main/n/natpmpc/natpmpc_20230423-2_aarch64.deb");
         TERMUX_POOL_MAP.put("libc++", "pool/main/libc/libc++/libc++_30_aarch64.deb");
         TERMUX_POOL_MAP.put("7zip", "pool/main/7/7zip/7zip_26.06_aarch64.deb");
@@ -7584,7 +7755,9 @@ public final class JellyarrActivity extends AppCompatActivity
         if (pkgName == null || pkgName.trim().isEmpty()) return null;
         String targetPkg = pkgName.trim().toLowerCase(Locale.ROOT);
         for (String mirror : TERMUX_MIRRORS) {
-            String pkgsUrl = mirror + "dists/stable/main/binary-aarch64/Packages.gz";
+          for (String idx : new String[]{"Packages.gz", "Packages"}) {
+            String pkgsUrl = mirror + "dists/stable/main/binary-aarch64/" + idx;
+            final boolean gz = idx.endsWith(".gz");
             try {
                 URL url = new URL(pkgsUrl);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -7592,16 +7765,20 @@ public final class JellyarrActivity extends AppCompatActivity
                 conn.setReadTimeout(30000);
                 conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
                 if (conn.getResponseCode() == 200) {
-                    try (java.util.zip.GZIPInputStream gzis = new java.util.zip.GZIPInputStream(new BufferedInputStream(conn.getInputStream(), 65536))) {
-                        String match = parseDebFilenameFromPackages(gzis, targetPkg);
+                    InputStream raw = new BufferedInputStream(conn.getInputStream(), 65536);
+                    try (InputStream in = gz ? new java.util.zip.GZIPInputStream(raw) : raw) {
+                        String match = parseDebFilenameFromPackages(in, targetPkg);
                         if (match != null) {
                             return match;
                         }
                     }
+                } else {
+                    conn.disconnect();
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "Dynamic deb lookup from " + pkgsUrl + " failed for " + pkgName + ": " + t.getMessage());
             }
+          }
         }
         return null;
     }
@@ -11780,7 +11957,7 @@ public final class JellyarrActivity extends AppCompatActivity
         info.setText("Successfully restored configuration files:\n\n"
                 + "• Preferences: " + prefsCount + " files\n"
                 + "• Service Configs: " + configsCount + " files\n\n"
-                + "To ensure all running daemons reload their restored configuration and credentials, please restart services.");
+                + "Jellyarr restarts now so every service and screen uses the restored settings and accounts.");
         info.setTextSize(11.5f);
         info.setTextColor(AppTheme.text());
         info.setLineSpacing(dp(2), 1.15f);
@@ -11788,21 +11965,17 @@ public final class JellyarrActivity extends AppCompatActivity
         box.addView(info);
 
         Button btnRestart = new Button(this);
-        btnRestart.setText("RESTART SERVICES NOW");
+        btnRestart.setText("RESTART JELLYARR");
         btnRestart.setTextSize(11f);
         btnRestart.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         btnRestart.setTextColor(AppTheme.card());
         btnRestart.setBackground(createBorderedRoundedDrawable(Color.parseColor("#55A9A0"), Color.parseColor("#55A9A0"), 0, dp(8)));
+        d.setCancelable(false);
         btnRestart.setOnClickListener(v -> {
             d.dismiss();
-            triggerServerAction(JellyfinServerService.ACTION_STOP_ALL);
-            mainHandler.postDelayed(() -> triggerServerAction(JellyfinServerService.ACTION_START_ALL), 1000);
-            Toast.makeText(this, I18n.tr("Restarting all services..."), Toast.LENGTH_SHORT).show();
-            mainHandler.postDelayed(() -> {
-                refreshServicesTabUI();
-                refreshHomeServicesBadge();
-                updateBackupStatusUI();
-            }, 1200);
+            // The restored preferences must be read from disk: a restart is the only way to drop the copies
+            // this process still holds (otherwise they are written back over the restored files).
+            RestartActivity.restart(this);
         });
         box.addView(btnRestart, new LinearLayout.LayoutParams(-1, dp(40)));
 
