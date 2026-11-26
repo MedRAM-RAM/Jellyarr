@@ -2,7 +2,7 @@ name: Build Bot
 
 on:
   push:
-    branches: [ main, develop, 'release/**', 'ccr-*' ]
+    branches: [ main, develop, 'release/**', 'ccr-*', 'claude/**' ]
   pull_request:
     branches: [ main, develop, 'release/**' ]
   workflow_dispatch:

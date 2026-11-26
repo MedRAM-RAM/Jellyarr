@@ -1,3 +1,5 @@
+<p align="center"><img src="art/jellyarr_logo_v11-1_dark.svg" width="112" alt="Jellyarr logo" /></p>
+
 <h1 align="center">Jellyarr</h1>
 
 <p align="center">
@@ -66,6 +68,18 @@ All services listen on the phone and on your local network only.
 5. Install the companion services from the **Media** tab and tap **SYNC STACK**.
 
 Jellyfin is then available at `http://<phone-ip>:8096` from any device on your network.
+
+### Moving from the old package (2.x)
+
+Since 3.0.0 the app id is `com.jellyarr.app` (it was `com.fishbowl.app`), so Android installs 3.0.0 as a new app and
+the old one cannot update itself to it:
+
+1. In the old app, make a backup (**Settings › Backup**) and stop all services.
+2. Install Jellyarr 3.0.0 and restore the backup when the first start offers it.
+3. Uninstall the old app.
+
+Media in `JellyarrMedia` is not touched. Paths that point inside the old app's data folder are switched to the new
+package during the restore.
 
 ## Storage layout
 

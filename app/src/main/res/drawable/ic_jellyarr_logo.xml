@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Jellyarr logo v11-1 (glyph only, white; tinted in the app, used as notification icon). Source: art/jellyarr_logo_v11-1_dark.svg -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="28dp"
+    android:height="28dp"
+    android:viewportWidth="324"
+    android:viewportHeight="324">
+    <group android:translateX="-91" android:translateY="-101">
+        <group android:scaleY="-1" android:pivotY="256">
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:strokeColor="#FFFFFFFF"
+                android:strokeWidth="28"
+                android:strokeLineJoin="round"
+                android:pathData="M152,196 L152,316 L244,256 Z" />
+            <path
+                android:strokeColor="#FFFFFFFF"
+                android:strokeWidth="36"
+                android:strokeLineCap="round"
+                android:strokeLineJoin="round"
+                android:pathData="M216,163 L356,256 L150,393" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M138,123 A18,18 0 1,0 174,123 A18,18 0 1,0 138,123 Z" />
+        </group>
+    </group>
+</vector>

@@ -1,6 +1,6 @@
 # Security Policy
 
-We prioritize the security, integrity, and privacy of **Fishbowl**. This document outlines our security architecture, supported versions, and responsible disclosure procedures.
+We prioritize the security, integrity, and privacy of **Jellyarr**. This document outlines our security architecture, supported versions, and responsible disclosure procedures.
 
 ---
 
@@ -17,7 +17,7 @@ Security fixes and compatibility updates are actively maintained on the followin
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability or sensitive flaw in Fishbowl, please do **not** open a public issue. We request that you disclose it responsibly:
+If you discover a security vulnerability or sensitive flaw in Jellyarr, please do **not** open a public issue. We request that you disclose it responsibly:
 
 ### How to Report
 1. **GitHub Security Advisory (Preferred):** Navigate to the **Security** tab of this repository and select **Report a vulnerability**.
@@ -40,7 +40,7 @@ To help us triage and resolve the issue quickly, please provide:
 
 ## Security Architecture & Invariants
 
-Fishbowl is engineered around strict security invariants to ensure user safety:
+Jellyarr is engineered around strict security invariants to ensure user safety:
 
 ### 1. Zero Telemetry & Privacy Preservation
 - **0 Remote Trackers:** No analytics SDKs (Google Analytics, Firebase, Mixpanel, etc.).
@@ -48,17 +48,17 @@ Fishbowl is engineered around strict security invariants to ensure user safety:
 - **100% Local Execution:** All database queries, user management, and metadata indexing occur strictly on-device.
 
 ### 2. Sandboxed Process Execution
-- Native .NET processes (`dotnet jellyfin.dll`), FFmpeg binaries, and SQLite engines execute exclusively within the Android application's dedicated UID sandbox (`/data/data/com.fishbowl.app/files/usr`).
+- Native .NET processes (`dotnet jellyfin.dll`), FFmpeg binaries, and SQLite engines execute exclusively within the Android application's dedicated UID sandbox (`/data/data/com.jellyarr.app/files/usr`).
 - No root access is required or requested. The application operates entirely within unprivileged user space.
 
 ### 3. SELinux & Storage Security
 - Media directory access strictly respects Android SELinux security boundaries.
-- External storage interactions are anchored to the application's guaranteed package folder (`/storage/<UUID>/Android/data/com.fishbowl.app/files`) or verified POSIX paths to prevent privilege escalation or directory traversal.
+- External storage interactions are anchored to the application's guaranteed package folder (`/storage/<UUID>/Android/data/com.jellyarr.app/files`) or verified POSIX paths to prevent privilege escalation or directory traversal.
 - Virtual cloud DocumentProviders without Linux mount points are quarantined to prevent server corruption.
 
 ### 4. Local Network & Socket Bounds
 - Kestrel web server bindings are limited to the local loopback interface (`127.0.0.1:8096`) and the device's local Wi-Fi / Tailscale subnet addresses.
-- Fishbowl does not perform automatic UPnP port opening or expose ports to public WAN interfaces without user-configured network tunnels.
+- Jellyarr does not perform automatic UPnP port opening or expose ports to public WAN interfaces without user-configured network tunnels.
 
 ### 5. Reproducible Builds & Source Auditing
 - All build configurations, ProGuard/R8 rules, and dependency manifests are fully open-source.

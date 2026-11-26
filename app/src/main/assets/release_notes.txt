@@ -1,4 +1,16 @@
-What's new in 2.1.1 (stable)
+What's new in 3.0.0 (stable)
+- The app is now fully Jellyarr: new package name (com.jellyarr.app), new name everywhere and the new Jellyarr logo.
+- IMPORTANT, moving from the old app: Android treats 3.0.0 as a new app, so the old app cannot update itself to it. In the old app make a backup (Settings > Backup), stop all services, install Jellyarr 3.0.0, restore the backup on first start, then uninstall the old app. Your media in JellyarrMedia is not touched. Paths inside restored settings and databases are switched to the new package automatically.
+- Unified account sync: Sonarr, Radarr and Prowlarr are first checked with a real sign-in. A service that already accepts the account is left alone (no new login, no password re-hash, no dropped web sessions, no restart). Only services that do not accept it yet are updated.
+- Transmission is no longer restarted when it already requires the account.
+- SYNC STACK runs one pass at a time: starts, stops and the screen no longer launch overlapping syncs, and the pass ends by signing in only the services that still need the account.
+- Radarr now checks its Transmission download client the same way as Sonarr (download folder included).
+- New Jellyarr logo (v11-1 dark) for the launcher, round and themed icons, notifications, widgets, the quick-settings tile and the TV banner.
+- New on/off switches drawn by the app: a clear 52 x 32 dp track, a round thumb that grows with a check mark when ON, smooth animation, right-to-left aware. Used in every screen.
+- Bottom bar redesigned: rounded floating surface, ripples stay inside each item, and only the newly selected item animates.
+- Buttons show a disabled state on their own.
+
+From 2.1.1:
 - Switches now light up clearly when ON (accent track, bright thumb) and dim when OFF or disabled, in every screen.
 - Faster theme changes and screens: the Library / Sonarr / Radarr / Transmission / Prowlarr screens are now built on demand in the background instead of all at start-up, and a theme change fades instead of freezing.
 - Home: the start-up progress now also covers Transmission, Prowlarr, Radarr and Sonarr, and sits at the bottom of the Services card.
@@ -139,7 +151,7 @@ From 2.0.1:
 - The app is now named Jellyarr (display name, notifications and screens). Same signing key and package, so it installs over the previous version and keeps all data.
 
 From 2.0.0 (first stable release):
-- Update notifications: Fishbowl now checks for new versions in the background and notifies you outside the app (system notification) and inside the app (pop-up).
+- Update notifications: Jellyarr now checks for new versions in the background and notifies you outside the app (system notification) and inside the app (pop-up).
 - Separate Stable and Beta update settings: choose for each channel whether to get a system notification and/or an in-app notice, and set the check interval.
 - In-app download, verification and installation of updates, straight from the notice or from Settings > Software Updates.
 - Updates now come from the Jellyarr releases (same signing key, installs over the current version).

@@ -176,12 +176,12 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "Configuring protected production release keystore from GitHub Secrets..."
-            KEYSTORE_FILE="$RUNNER_TEMP/fishbowl_release.keystore"
+            KEYSTORE_FILE="$RUNNER_TEMP/jellyarr_release.keystore"
             echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"
-            echo "FISHBOWL_RELEASE_KEYSTORE_PATH=$KEYSTORE_FILE" >> $GITHUB_ENV
-            echo "FISHBOWL_RELEASE_KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
-            echo "FISHBOWL_RELEASE_STORE_PASSWORD=$STORE_PASS" >> $GITHUB_ENV
-            echo "FISHBOWL_RELEASE_KEY_PASSWORD=$KEY_PASS" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_KEYSTORE_PATH=$KEYSTORE_FILE" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_STORE_PASSWORD=$STORE_PASS" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_KEY_PASSWORD=$KEY_PASS" >> $GITHUB_ENV
             echo "configured=true" >> $GITHUB_OUTPUT
           else
             echo "Error: FISHBOWL_RELEASE_KEYSTORE_BASE64 secret is not configured in GitHub Secrets." >&2
@@ -228,21 +228,21 @@ jobs:
       - name: Cleanup Temporary Keystore
         if: always()
         run: |
-          if [ -f "$RUNNER_TEMP/fishbowl_release.keystore" ]; then
-            shred -u "$RUNNER_TEMP/fishbowl_release.keystore" 2>/dev/null || rm -f "$RUNNER_TEMP/fishbowl_release.keystore"
+          if [ -f "$RUNNER_TEMP/jellyarr_release.keystore" ]; then
+            shred -u "$RUNNER_TEMP/jellyarr_release.keystore" 2>/dev/null || rm -f "$RUNNER_TEMP/jellyarr_release.keystore"
           fi
 
       - name: Create GitHub Release & Upload Official Assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.validate.outputs.tag }}
-          name: "Fishbowl ${{ needs.validate.outputs.tag }}"
+          name: "Jellyarr ${{ needs.validate.outputs.tag }}"
           target_commitish: ${{ needs.validate.outputs.commit_sha }}
           prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
           draft: false
           generate_release_notes: true
           body: |
-            ### Fishbowl Release ${{ needs.validate.outputs.tag }}
+            ### Jellyarr Release ${{ needs.validate.outputs.tag }}
             
             - **Version Name:** `${{ needs.validate.outputs.version_name }}`
             - **Version Code:** `${{ needs.validate.outputs.version_code }}`

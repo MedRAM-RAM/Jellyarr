@@ -1,14 +1,14 @@
 # Third-Party Licenses & Open Source Attributions
 
-Fishbowl is free software licensed under the **GNU General Public License v3.0 (GPLv3)**. See [`LICENSE`](LICENSE) for the complete license terms.
+Jellyarr is free software licensed under the **GNU General Public License v3.0 (GPLv3)**. See [`LICENSE`](LICENSE) for the complete license terms.
 
-This document provides full attribution, licensing details, and source code disclosures for all open-source libraries, runtimes, and bundled binary components included in or interfaced with Fishbowl.
+This document provides full attribution, licensing details, and source code disclosures for all open-source libraries, runtimes, and bundled binary components included in or interfaced with Jellyarr.
 
 ---
 
 ## 1. GPLv3 Section 6 — Corresponding Source Code Disclosure
 
-In accordance with Section 6 of the GNU General Public License v3.0 (*Conveying Non-Source Forms*), Fishbowl provides open access to the Corresponding Source for all bundled pre-compiled object code and binary assets:
+In accordance with Section 6 of the GNU General Public License v3.0 (*Conveying Non-Source Forms*), Jellyarr provides open access to the Corresponding Source for all bundled pre-compiled object code and binary assets:
 
 | Bundled Binary Component | Version / Build | Upstream Source Repository | Upstream License |
 | :--- | :--- | :--- | :--- |
@@ -39,7 +39,7 @@ In accordance with Section 6 of the GNU General Public License v3.0 (*Conveying 
 - **Copyright:** (c) 2018–2026 Jellyfin Contributors
 - **License:** GNU General Public License v3.0 (GPLv3)
 - **Website:** <https://jellyfin.org>
-- **Notice:** Fishbowl is an independent, unofficial community project. It is not affiliated with, endorsed by, maintained by, or sponsored by the official Jellyfin Project.
+- **Notice:** Jellyarr is an independent, unofficial community project. It is not affiliated with, endorsed by, maintained by, or sponsored by the official Jellyfin Project.
 
 ### Servarr Automation Stack (Radarr, Sonarr, Prowlarr)
 - **Copyright:** (c) 2010–2026 Sonarr, Radarr, and Prowlarr Contributors
@@ -56,7 +56,13 @@ In accordance with Section 6 of the GNU General Public License v3.0 (*Conveying 
 - **Copyright:** (c) Fredrik Fornwall and Termux Contributors
 - **License:** GNU General Public License v3.0 (GPLv3), with modules under MIT and Apache 2.0
 - **Source:** <https://github.com/termux/termux-app>
-- **Notice:** Fishbowl incorporates modified components from the Termux project for POSIX process management and terminal session handling. Termux is a trademark of its respective authors.
+- **Notice:** Jellyarr incorporates modified components from the Termux project for POSIX process management and terminal session handling. Termux is a trademark of its respective authors.
+
+### Fishbowl (upstream project)
+- **Copyright:** (c) Sujal Achari and Fishbowl contributors
+- **License:** GNU General Public License v3.0 (GPLv3)
+- **Source:** <https://github.com/Suz41/Fishbowl>
+- **Notice:** Jellyarr began as a derivative of Fishbowl and has since evolved into an independent project. The original copyright and license notices are retained.
 
 ### Terminal Emulator for Android
 - **Copyright:** (c) 2011–2016 Jack Palevich
@@ -118,8 +124,8 @@ In accordance with Section 6 of the GNU General Public License v3.0 (*Conveying 
 
 ## 3. Trademark Disclaimers
 
-- **Jellyfin:** "Jellyfin" is a trademark of the Jellyfin Project. Any use of the Jellyfin name within Fishbowl is solely for descriptive purposes to indicate software compatibility and interoperability under nominative fair use.
-- **Termux:** "Termux" is a trademark of the Termux Project. Fishbowl is an independent derivative work not affiliated with or endorsed by Termux.
+- **Jellyfin:** "Jellyfin" is a trademark of the Jellyfin Project. Any use of the Jellyfin name within Jellyarr is solely for descriptive purposes to indicate software compatibility and interoperability under nominative fair use.
+- **Termux:** "Termux" is a trademark of the Termux Project. Jellyarr is an independent derivative work not affiliated with or endorsed by Termux.
 - **Android, Google Play:** Android is a trademark of Google LLC.
 - All other trademarks and registered trademarks are the property of their respective owners.
 
@@ -135,11 +141,11 @@ IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING WILL ANY C
 
 ## 5. Lawful Media & Anti-Piracy Policy
 
-Fishbowl is an open-source Android hosting environment designed exclusively for private homelab infrastructure and personal media server administration.
+Jellyarr is an open-source Android hosting environment designed exclusively for private homelab infrastructure and personal media server administration.
 
-- Fishbowl does not host, stream, distribute, or index any copyrighted content, torrents, magnet links, or proprietary media streams.
+- Jellyarr does not host, stream, distribute, or index any copyrighted content, torrents, magnet links, or proprietary media streams.
 - Bundled and interfaced companion utilities (such as Transmission, Radarr, Sonarr, and Prowlarr) are modular, open-source software packages intended solely for lawful personal workflows, including managing self-owned backups, personal home videos, Creative Commons assets, and public-domain media.
-- The project maintainers expressly disclaim any and all liability for unauthorized or illegal use of this software. End users are solely responsible for ensuring that their use of Fishbowl complies with all relevant local, national, and international copyright and telecommunications laws.
+- The project maintainers expressly disclaim any and all liability for unauthorized or illegal use of this software. End users are solely responsible for ensuring that their use of Jellyarr complies with all relevant local, national, and international copyright and telecommunications laws.
 
 ---
 

@@ -25,8 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      FISHBOWL_VERSION_CODE: ${{ vars.FISHBOWL_VERSION_CODE || '101461' }}
-      FISHBOWL_VERSION_NAME: ${{ vars.FISHBOWL_VERSION_NAME || '2.1.1' }}
+      JELLYARR_VERSION_CODE: ${{ vars.JELLYARR_VERSION_CODE || vars.FISHBOWL_VERSION_CODE || '103000' }}
+      JELLYARR_VERSION_NAME: ${{ vars.JELLYARR_VERSION_NAME || vars.FISHBOWL_VERSION_NAME || '3.0.0' }}
 
     steps:
       - name: Checkout
@@ -94,7 +94,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: fishbowl-debug-apk
+          name: jellyarr-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
 
@@ -103,13 +103,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           APK=$(ls -1 app/build/outputs/apk/debug/*.apk | head -n 1)
-          TAG="build-${GITHUB_RUN_NUMBER}-${FISHBOWL_VERSION_NAME}"
+          TAG="build-${GITHUB_RUN_NUMBER}-${JELLYARR_VERSION_NAME}"
           SHA=$(sha256sum "$APK" | cut -d' ' -f1)
           echo "${SHA}  $(basename "$APK")" > "${APK}.sha256"
           {
             cat app/src/main/assets/release_notes.txt
             echo
-            echo "versionCode: ${FISHBOWL_VERSION_CODE}"
+            echo "versionCode: ${JELLYARR_VERSION_CODE}"
             echo "sha256: ${SHA}"
           } > /tmp/release_body.md
           FLAGS="--prerelease"
@@ -117,5 +117,5 @@ jobs:
           gh release create "$TAG" "$APK" "${APK}.sha256" \
             --target "$GITHUB_SHA" \
             $FLAGS \
-            --title "Jellyarr ${FISHBOWL_VERSION_NAME} (build ${GITHUB_RUN_NUMBER})" \
+            --title "Jellyarr ${JELLYARR_VERSION_NAME} (build ${GITHUB_RUN_NUMBER})" \
             --notes-file /tmp/release_body.md
