@@ -5,6 +5,7 @@ What's new in 3.0.0 (stable)
 - Transmission is no longer restarted when it already requires the account.
 - SYNC STACK runs one pass at a time: starts, stops and the screen no longer launch overlapping syncs, and the pass ends by signing in only the services that still need the account.
 - Radarr now checks its Transmission download client the same way as Sonarr (download folder included).
+- New Jellyarr logo (v11-1 dark) for the launcher, round and themed icons, notifications, widgets, the quick-settings tile and the TV banner.
 - New on/off switches drawn by the app: a clear 52 x 32 dp track, a round thumb that grows with a check mark when ON, smooth animation, right-to-left aware. Used in every screen.
 - Bottom bar redesigned: rounded floating surface, ripples stay inside each item, and only the newly selected item animates.
 - Buttons show a disabled state on their own.

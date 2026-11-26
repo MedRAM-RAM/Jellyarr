@@ -1,3 +1,5 @@
+<p align="center"><img src="art/jellyarr_logo_v11-1_dark.svg" width="112" alt="Jellyarr logo" /></p>
+
 <h1 align="center">Jellyarr</h1>
 
 <p align="center">

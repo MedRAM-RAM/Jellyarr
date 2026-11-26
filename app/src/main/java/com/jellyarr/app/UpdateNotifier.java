@@ -190,7 +190,7 @@ public final class UpdateNotifier {
             PendingIntent pi = PendingIntent.getActivity(ctx, 7403, open, flags);
             Notification.Builder b = Build.VERSION.SDK_INT >= 26
                     ? new Notification.Builder(ctx, NOTIF_CHANNEL_ID) : new Notification.Builder(ctx);
-            b.setSmallIcon(R.drawable.ic_service_notification)
+            b.setSmallIcon(R.drawable.ic_jellyarr_logo)
                     .setContentTitle("Update downloaded")
                     .setContentText("v" + l.name + " is ready - tap to install")
                     .setContentIntent(pi)
@@ -217,7 +217,7 @@ public final class UpdateNotifier {
             String label = UpdateManager.CHANNEL_STABLE.equals(ch) ? "Stable" : "Beta";
             Notification.Builder b = Build.VERSION.SDK_INT >= 26
                     ? new Notification.Builder(ctx, NOTIF_CHANNEL_ID) : new Notification.Builder(ctx);
-            b.setSmallIcon(R.drawable.ic_service_notification)
+            b.setSmallIcon(R.drawable.ic_jellyarr_logo)
                     .setContentTitle("Jellyarr update available (" + label + ")")
                     .setContentText("v" + l.name + " - tap to see what's new and install")
                     .setStyle(new Notification.BigTextStyle().bigText("v" + l.name + "\n" + l.notes))

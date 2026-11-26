@@ -48,7 +48,7 @@ public class ToggleSwitch extends Switch {
     }
 
     @Override
-    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+    public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         // 48 dp tall touch target around the 32 dp track
         int w = (int) Math.ceil(TRACK_W * d) + getPaddingLeft() + getPaddingRight();
         int h = (int) Math.ceil(48f * d) + getPaddingTop() + getPaddingBottom();

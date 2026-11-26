@@ -340,13 +340,13 @@ public class JellyfinServerService extends Service implements JellyfinController
                     shortText = (bMsg != null && !bMsg.isEmpty()) ? bMsg : "Configuring server environment...";
                     expandedText = shortText;
                     subText = displayPct + "%";
-                    iconRes = R.drawable.ic_notification_jellyfin;
+                    iconRes = R.drawable.ic_jellyarr_logo;
                 } else if (isStarting && !anyRunning) {
                     title = "Jellyfin Server";
                     shortText = "Starting server...";
                     expandedText = "Starting server...";
                     subText = "Starting";
-                    iconRes = R.drawable.ic_notification_jellyfin;
+                    iconRes = R.drawable.ic_jellyarr_logo;
                 } else if (jfRunning) {
                     title = "Jellyfin Server";
                     shortText = fullUrl;
@@ -357,7 +357,7 @@ public class JellyfinServerService extends Service implements JellyfinController
                         subText = "Online";
                         expandedText = fullUrl;
                     }
-                    iconRes = R.drawable.ic_notification_jellyfin;
+                    iconRes = R.drawable.ic_jellyarr_logo;
                 } else {
                     // Only companions are running; Jellyfin is stopped
                     title = "Jellyarr Services";
@@ -377,7 +377,7 @@ public class JellyfinServerService extends Service implements JellyfinController
                 releaseLocks();
                 String err = (controller != null && controller.getLastError() != null) ? controller.getLastError() : "Server stopped unexpectedly";
                 String title = (jfState == JellyfinController.State.CRASH_LOOP) ? "Jellyfin: Crash Loop" : "Jellyfin: Server Error";
-                Notification failNotif = buildNotification(title, err, err, "Error", R.drawable.ic_notification_jellyfin, false, false, false, true);
+                Notification failNotif = buildNotification(title, err, err, "Error", R.drawable.ic_jellyarr_logo, false, false, false, true);
                 promoteToForeground(failNotif);
                 com.jellyarr.app.widget.JellyarrWidgetProvider.updateAllWidgets(getApplicationContext());
                 com.jellyarr.app.widget.JellyarrServicesWidgetProvider.updateAllWidgets(getApplicationContext());
@@ -484,16 +484,16 @@ public class JellyfinServerService extends Service implements JellyfinController
     // -- Notification helpers --------------------------------------------------
 
     private Notification buildNotification(String title, String text, boolean isRunning) {
-        return buildNotification(title, text, null, isRunning ? "Online" : "Starting", R.drawable.ic_notification_jellyfin, isRunning, isRunning, false, false);
+        return buildNotification(title, text, null, isRunning ? "Online" : "Starting", R.drawable.ic_jellyarr_logo, isRunning, isRunning, false, false);
     }
 
     private Notification buildNotification(String title, String shortText, String expandedText, boolean isRunning) {
-        return buildNotification(title, shortText, expandedText, isRunning ? "Online" : "Starting", R.drawable.ic_notification_jellyfin, isRunning, isRunning, false, false);
+        return buildNotification(title, shortText, expandedText, isRunning ? "Online" : "Starting", R.drawable.ic_jellyarr_logo, isRunning, isRunning, false, false);
     }
 
     private Notification buildNotification(String title, String shortText, String expandedText, boolean isRunning, boolean isInitializing, boolean isFailed) {
         String subText = isFailed ? "Error" : (isInitializing ? "Installing" : (isRunning ? "Online" : "Starting"));
-        return buildNotification(title, shortText, expandedText, subText, R.drawable.ic_notification_jellyfin, isRunning, isRunning, isInitializing, isFailed);
+        return buildNotification(title, shortText, expandedText, subText, R.drawable.ic_jellyarr_logo, isRunning, isRunning, isInitializing, isFailed);
     }
 
     private Notification buildNotification(String title, String shortText, String expandedText, String subText, int iconRes, boolean isJfRunning, boolean isAnyRunning, boolean isInitializing, boolean isFailed) {
@@ -512,7 +512,7 @@ public class JellyfinServerService extends Service implements JellyfinController
         NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(shortText)
-                .setSmallIcon(iconRes != 0 ? iconRes : R.drawable.ic_notification_jellyfin)
+                .setSmallIcon(iconRes != 0 ? iconRes : R.drawable.ic_jellyarr_logo)
                 .setContentIntent(openPi)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
