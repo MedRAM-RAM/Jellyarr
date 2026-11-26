@@ -66,6 +66,13 @@
             </intent-filter>
         </activity>
         <activity
+            android:name="com.jellyarr.app.RestartActivity"
+            android:exported="false"
+            android:process=":restart"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity
             android:name="com.jellyarr.app.JellyfinStorageActivity"
             android:exported="false"
             android:label="Media Storage"

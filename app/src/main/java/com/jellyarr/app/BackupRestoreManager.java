@@ -115,6 +115,50 @@ public final class BackupRestoreManager {
         return changed;
     }
 
+    private static final int[] SERVICE_PORTS = {8096, 8989, 7878, 9696, 9091};
+
+    private static boolean anyServicePortOpen() {
+        for (int port : SERVICE_PORTS) {
+            try (java.net.Socket sk = new java.net.Socket()) {
+                sk.connect(new java.net.InetSocketAddress("127.0.0.1", port), 400);
+                return true;
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private static void waitForServicesStopped(RestoreCallback callback, long timeoutMs) {
+        long end = System.currentTimeMillis() + timeoutMs;
+        boolean told = false;
+        while (anyServicePortOpen() && System.currentTimeMillis() < end) {
+            if (!told) {
+                postProgress(callback, "Waiting for the services to stop...");
+                told = true;
+            }
+            try { Thread.sleep(700); } catch (InterruptedException e) { return; }
+        }
+        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+    }
+
+    /**
+     * For every database in the backup that comes without its -wal / -shm, removes the live -wal / -shm next to the
+     * target: SQLite would otherwise replay the old journal over the restored database.
+     */
+    static void dropStaleWal(File staging, File target) {
+        File[] kids = staging.listFiles();
+        if (kids == null) return;
+        for (File k : kids) {
+            if (k.isDirectory()) {
+                dropStaleWal(k, new File(target, k.getName()));
+            } else if (k.getName().endsWith(".db")) {
+                if (!new File(staging, k.getName() + "-wal").exists()) {
+                    new File(target, k.getName() + "-wal").delete();
+                    new File(target, k.getName() + "-shm").delete();
+                }
+            }
+        }
+    }
+
     /** Jellyarr backup archive (current name, or the name older builds wrote). */
     static boolean isOwnBackupName(String name) {
         if (name == null) return false;
@@ -301,6 +345,20 @@ public final class BackupRestoreManager {
                         totalCount += stageConfigDir(jfDataDir, stagingJfData, "jellyfin_data", itemsArray);
                     } catch (Throwable jfEx) {
                         Log.w(TAG, "Jellyfin data staging problem: " + jfEx.getMessage());
+                    }
+                }
+
+                // 2c. Jellyfin libraries (root/default/<library>), plugins and artwork (metadata). Without root the
+                // restored server has no libraries and looks empty even though jellyfin.db came back.
+                File jfShare = new File(homeDir, ".local/share/jellyfin");
+                for (String sub : JELLYFIN_SHARE_DIRS) {
+                    File src = new File(jfShare, sub);
+                    if (!src.isDirectory()) continue;
+                    postProgress(callback, "Backing up Jellyfin " + sub + "...");
+                    try {
+                        totalCount += stageAllFiles(src, new File(stagingDir, "jellyfin_share/" + sub), "jellyfin_share/" + sub, itemsArray, 0);
+                    } catch (Throwable shareEx) {
+                        Log.w(TAG, "Jellyfin " + sub + " staging problem: " + shareEx.getMessage());
                     }
                 }
 
@@ -493,6 +551,43 @@ public final class BackupRestoreManager {
     /**
      * Recursively stages config files filtering out large caches/logs.
      */
+    /** Jellyfin data folders (under ~/.local/share/jellyfin) kept in a backup besides data/. */
+    static final String[] JELLYFIN_SHARE_DIRS = {"root", "plugins", "metadata"};
+
+    /** Copies every regular file (any type) under source; symbolic links are skipped. */
+    private static int stageAllFiles(File source, File dest, String relativeParent, org.json.JSONArray itemsArray, int depth) {
+        int count = 0;
+        if (depth > 32) return 0;
+        File[] files = source.listFiles();
+        if (files == null) return 0;
+        for (File f : files) {
+            try {
+                if (java.nio.file.Files.isSymbolicLink(f.toPath())) continue;
+            } catch (Throwable ignored) {}
+            if (f.isDirectory()) {
+                count += stageAllFiles(f, new File(dest, f.getName()), relativeParent + "/" + f.getName(), itemsArray, depth + 1);
+            } else if (f.isFile()) {
+                try {
+                    if (!dest.exists()) dest.mkdirs();
+                    File destFile = new File(dest, f.getName());
+                    copyFile(f, destFile);
+                    count++;
+                    if (itemsArray != null) {
+                        JSONObject itemObj = new JSONObject();
+                        itemObj.put("path", relativeParent + "/" + f.getName());
+                        itemObj.put("size", destFile.length());
+                        itemObj.put("sha256", computeSHA256(destFile));
+                        itemObj.put("component", "jellyfin");
+                        itemsArray.put(itemObj);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "Failed to stage " + f.getName() + ": " + t.getMessage());
+                }
+            }
+        }
+        return count;
+    }
+
     private static int stageConfigDir(File source, File dest, String relativeParent, org.json.JSONArray itemsArray) {
         int count = 0;
         File[] files = source.listFiles();
@@ -501,6 +596,7 @@ public final class BackupRestoreManager {
         for (File f : files) {
             String nameLower = f.getName().toLowerCase(Locale.ROOT);
             if (IGNORED_NAMES.contains(nameLower)) continue;
+            if (nameLower.startsWith("logs.db")) continue;
 
             if (f.isDirectory()) {
                 File subDest = new File(dest, f.getName());
@@ -600,6 +696,9 @@ public final class BackupRestoreManager {
                 } catch (Throwable t) {
                     Log.w(TAG, "Service quiesce note: " + t.getMessage());
                 }
+                // Stopping is asynchronous: a service still running would write its own database over the restored
+                // one (or keep a WAL that replays old data), so wait until every port is really closed.
+                waitForServicesStopped(callback, 60000L);
 
                 // 4. Create Pre-Restore Snapshot for automatic rollback on error
                 postProgress(callback, "Creating pre-restore recovery snapshot...");
@@ -642,11 +741,29 @@ public final class BackupRestoreManager {
                 if (stagingConfig.exists() && stagingConfig.isDirectory()) {
                     File targetConfig = new File(TermuxConstants.TERMUX_HOME_DIR, ".config");
                     if (!targetConfig.exists()) targetConfig.mkdirs();
+                    dropStaleWal(stagingConfig, targetConfig);
                     configCount = copyDirectory(stagingConfig, targetConfig);
                     rewriteOldPackagePaths(targetConfig, context.getPackageName());
                 }
+                try { new File(context.getFilesDir(), UnifiedAccount.RESTORE_MARKER).createNewFile(); } catch (Throwable ignored) {}
                 File restoredPrefs = new File(context.getApplicationInfo().dataDir, "shared_prefs");
                 rewriteOldPackagePaths(restoredPrefs, context.getPackageName());
+
+                // 6a. Restore Jellyfin libraries, plugins and artwork (replaces what a fresh install created)
+                File stagingShare = new File(stagingDir, "jellyfin_share");
+                if (stagingShare.isDirectory()) {
+                    postProgress(callback, "Restoring Jellyfin libraries and artwork...");
+                    File targetShare = new File(TermuxConstants.TERMUX_HOME_DIR, ".local/share/jellyfin");
+                    for (String sub : JELLYFIN_SHARE_DIRS) {
+                        File src = new File(stagingShare, sub);
+                        if (!src.isDirectory()) continue;
+                        File dst = new File(targetShare, sub);
+                        if ("root".equals(sub)) deleteRecursively(dst);
+                        if (!dst.exists()) dst.mkdirs();
+                        configCount += copyDirectory(src, dst);
+                        if (!"metadata".equals(sub)) rewriteOldPackagePaths(dst, context.getPackageName());
+                    }
+                }
 
                 // 6b. Restore Jellyfin User Database & Data
                 File stagingJfData = new File(stagingDir, "jellyfin_data");
