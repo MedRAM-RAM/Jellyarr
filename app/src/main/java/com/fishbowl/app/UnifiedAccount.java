@@ -71,14 +71,14 @@ public final class UnifiedAccount {
 
     public static void save(Context c, String user, String pass) {
         SharedPreferences.Editor e = sp(c).edit().putString(K_USER, user).putString(K_PASS, pass);
-        for (String s : SERVICES) e.putString("status_" + s, "pending").remove("msg_" + s);
+        for (String s : SERVICES) e.putString("status_" + s, "pending").remove("msg_" + s).remove("sig_" + s);
         e.apply();
     }
 
     /** Forgets the stored account (services keep whatever login they already have). */
     public static void clear(Context c) {
         SharedPreferences.Editor e = sp(c).edit().remove(K_USER).remove(K_PASS);
-        for (String s : SERVICES) e.remove("status_" + s).remove("msg_" + s);
+        for (String s : SERVICES) e.remove("status_" + s).remove("msg_" + s).remove("sig_" + s);
         e.apply();
     }
 
@@ -132,6 +132,20 @@ public final class UnifiedAccount {
     public static void applyAll(Context ctx, boolean force, Progress cb) {
         final Context c = ctx.getApplicationContext();
         if (!isConfigured(c)) return;
+        // One pass at a time (the screen, SYNC STACK and service starts can all ask). An automatic pass simply skips
+        // when another is running; a forced one (new password, APPLY NOW) waits for it and then runs.
+        if (force) APPLY_LOCK.lock();
+        else if (!APPLY_LOCK.tryLock()) return;
+        try {
+            applyAllLocked(c, force, cb);
+        } finally {
+            APPLY_LOCK.unlock();
+        }
+    }
+
+    private static final java.util.concurrent.locks.ReentrantLock APPLY_LOCK = new java.util.concurrent.locks.ReentrantLock();
+
+    private static void applyAllLocked(Context c, boolean force, Progress cb) {
         final String user = getUsername(c).trim();
         final String pass = getPassword(c);
 
@@ -213,6 +227,18 @@ public final class UnifiedAccount {
             }
             String base = "http://127.0.0.1:" + port + api;
             JSONObject host = new JSONObject(http("GET", base + "/config/host", key, null, null));
+
+            // Already signed in with this account? Then leave the service alone: re-sending the login re-hashes the
+            // password, drops every open web session and can make the service restart in the middle of a sync.
+            if (arrAlreadySignedIn(host, port, user, pass)) {
+                if (!signature(user, pass).equals(sp(c).getString("sig_" + id, ""))) {
+                    if (!"prowlarr".equals(id)) syncTransmissionClient(base, key, user, pass);
+                    sp(c).edit().putString("sig_" + id, signature(user, pass)).apply();
+                }
+                setStatus(c, id, "ok", "", cb);
+                return;
+            }
+
             sanitizeHostConfig(host, id);
             host.put("authenticationMethod", "forms");
             // Same rule the app enforces in config.xml at every start: with an account set, the web UI always asks
@@ -227,15 +253,45 @@ public final class UnifiedAccount {
             // Keep the Transmission download client in Radarr / Sonarr in sync with the new credentials.
             if (!"prowlarr".equals(id)) syncTransmissionClient(base, key, user, pass);
 
-            // Verify the new login really works on the web UI.
+            // Verify the new login really works on the web UI (the service may need a moment after the change).
             int verdict = verifyFormsLogin(port, user, pass);
+            for (int i = 0; verdict == 0 && i < 3; i++) {
+                Thread.sleep(1500);
+                verdict = verifyFormsLogin(port, user, pass);
+            }
             if (verdict < 0) {
                 setStatus(c, id, "failed", "Saved, but the new password was refused at login", cb);
                 return;
             }
+            sp(c).edit().putString("sig_" + id, signature(user, pass)).apply();
             setStatus(c, id, "ok", "", cb);
         } catch (Throwable t) {
             setStatus(c, id, "failed", String.valueOf(t.getMessage()), cb);
+        }
+    }
+
+    /**
+     * True when the service already uses Forms login and accepts exactly this username and password. The check is a
+     * real login attempt against the web UI, so it is right even when the host config hides the stored password.
+     */
+    static boolean arrAlreadySignedIn(JSONObject host, int port, String user, String pass) {
+        if (host == null) return false;
+        if (!"forms".equalsIgnoreCase(host.optString("authenticationMethod", ""))) return false;
+        String current = host.optString("username", "");
+        if (!current.isEmpty() && !current.equalsIgnoreCase(user)) return false;
+        return verifyFormsLogin(port, user, pass) > 0;
+    }
+
+    /** Non-reversible fingerprint of the account, used to tell whether a service already got this exact account. */
+    private static String signature(String user, String pass) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest((user.toLowerCase(Locale.US) + "\n" + pass).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 12; i++) sb.append(String.format(Locale.US, "%02x", d[i]));
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
         }
     }
 
@@ -269,7 +325,7 @@ public final class UnifiedAccount {
     }
 
     /** 1 = accepted, -1 = refused, 0 = could not tell. Forms login answers with a redirect either way. */
-    private static int verifyFormsLogin(int port, String user, String pass) {
+    static int verifyFormsLogin(int port, String user, String pass) {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL("http://127.0.0.1:" + port + "/login?returnUrl=/").openConnection();
@@ -311,6 +367,13 @@ public final class UnifiedAccount {
                 setStatus(c, "transmission", "pending", "Will apply at next start", cb);
                 return;
             }
+            // Already protected by this account (anonymous call refused, authenticated call accepted)? Keep it running.
+            int anon = rpcProbe(c, false);
+            int authed = rpcProbe(c, true);
+            if (anon == 401 && (authed == 200 || authed == 409)) {
+                setStatus(c, "transmission", "ok", "", cb);
+                return;
+            }
             // Transmission only reads rpc-username / rpc-password from settings.json at start-up.
             mgr.stopService("transmission");
             long end = System.currentTimeMillis() + 20000;
@@ -324,7 +387,7 @@ public final class UnifiedAccount {
                 return;
             }
             // Verify: an authenticated call must be accepted (200 or the 409 session challenge).
-            int code = rpcProbe(c);
+            int code = rpcProbe(c, true);
             if (code == 200 || code == 409) setStatus(c, "transmission", "ok", "", cb);
             else setStatus(c, "transmission", "failed", "RPC answered HTTP " + code, cb);
         } catch (Throwable t) {
@@ -332,7 +395,7 @@ public final class UnifiedAccount {
         }
     }
 
-    private static int rpcProbe(Context c) {
+    private static int rpcProbe(Context c, boolean withAccount) {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL("http://127.0.0.1:9091/transmission/rpc").openConnection();
@@ -340,7 +403,7 @@ public final class UnifiedAccount {
             conn.setReadTimeout(5000);
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
-            authorize(conn, c);
+            if (withAccount) authorize(conn, c);
             OutputStream os = conn.getOutputStream();
             os.write("{\"method\":\"session-get\"}".getBytes(StandardCharsets.UTF_8));
             os.close();

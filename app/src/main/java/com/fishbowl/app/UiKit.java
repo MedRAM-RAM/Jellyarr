@@ -201,7 +201,10 @@ public final class UiKit {
         b.setAllCaps(false);
         b.setTextSize(13f);
         b.setTypeface(BOLD);
-        b.setTextColor(fg);
+        // Disabled buttons look disabled on their own (callers no longer need to fade them by hand).
+        b.setTextColor(new ColorStateList(
+                new int[][]{new int[]{-android.R.attr.state_enabled}, new int[]{}},
+                new int[]{AppTheme.withAlpha(fg, 0x70), fg}));
         b.setMinHeight(dp(c, 42));
         b.setMinimumHeight(dp(c, 42));
         b.setMinWidth(0);
@@ -209,7 +212,12 @@ public final class UiKit {
         b.setPadding(dp(c, 14), 0, dp(c, 14), 0);
         b.setSingleLine(true);
         b.setEllipsize(TextUtils.TruncateAt.END);
-        b.setBackground(pressable(c, fill, stroke, R_INNER));
+        android.graphics.drawable.StateListDrawable bg = new android.graphics.drawable.StateListDrawable();
+        bg.addState(new int[]{-android.R.attr.state_enabled},
+                shape(c, fill == AppTheme.card() ? fill : AppTheme.mix(AppTheme.card(), fill, 0.45f),
+                        stroke == 0 ? 0 : AppTheme.withAlpha(stroke, 0x60), R_INNER));
+        bg.addState(new int[]{}, pressable(c, fill, stroke, R_INNER));
+        b.setBackground(bg);
         if (Build.VERSION.SDK_INT >= 21) b.setStateListAnimator(null);
         if (l != null) b.setOnClickListener(l);
         return b;

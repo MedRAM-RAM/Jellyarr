@@ -1238,12 +1238,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                     }
 
                     // Automatically wire service with stack in background
-                    final String svcToWire = id;
                     try {
-                        serviceExecutor.execute(() -> {
-                            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-                            wireService(svcToWire, null);
-                        });
                         scheduleAutoWireDebounced(2500);
                     } catch (RejectedExecutionException rex) {
                         Log.w(TAG, "[ServiceManager] Service wiring deferred under load: " + rex.getMessage());
@@ -2705,9 +2700,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
 
             // Automatically auto-wire the full stack in background once services are up
             try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-            autoWireStack((success, msg) -> {
-                Log.i(TAG, "[AutoWire] Automatic stack auto-wiring on start: success=" + success + " msg=" + msg);
-            });
+            autoWireStack(null, null);
         });
     }
 
@@ -2750,9 +2743,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
             }
 
             try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
-            autoWireStack((success, msg) -> {
-                Log.i(TAG, "[AutoWire] Automatic stack auto-wiring on companion start: success=" + success + " msg=" + msg);
-            });
+            autoWireStack(null, null);
         });
     }
 
@@ -2913,14 +2904,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
 
         // 4. Link Transmission if running
         if (isPortOccupied(9091)) {
-            if (!hasDownloadClient(7878, radarrKey, "Transmission")) {
-                String body = buildTransmissionClientJson("radarr");
-                if (postJson("http://127.0.0.1:7878/api/v3/downloadclient?apiKey=" + radarrKey, body)) {
-                    log.append("[OK] Transmission linked into Radarr\n");
-                }
-            } else {
-                log.append("[OK] Transmission verified in Radarr\n");
-            }
+            ensureTransmissionClient(7878, radarrKey, "radarr", log);
         }
 
         // 5. Link into Prowlarr if running
@@ -3800,8 +3784,51 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
         autoWireStack(callback, null);
     }
 
+    private final java.util.concurrent.atomic.AtomicBoolean autoWireRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile boolean autoWireRerun = false;
+
     public void autoWireStack(AutoWireCallback callback, AutoWireProgress progress) {
-        serviceExecutor.execute(() -> {
+        // Single flight: starts, stops and the screen all ask for a sync. While one runs, further automatic requests
+        // are folded into one follow-up pass instead of piling up and fighting over the same services.
+        if (!autoWireRunning.compareAndSet(false, true)) {
+            if (callback == null && progress == null) {
+                autoWireRerun = true;
+                return;
+            }
+            // An explicit SYNC STACK while a pass runs: wait for it, then run (on a worker, never the UI thread).
+            try {
+                serviceExecutor.execute(() -> {
+                    long end = System.currentTimeMillis() + 180000L;
+                    while (autoWireRunning.get() && System.currentTimeMillis() < end) {
+                        try { Thread.sleep(500); } catch (InterruptedException ie) { return; }
+                    }
+                    autoWireStack(callback, progress);
+                });
+            } catch (RejectedExecutionException rex) {
+                postCallback(callback, false, "A sync is already running, try again in a moment");
+            }
+            return;
+        }
+        try {
+            serviceExecutor.execute(() -> {
+                try {
+                    runAutoWire(callback, progress);
+                } finally {
+                    autoWireRunning.set(false);
+                    if (autoWireRerun) {
+                        autoWireRerun = false;
+                        scheduleAutoWireDebounced(1500);
+                    }
+                }
+            });
+        } catch (RejectedExecutionException rex) {
+            autoWireRunning.set(false);
+            postCallback(callback, false, "Sync deferred: the service worker is busy");
+        }
+    }
+
+    private void runAutoWire(AutoWireCallback callback, AutoWireProgress progress) {
+        {
             StringBuilder log = new StringBuilder();
             try {
                 wireStep(progress, "… Preparing storage folders (movies / series / downloads)");
@@ -3846,6 +3873,21 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                     wireStep(progress, "✓ Prowlarr synchronized");
                 }
 
+                // Unified account: only services that are not signed in with it yet are touched; a service that
+                // already accepts the account is left alone (no new login, no restart).
+                if (com.fishbowl.app.UnifiedAccount.isConfigured(appContext)) {
+                    if (com.fishbowl.app.UnifiedAccount.hasDue(appContext)) {
+                        wireStep(progress, "… Checking the unified account");
+                        com.fishbowl.app.UnifiedAccount.applyAll(appContext, false, null);
+                    }
+                    int ok = 0;
+                    for (String s : com.fishbowl.app.UnifiedAccount.SERVICES) {
+                        if ("ok".equals(com.fishbowl.app.UnifiedAccount.getStatus(appContext, s))) ok++;
+                    }
+                    wireStep(progress, (ok == com.fishbowl.app.UnifiedAccount.SERVICES.length ? "✓ " : "• ")
+                            + "Unified account signed in on " + ok + " / " + com.fishbowl.app.UnifiedAccount.SERVICES.length + " services");
+                }
+
                 String summaryMsg = !wiredServices.isEmpty()
                         ? "Stack synchronized (" + android.text.TextUtils.join(", ", wiredServices) + ")"
                         : "No active companion services running to sync";
@@ -3854,7 +3896,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                 Log.e(TAG, "[AutoWire] Error during autoWireStack", t);
                 postCallback(callback, false, "Auto-wire notice: " + t.getMessage());
             }
-        });
+        }
     }
 
     private Runnable pendingAutoWireRunnable = null;
@@ -3864,9 +3906,8 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
             mainHandler.removeCallbacks(pendingAutoWireRunnable);
         }
         pendingAutoWireRunnable = () -> {
-            autoWireStack((success, msg) -> {
-                Log.i(TAG, "[AutoWireDebounced] Stack auto-wired: success=" + success + " msg=" + msg);
-            });
+            pendingAutoWireRunnable = null;
+            autoWireStack(null, null);
         };
         mainHandler.postDelayed(pendingAutoWireRunnable, delayMs);
     }

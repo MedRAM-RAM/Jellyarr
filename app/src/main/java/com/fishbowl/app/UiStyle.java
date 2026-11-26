@@ -50,6 +50,10 @@ public final class UiStyle {
      *  disabled = same shapes at low contrast.
      */
     public static void styleSwitch(Context c, Switch s) {
+        if (s instanceof ToggleSwitch) {
+            s.invalidate();
+            return;
+        }
         try {
             float d = c.getResources().getDisplayMetrics().density;
             int trackW = (int) (46 * d), trackH = (int) (26 * d), stroke = Math.max(1, (int) (1.5f * d));
@@ -88,9 +92,7 @@ public final class UiStyle {
 
     /** A Switch that already has the themed look. */
     public static Switch newSwitch(Context c) {
-        Switch s = new Switch(c);
-        styleSwitch(c, s);
-        return s;
+        return new ToggleSwitch(c);
     }
 
     /** Check box with the accent colour when checked. */

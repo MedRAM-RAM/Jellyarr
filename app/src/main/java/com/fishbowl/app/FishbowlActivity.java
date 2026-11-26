@@ -1095,16 +1095,22 @@ public final class FishbowlActivity extends AppCompatActivity
     private LinearLayout buildBottomNavBar() {
         LinearLayout nav = new LinearLayout(this);
         nav.setOrientation(LinearLayout.HORIZONTAL);
-        nav.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outlineStrong(), UiKit.R_PILL));
-        nav.setPadding(dp(8), dp(8), dp(8), dp(8));
-        nav.setElevation(dp(10));
+        nav.setGravity(Gravity.CENTER_VERTICAL);
+        // Rounded (not fully pill-shaped) floating bar: reads as one surface on every width and keeps the
+        // selected-item pill visually inside it.
+        nav.setBackground(UiKit.shape(this, AppTheme.card(), AppTheme.outline(), 26));
+        nav.setPadding(dp(6), dp(6), dp(6), dp(6));
+        nav.setElevation(dp(8));
+        nav.setClipToOutline(true);
+        nav.setOutlineProvider(android.view.ViewOutlineProvider.BACKGROUND);
+        nav.setMinimumHeight(dp(64));
 
         populateNavTabs(nav);
         return nav;
     }
 
-    /** Material 3 navigation bar, ordered by what you do: control the server (Home), watch
-     *  (Library), search missing episodes (Sonarr), acquire (Media: services + downloads), inspect (Activity), configure (Settings). */
+    /** Navigation, ordered by what you do: control the server (Home), acquire (Media: services + downloads),
+     *  inspect (Activity), configure (Settings); the Menu item opens the drawer with the service screens. */
     private void populateNavTabs(LinearLayout nav) {
         addNavTab(nav, -1, R.drawable.ic_menu, "Menu");
         addNavTab(nav, 0, R.drawable.ic_home, "Home");
@@ -1118,12 +1124,16 @@ public final class FishbowlActivity extends AppCompatActivity
     private void addNavTab(LinearLayout parent, int tabIndex, int iconRes, String label) {
         LinearLayout tab = new LinearLayout(this);
         tab.setOrientation(LinearLayout.VERTICAL);
-        tab.setGravity(Gravity.CENTER_HORIZONTAL);
+        tab.setGravity(Gravity.CENTER);
         tab.setTag(tabIndex);
         tab.setClickable(true);
         tab.setFocusable(true);
-        tab.setContentDescription(label);
-        tab.setBackground(UiKit.rowRipple(this));
+        tab.setContentDescription(I18n.tr(label));
+        tab.setPadding(0, dp(4), 0, dp(4));
+        tab.setMinimumHeight(dp(52));
+        tab.setBackground(new android.graphics.drawable.RippleDrawable(
+                ColorStateList.valueOf(AppTheme.withAlpha(AppTheme.accent(), 0x30)), null,
+                UiKit.shape(this, 0xFFFFFFFF, 0, 20)));
         tab.setOnClickListener(v -> {
             if (tabIndex == -1) {
                 toggleSideDrawer();
@@ -1148,7 +1158,7 @@ public final class FishbowlActivity extends AppCompatActivity
         FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(dp(22), dp(22));
         iconParams.gravity = Gravity.CENTER;
         pill.addView(icon, iconParams);
-        tab.addView(pill, new LinearLayout.LayoutParams(dp(60), dp(32)));
+        tab.addView(pill, new LinearLayout.LayoutParams(dp(52), dp(30)));
 
         TextView labelView = new TextView(this);
         labelView.setTag("label");
@@ -1156,8 +1166,10 @@ public final class FishbowlActivity extends AppCompatActivity
         labelView.setTextSize(11f);
         labelView.setGravity(Gravity.CENTER);
         labelView.setSingleLine(true);
+        labelView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        labelView.setIncludeFontPadding(false);
         labelView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.topMargin = dp(4);
         tab.addView(labelView, lp);
 
@@ -1178,16 +1190,27 @@ public final class FishbowlActivity extends AppCompatActivity
             int tabIndex = (tagVal instanceof Integer) ? (Integer) tagVal : i;
 
             boolean selected = (tabIndex == activeTab) || (tabIndex == -1 && isDrawerTab(activeTab));
+            boolean wasSelected = Boolean.TRUE.equals(tab.getTag(R.id.nav_selected_state));
+            tab.setTag(R.id.nav_selected_state, selected);
+            tab.setSelected(selected);
             if (pill != null) {
-                pill.setBackground(createRoundedDrawable(selected ? AppTheme.accentContainer() : Color.TRANSPARENT, dp(16)));
-                pill.setScaleX(selected ? 1f : 0.85f);
-                pill.animate().scaleX(1f).setDuration(160).start();
+                pill.setBackground(selected ? createRoundedDrawable(AppTheme.accentContainer(), dp(15)) : null);
+                // Only the item that just became selected animates; the others stay still.
+                if (selected && !wasSelected) {
+                    pill.setScaleX(0.6f);
+                    pill.setAlpha(0.6f);
+                    pill.animate().scaleX(1f).alpha(1f).setDuration(180).start();
+                } else {
+                    pill.animate().cancel();
+                    pill.setScaleX(1f);
+                    pill.setAlpha(1f);
+                }
             }
             if (icon != null) {
                 icon.setColorFilter(selected ? AppTheme.onAccentContainer() : AppTheme.textSecondary());
             }
             if (label != null) {
-                label.setTextColor(selected ? AppTheme.text() : AppTheme.textSecondary());
+                label.setTextColor(selected ? AppTheme.text() : AppTheme.textMuted());
                 label.setTypeface(Typeface.create("sans-serif-medium", selected ? Typeface.BOLD : Typeface.NORMAL));
             }
         }
