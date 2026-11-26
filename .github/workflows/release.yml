@@ -178,10 +178,10 @@ jobs:
             echo "Configuring protected production release keystore from GitHub Secrets..."
             KEYSTORE_FILE="$RUNNER_TEMP/jellyarr_release.keystore"
             echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"
-            echo "FISHBOWL_RELEASE_KEYSTORE_PATH=$KEYSTORE_FILE" >> $GITHUB_ENV
-            echo "FISHBOWL_RELEASE_KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
-            echo "FISHBOWL_RELEASE_STORE_PASSWORD=$STORE_PASS" >> $GITHUB_ENV
-            echo "FISHBOWL_RELEASE_KEY_PASSWORD=$KEY_PASS" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_KEYSTORE_PATH=$KEYSTORE_FILE" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_STORE_PASSWORD=$STORE_PASS" >> $GITHUB_ENV
+            echo "JELLYARR_RELEASE_KEY_PASSWORD=$KEY_PASS" >> $GITHUB_ENV
             echo "configured=true" >> $GITHUB_OUTPUT
           else
             echo "Error: FISHBOWL_RELEASE_KEYSTORE_BASE64 secret is not configured in GitHub Secrets." >&2

@@ -43,22 +43,22 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.fishbowl.app"
+        applicationId "com.jellyarr.app"
         minSdkVersion project.properties.minSdkVersion.toInteger()
         targetSdkVersion project.properties.targetSdkVersion.toInteger()
-        versionCode 101461
-        versionName "2.1.1"
+        versionCode 103000
+        versionName "3.0.0"
 
         if (project.hasProperty("appVersionCode")) {
             versionCode project.property("appVersionCode").toInteger()
-        } else if (System.getenv("FISHBOWL_VERSION_CODE")) {
-            versionCode System.getenv("FISHBOWL_VERSION_CODE").toInteger()
+        } else if (System.getenv("JELLYARR_VERSION_CODE")) {
+            versionCode System.getenv("JELLYARR_VERSION_CODE").toInteger()
         }
 
         if (project.hasProperty("appVersionName")) {
             versionName project.property("appVersionName")
-        } else if (System.getenv("FISHBOWL_VERSION_NAME")) {
-            versionName System.getenv("FISHBOWL_VERSION_NAME")
+        } else if (System.getenv("JELLYARR_VERSION_NAME")) {
+            versionName System.getenv("JELLYARR_VERSION_NAME")
         } else if (appVersionName) {
             versionName appVersionName
         }
@@ -66,7 +66,7 @@ android {
 
         buildConfigField "String", "TERMUX_PACKAGE_VARIANT", "\"" + project.ext.packageVariant + "\"" // Used by TermuxApplication class
 
-        manifestPlaceholders.TERMUX_PACKAGE_NAME = "com.fishbowl.app"
+        manifestPlaceholders.TERMUX_PACKAGE_NAME = "com.jellyarr.app"
         manifestPlaceholders.TERMUX_APP_NAME = "Jellyarr"
 
 
@@ -88,22 +88,22 @@ android {
             // Secure production keystore resolution:
             // Prioritizes environment variables (CI secrets) or project properties.
             // Refuses silent testkey fallback when running release tasks in CI.
-            def isCi = (System.getenv("CI") == "true" || System.getenv("GITHUB_ACTIONS") == "true" || project.hasProperty("CI") || project.hasProperty("FISHBOWL_CI"))
+            def isCi = (System.getenv("CI") == "true" || System.getenv("GITHUB_ACTIONS") == "true" || project.hasProperty("CI") || project.hasProperty("JELLYARR_CI"))
             def isReleaseTask = gradle.startParameter.taskNames.any { it.contains("Release") }
-            def releaseKeyStorePath = System.getenv("FISHBOWL_RELEASE_KEYSTORE_PATH") ?: (project.findProperty("FISHBOWL_RELEASE_KEYSTORE_PATH") ?: null)
+            def releaseKeyStorePath = System.getenv("JELLYARR_RELEASE_KEYSTORE_PATH") ?: (project.findProperty("JELLYARR_RELEASE_KEYSTORE_PATH") ?: null)
             def isReleaseValidation = project.hasProperty("validateReleaseCompilation") ||
-                                      project.hasProperty("FISHBOWL_VALIDATE_RELEASE") ||
+                                      project.hasProperty("JELLYARR_VALIDATE_RELEASE") ||
                                       (System.getenv("GITHUB_WORKFLOW") == "Build Bot")
             if (releaseKeyStorePath && file(releaseKeyStorePath).exists()) {
                 storeFile file(releaseKeyStorePath)
-                keyAlias System.getenv("FISHBOWL_RELEASE_KEY_ALIAS") ?: (project.findProperty("FISHBOWL_RELEASE_KEY_ALIAS") ?: 'alias')
-                storePassword System.getenv("FISHBOWL_RELEASE_STORE_PASSWORD") ?: (project.findProperty("FISHBOWL_RELEASE_STORE_PASSWORD") ?: '')
-                keyPassword System.getenv("FISHBOWL_RELEASE_KEY_PASSWORD") ?: (project.findProperty("FISHBOWL_RELEASE_KEY_PASSWORD") ?: '')
+                keyAlias System.getenv("JELLYARR_RELEASE_KEY_ALIAS") ?: (project.findProperty("JELLYARR_RELEASE_KEY_ALIAS") ?: 'alias')
+                storePassword System.getenv("JELLYARR_RELEASE_STORE_PASSWORD") ?: (project.findProperty("JELLYARR_RELEASE_STORE_PASSWORD") ?: '')
+                keyPassword System.getenv("JELLYARR_RELEASE_KEY_PASSWORD") ?: (project.findProperty("JELLYARR_RELEASE_KEY_PASSWORD") ?: '')
             } else if (isCi && isReleaseTask && !isReleaseValidation) {
-                throw new GradleException("FISHBOWL_RELEASE_KEYSTORE_PATH must be configured in CI for release builds! Refusing to sign production release APK with untrusted debug testkey.")
+                throw new GradleException("JELLYARR_RELEASE_KEYSTORE_PATH must be configured in CI for release builds! Refusing to sign production release APK with untrusted debug testkey.")
             } else {
                 if (isCi && isReleaseTask) {
-                    logger.warn("[SECURITY NOTICE] Release compilation validation build in CI: FISHBOWL_RELEASE_KEYSTORE_PATH not configured. Signing with untrusted testkey for compilation validation only. This artifact must NOT be published as a production release!")
+                    logger.warn("[SECURITY NOTICE] Release compilation validation build in CI: JELLYARR_RELEASE_KEYSTORE_PATH not configured. Signing with untrusted testkey for compilation validation only. This artifact must NOT be published as a production release!")
                 }
                 storeFile file('testkey_untrusted.jks')
                 keyAlias 'alias'

@@ -2,7 +2,7 @@ name: Test Build APK (no publish)
 
 on:
   push:
-    branches: [ 'ccr-*' ]
+    branches: [ 'ccr-*', 'claude/**' ]
   workflow_dispatch:
 
 permissions:
@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      FISHBOWL_VERSION_CODE: ${{ vars.FISHBOWL_VERSION_CODE || '101461' }}
-      FISHBOWL_VERSION_NAME: ${{ vars.FISHBOWL_VERSION_NAME || '2.1.1' }}
+      JELLYARR_VERSION_CODE: ${{ vars.JELLYARR_VERSION_CODE || vars.FISHBOWL_VERSION_CODE || '103000' }}
+      JELLYARR_VERSION_NAME: ${{ vars.JELLYARR_VERSION_NAME || vars.FISHBOWL_VERSION_NAME || '3.0.0' }}
 
     steps:
       - name: Checkout

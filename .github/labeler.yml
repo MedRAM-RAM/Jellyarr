@@ -8,11 +8,11 @@ workflows:
 
 ui:
   - changed-files:
-      - any-glob-to-any-file: ['app/src/main/res/**', 'app/src/main/java/com/fishbowl/app/*Activity.java']
+      - any-glob-to-any-file: ['app/src/main/res/**', 'app/src/main/java/com/jellyarr/app/*Activity.java']
 
 backend:
   - changed-files:
-      - any-glob-to-any-file: ['app/src/main/java/com/fishbowl/app/JellyfinController.java', 'app/src/main/java/com/fishbowl/app/JellyfinBootstrapper.java', 'app/src/main/java/com/fishbowl/app/JellyfinServerService.java']
+      - any-glob-to-any-file: ['app/src/main/java/com/jellyarr/app/JellyfinController.java', 'app/src/main/java/com/jellyarr/app/JellyfinBootstrapper.java', 'app/src/main/java/com/jellyarr/app/JellyfinServerService.java']
 
 termux:
   - changed-files:

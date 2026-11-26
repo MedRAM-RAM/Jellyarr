@@ -1,4 +1,15 @@
-What's new in 2.1.1 (stable)
+What's new in 3.0.0 (stable)
+- The app is now fully Jellyarr: new package name (com.jellyarr.app), new name everywhere and the new Jellyarr logo.
+- IMPORTANT, moving from the old app: Android treats 3.0.0 as a new app, so the old app cannot update itself to it. In the old app make a backup (Settings > Backup), stop all services, install Jellyarr 3.0.0, restore the backup on first start, then uninstall the old app. Your media in JellyarrMedia is not touched. Paths inside restored settings and databases are switched to the new package automatically.
+- Unified account sync: Sonarr, Radarr and Prowlarr are first checked with a real sign-in. A service that already accepts the account is left alone (no new login, no password re-hash, no dropped web sessions, no restart). Only services that do not accept it yet are updated.
+- Transmission is no longer restarted when it already requires the account.
+- SYNC STACK runs one pass at a time: starts, stops and the screen no longer launch overlapping syncs, and the pass ends by signing in only the services that still need the account.
+- Radarr now checks its Transmission download client the same way as Sonarr (download folder included).
+- New on/off switches drawn by the app: a clear 52 x 32 dp track, a round thumb that grows with a check mark when ON, smooth animation, right-to-left aware. Used in every screen.
+- Bottom bar redesigned: rounded floating surface, ripples stay inside each item, and only the newly selected item animates.
+- Buttons show a disabled state on their own.
+
+From 2.1.1:
 - Switches now light up clearly when ON (accent track, bright thumb) and dim when OFF or disabled, in every screen.
 - Faster theme changes and screens: the Library / Sonarr / Radarr / Transmission / Prowlarr screens are now built on demand in the background instead of all at start-up, and a theme change fades instead of freezing.
 - Home: the start-up progress now also covers Transmission, Prowlarr, Radarr and Sonarr, and sits at the bottom of the Services card.

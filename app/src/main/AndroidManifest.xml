@@ -28,11 +28,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:name="com.fishbowl.app.FishbowlApplication"
+        android:name="com.jellyarr.app.JellyarrApplication"
         android:allowBackup="false"
         android:banner="@drawable/banner"
         android:icon="@mipmap/ic_launcher"
-        android:label="@string/fishbowl_name"
+        android:label="@string/jellyarr_name"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
         android:requestLegacyExternalStorage="true"
@@ -45,9 +45,9 @@
 
 
         <activity
-            android:name="com.fishbowl.app.FishbowlActivity"
+            android:name="com.jellyarr.app.JellyarrActivity"
             android:exported="true"
-            android:label="@string/fishbowl_name"
+            android:label="@string/jellyarr_name"
             android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|smallestScreenSize|density|screenLayout|keyboard|keyboardHidden|navigation|uiMode|fontScale|fontWeightAdjustment|locale|layoutDirection"
             android:theme="@style/Theme.TermuxApp.DayNight.NoActionBar">
@@ -66,13 +66,13 @@
             </intent-filter>
         </activity>
         <activity
-            android:name="com.fishbowl.app.JellyfinStorageActivity"
+            android:name="com.jellyarr.app.JellyfinStorageActivity"
             android:exported="false"
             android:label="Media Storage"
             android:configChanges="orientation|screenSize|smallestScreenSize|density|screenLayout|keyboard|keyboardHidden|navigation|uiMode|fontScale|fontWeightAdjustment|locale|layoutDirection"
             android:theme="@style/Theme.TermuxApp.DayNight.NoActionBar" />
         <activity
-            android:name="com.fishbowl.app.JellyfinWebActivity"
+            android:name="com.jellyarr.app.JellyfinWebActivity"
             android:exported="false"
             android:label="Jellyarr Web"
             android:theme="@style/Theme.TermuxApp.DayNight.NoActionBar"
@@ -98,12 +98,12 @@
 
 
 
-        <!-- Fishbowl Jellyfin Password Reset PIN Notification Copy Action -->
+        <!-- Jellyarr Jellyfin Password Reset PIN Notification Copy Action -->
         <receiver
-            android:name="com.fishbowl.app.CopyPinReceiver"
+            android:name="com.jellyarr.app.CopyPinReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.fishbowl.app.ACTION_COPY_PIN" />
+                <action android:name="com.jellyarr.app.ACTION_COPY_PIN" />
             </intent-filter>
         </receiver>
 
@@ -113,46 +113,46 @@
 
         <!-- Phase 10: Android Home Screen Widget Provider -->
         <receiver
-            android:name="com.fishbowl.app.widget.FishbowlWidgetProvider"
+            android:name="com.jellyarr.app.widget.JellyarrWidgetProvider"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
-                android:resource="@xml/fishbowl_widget_info" />
+                android:resource="@xml/jellyarr_widget_info" />
         </receiver>
 
         <receiver
-            android:name="com.fishbowl.app.widget.FishbowlServicesWidgetProvider"
-            android:label="@string/fishbowl_services_widget_name"
+            android:name="com.jellyarr.app.widget.JellyarrServicesWidgetProvider"
+            android:label="@string/jellyarr_services_widget_name"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
-                android:resource="@xml/fishbowl_services_widget_info" />
+                android:resource="@xml/jellyarr_services_widget_info" />
         </receiver>
 
 
         <service
-            android:name="com.fishbowl.app.UpdateNotifier$UpdateJobService"
+            android:name="com.jellyarr.app.UpdateNotifier$UpdateJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="false" />
 
         <!-- Phase 9: Foreground service for background reliability and notification -->
         <service
-            android:name="com.fishbowl.app.JellyfinServerService"
+            android:name="com.jellyarr.app.JellyfinServerService"
             android:foregroundServiceType="mediaPlayback"
             android:stopWithTask="false"
             android:exported="false" />
 
         <!-- Native Android Quick Settings Tile (Jellyfin Server Controller) -->
         <service
-            android:name="com.fishbowl.app.FishbowlQuickSettingsTileService"
+            android:name="com.jellyarr.app.JellyarrQuickSettingsTileService"
             android:label="@string/quick_settings_tile_label"
-            android:icon="@drawable/ic_fishbowl_logo"
+            android:icon="@drawable/ic_jellyarr_logo"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true"
             tools:targetApi="n">

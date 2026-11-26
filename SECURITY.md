@@ -48,12 +48,12 @@ Jellyarr is engineered around strict security invariants to ensure user safety:
 - **100% Local Execution:** All database queries, user management, and metadata indexing occur strictly on-device.
 
 ### 2. Sandboxed Process Execution
-- Native .NET processes (`dotnet jellyfin.dll`), FFmpeg binaries, and SQLite engines execute exclusively within the Android application's dedicated UID sandbox (`/data/data/com.fishbowl.app/files/usr`).
+- Native .NET processes (`dotnet jellyfin.dll`), FFmpeg binaries, and SQLite engines execute exclusively within the Android application's dedicated UID sandbox (`/data/data/com.jellyarr.app/files/usr`).
 - No root access is required or requested. The application operates entirely within unprivileged user space.
 
 ### 3. SELinux & Storage Security
 - Media directory access strictly respects Android SELinux security boundaries.
-- External storage interactions are anchored to the application's guaranteed package folder (`/storage/<UUID>/Android/data/com.fishbowl.app/files`) or verified POSIX paths to prevent privilege escalation or directory traversal.
+- External storage interactions are anchored to the application's guaranteed package folder (`/storage/<UUID>/Android/data/com.jellyarr.app/files`) or verified POSIX paths to prevent privilege escalation or directory traversal.
 - Virtual cloud DocumentProviders without Linux mount points are quarantined to prevent server corruption.
 
 ### 4. Local Network & Socket Bounds
