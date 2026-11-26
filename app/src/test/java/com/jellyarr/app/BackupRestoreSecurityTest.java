@@ -512,4 +512,39 @@ public class BackupRestoreSecurityTest {
             fos.write(content.getBytes(StandardCharsets.UTF_8));
         }
     }
+
+    /** Android's SQLite folds accented letters in lower(); index-only mismatches must not block a restore. */
+    @Test
+    public void test20_IndexOnlyIntegrityLinesAreNotFatal() {
+        java.util.List<String> idx = java.util.Arrays.asList(
+                "row 53 missing from index IX_Peoples_NameLower",
+                "wrong # of entries in index IX_Peoples_NameLower");
+        Assert.assertNull(BackupRestoreManager.firstStructuralProblem(idx));
+        Assert.assertNull(BackupRestoreManager.firstStructuralProblem(java.util.Collections.singletonList("ok")));
+        java.util.List<String> bad = java.util.Arrays.asList(
+                "row 53 missing from index IX_Peoples_NameLower",
+                "*** in database main ***\nPage 12: btreeInitPage() returns error code 11");
+        Assert.assertNotNull(BackupRestoreManager.firstStructuralProblem(bad));
+    }
+
+    /** Old-package paths are rewritten in place, including a match that straddles the 1 MiB read window. */
+    @Test
+    public void test21_OldPackagePathsRewrittenAcrossChunks() throws Exception {
+        File dir = new File(testRoot, "pkg_rewrite");
+        dir.mkdirs();
+        File f = new File(dir, "library.db");
+        byte[] needle = "/com.fishbowl.app/".getBytes(StandardCharsets.US_ASCII);
+        byte[] data = new byte[(1 << 20) + 64];
+        java.util.Arrays.fill(data, (byte) 'x');
+        System.arraycopy(needle, 0, data, (1 << 20) - 5, needle.length);
+        System.arraycopy(needle, 0, data, 10, needle.length);
+        try (FileOutputStream fos = new FileOutputStream(f)) { fos.write(data); }
+        int changed = BackupRestoreManager.rewriteOldPackagePaths(dir, "com.jellyarr.app");
+        Assert.assertEquals(1, changed);
+        byte[] out = java.nio.file.Files.readAllBytes(f.toPath());
+        Assert.assertEquals(data.length, out.length);
+        String text = new String(out, StandardCharsets.US_ASCII);
+        Assert.assertFalse(text.contains("com.fishbowl.app"));
+        Assert.assertEquals(2, text.split("/com.jellyarr.app/", -1).length - 1);
+    }
 }
