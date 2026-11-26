@@ -1,4 +1,7 @@
-What's new in 3.0.0 (stable)
+What's new in 3.0.1 (stable)
+- Restore fixed: backups whose Jellyfin library has names with accented letters (for example "Iva Šebková") were refused with "SQLite integrity check failed ... missing from index IX_Peoples_NameLower". The database was healthy: Android's SQLite lowercases accented letters differently from Jellyfin's own SQLite. The check now refuses only real damage, so these backups restore normally.
+
+From 3.0.0:
 - The app is now fully Jellyarr: new package name (com.jellyarr.app), new name everywhere and the new Jellyarr logo.
 - IMPORTANT, moving from the old app: Android treats 3.0.0 as a new app, so the old app cannot update itself to it. In the old app make a backup (Settings > Backup), stop all services, install Jellyarr 3.0.0, restore the backup on first start, then uninstall the old app. Your media in JellyarrMedia is not touched. Paths inside restored settings and databases are switched to the new package automatically.
 - Unified account sync: Sonarr, Radarr and Prowlarr are first checked with a real sign-in. A service that already accepts the account is left alone (no new login, no password re-hash, no dropped web sessions, no restart). Only services that do not accept it yet are updated.

@@ -774,12 +774,15 @@ public final class BackupRestoreManager {
         try {
             db = SQLiteDatabase.openDatabase(dbFile.getAbsolutePath(), null, SQLiteDatabase.OPEN_READONLY);
             if (db == null) return; // SQLiteDatabase provider stubbed/unavailable in unit test environment
-            try (Cursor c = db.rawQuery("PRAGMA integrity_check;", null)) {
-                if (c != null && c.moveToFirst()) {
-                    String result = c.getString(0);
-                    if (!"ok".equalsIgnoreCase(result)) {
-                        throw new java.io.IOException("SQLite integrity check failed for " + dbFile.getName() + ": " + result);
-                    }
+            try (Cursor c = db.rawQuery("PRAGMA integrity_check(200);", null)) {
+                java.util.List<String> lines = new ArrayList<>();
+                if (c != null) while (c.moveToNext()) lines.add(c.getString(0));
+                String fatal = firstStructuralProblem(lines);
+                if (fatal != null) {
+                    throw new java.io.IOException("SQLite integrity check failed for " + dbFile.getName() + ": " + fatal);
+                }
+                if (!lines.isEmpty() && !"ok".equalsIgnoreCase(lines.get(0))) {
+                    Log.w(TAG, "Index-only differences ignored for " + dbFile.getName() + " (" + lines.size() + "): " + lines.get(0));
                 }
             }
         } catch (Throwable t) {
@@ -790,6 +793,27 @@ public final class BackupRestoreManager {
                 try { db.close(); } catch (Throwable ignored) {}
             }
         }
+    }
+
+    /**
+     * Returns the first integrity_check line that means real damage, or null when the database is sound.
+     *
+     * Index-only lines are not damage here: Jellyfin and the *arr apps index lower("Name") with their own SQLite,
+     * whose lower() only folds ASCII. Android's SQLite folds every letter (e.g. Š), so on names with accents it
+     * reports "row N missing from index ..." for a perfectly healthy database.
+     */
+    static String firstStructuralProblem(java.util.List<String> lines) {
+        if (lines == null) return null;
+        for (String l : lines) {
+            if (l == null) continue;
+            String t = l.trim();
+            if (t.isEmpty() || "ok".equalsIgnoreCase(t)) continue;
+            if (t.matches("(?i)^row \\d+ missing from index .*")) continue;
+            if (t.matches("(?i)^wrong # of entries in index .*")) continue;
+            if (t.matches("(?i)^non-unique entry in index .*")) continue;
+            return t;
+        }
+        return null;
     }
 
     public static String computeSHA256(File file) throws Exception {

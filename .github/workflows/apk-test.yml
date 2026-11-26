@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      JELLYARR_VERSION_CODE: ${{ vars.JELLYARR_VERSION_CODE || vars.FISHBOWL_VERSION_CODE || '103000' }}
-      JELLYARR_VERSION_NAME: ${{ vars.JELLYARR_VERSION_NAME || vars.FISHBOWL_VERSION_NAME || '3.0.0' }}
+      JELLYARR_VERSION_CODE: ${{ vars.JELLYARR_VERSION_CODE || vars.FISHBOWL_VERSION_CODE || '103010' }}
+      JELLYARR_VERSION_NAME: ${{ vars.JELLYARR_VERSION_NAME || vars.FISHBOWL_VERSION_NAME || '3.0.1' }}
 
     steps:
       - name: Checkout
