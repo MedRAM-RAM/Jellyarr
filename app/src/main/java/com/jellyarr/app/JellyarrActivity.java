@@ -8162,6 +8162,67 @@ public final class JellyarrActivity extends AppCompatActivity
         cacheDeb.delete();
     }
 
+    /** TorrServer ships one static ARM64 Android binary per release; it goes to $PREFIX/bin/torrserver. */
+    private static final String[] TORRSERVER_URLS = {
+            "https://github.com/YouROK/TorrServer/releases/latest/download/TorrServer-android-arm64",
+            "https://github.com/YouROK/TorrServer/releases/download/MatriX.152/TorrServer-android-arm64"
+    };
+
+    private void installTorrServer(ManagedService svc, File prefix, OledProgressDialog progress) throws Exception {
+        File bin = new File(prefix, "bin");
+        if (!bin.exists()) bin.mkdirs();
+        File target = new File(bin, "torrserver");
+        File tmp = new File(getCacheDir(), "torrserver.download");
+        final String step = "Downloading TorrServer...";
+        DownloadProgressCallback cb = new DownloadProgressCallback() {
+            @Override
+            public void onProgress(long current, long total, double speedKbps) {
+                if (progress != null) runOnUiThread(() -> progress.updateDownloadProgress(step, current, total, speedKbps));
+            }
+            @Override
+            public boolean isCancelled() {
+                return progress != null && progress.isCancelled();
+            }
+        };
+        Exception last = null;
+        boolean ok = false;
+        for (String url : TORRSERVER_URLS) {
+            if (progress != null && progress.isCancelled()) throw new InterruptedException("Installation cancelled");
+            try {
+                if (tmp.exists()) tmp.delete();
+                downloadWithRedirects(url, tmp, cb);
+                if (tmp.length() > 5L * 1024 * 1024) { ok = true; break; }
+                last = new Exception("Downloaded file is too small (" + tmp.length() + " bytes)");
+            } catch (Exception e) {
+                if (progress != null && progress.isCancelled()) throw e;
+                last = e;
+                Log.w(TAG, "TorrServer download failed from " + url + ": " + e.getMessage());
+            }
+        }
+        if (!ok) {
+            if (tmp.exists()) tmp.delete();
+            throw last != null ? last : new Exception("TorrServer download failed");
+        }
+        // ELF check: refuse an HTML error page saved as the binary
+        try (FileInputStream fis = new FileInputStream(tmp)) {
+            byte[] magic = new byte[4];
+            if (fis.read(magic) != 4 || magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+                tmp.delete();
+                throw new Exception("Downloaded TorrServer is not an ARM64 executable");
+            }
+        }
+        if (target.exists()) target.delete();
+        if (!tmp.renameTo(target)) {
+            BackupRestoreManager.copyFile(tmp, target);
+            tmp.delete();
+        }
+        target.setExecutable(true, false);
+        try { android.system.Os.chmod(target.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
+        File cfg = new File(TermuxConstants.TERMUX_HOME_DIR, ".config/torrserver");
+        if (!cfg.exists()) cfg.mkdirs();
+        svc.reconcileInstalledState();
+    }
+
     private void performServiceInstallSync(ManagedService svc, OledProgressDialog progress) throws Exception {
         if (progress != null && progress.isCancelled()) {
             throw new InterruptedException("Installation cancelled");
@@ -8194,6 +8255,11 @@ public final class JellyarrActivity extends AppCompatActivity
             MediaServiceManager.getInstance(this).ensureServiceConfigSanitized("transmission");
             MediaServiceManager.getInstance(this).autoWireStack(null);
             svc.reconcileInstalledState();
+            return;
+        }
+
+        if ("torrserver".equalsIgnoreCase(id)) {
+            installTorrServer(svc, prefix, progress);
             return;
         }
 
@@ -9251,6 +9317,7 @@ public final class JellyarrActivity extends AppCompatActivity
         addSettingsMenuRow("Automation", "Transmission cleanup, auto-recheck, Wi-Fi only", buildAutomationSection());
         addSettingsMenuRow("Companion services", "Install or uninstall Radarr, Sonarr, Prowlarr and Transmission", buildCompanionServicesSection());
         addSettingsMenuRow("Playback & Streaming", "Codecs and transcoding", buildStreamingSection());
+        addSettingsMenuRow("Stremio & AIOStreams", "Jellyfin library and Prowlarr torrents as a Stremio addon", buildStremioBridgeSection());
 
         addSettingsGroupHeader("DEVICE & SECURITY");
         addSettingsMenuRow("Storage", "Jellyarr footprint and disk usage", buildStorageSection());
@@ -9393,6 +9460,7 @@ public final class JellyarrActivity extends AppCompatActivity
             if ("Permissions & Health".equals(name)) refreshPermissionsUI();
             else if ("Security & Identity".equals(name)) refreshSecurityUsersUI();
             else if ("Backup & Restore".equals(name)) updateBackupStatusUI();
+            else if ("Stremio & AIOStreams".equals(name) && bridgeRefresh != null) bridgeRefresh.run();
         } catch (Throwable ignored) {}
         settingsMenu.getParent();
         ((View) settingsMenu.getParent()).setVisibility(View.GONE);
@@ -10584,6 +10652,136 @@ public final class JellyarrActivity extends AppCompatActivity
 
         section.addView(card);
         refreshCompanionButtons();
+        return section;
+    }
+
+    private Runnable bridgeRefresh;
+
+    /** Settings > Stremio & AIOStreams: the in-app Stremio addon (StremioBridge) and TorrServer. */
+    private View buildStremioBridgeSection() {
+        final android.content.Context ctx = this;
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+        section.addView(createSettingsSectionHeader("STREMIO & AIOSTREAMS"));
+
+        LinearLayout card = createSettingsSectionCard();
+        card.addView(settingsSwitchRow("Jellyarr addon",
+                "A Stremio addon served by Jellyarr on port " + com.jellyarr.app.services.StremioBridge.PORT
+                        + ": your Jellyfin movies and series, and Prowlarr torrents, for AIOStreams and Stremio on your network.",
+                com.jellyarr.app.services.StremioBridge.isEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setEnabled(ctx, checked);
+                    if (bridgeRefresh != null) bridgeRefresh.run();
+                }));
+
+        final TextView status = UiKit.caption(this, "");
+        status.setPadding(0, dp(2), 0, dp(6));
+        card.addView(status);
+
+        card.addView(UiKit.overline(this, I18n.tr("Addon URL")));
+        final LinearLayout urlBox = UiKit.column(this);
+        card.addView(urlBox);
+
+        LinearLayout urlBtns = new LinearLayout(this);
+        urlBtns.setOrientation(LinearLayout.HORIZONTAL);
+        urlBtns.setPadding(0, dp(6), 0, 0);
+        Button openStremio = UiKit.tonal(this, buttonLabel("OPEN IN STREMIO"), v -> {
+            String url = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.replaceFirst("^http://", "stremio://"))));
+            } catch (Throwable t) {
+                Toast.makeText(ctx, I18n.tr("Stremio is not installed on this device."), Toast.LENGTH_SHORT).show();
+            }
+        });
+        Button newKey = UiKit.outline(this, buttonLabel("NEW KEY"), v -> {
+            com.jellyarr.app.services.StremioBridge.regenerateKey(ctx);
+            if (bridgeRefresh != null) bridgeRefresh.run();
+            Toast.makeText(ctx, I18n.tr("New addon URL created. Add it again in AIOStreams or Stremio."), Toast.LENGTH_LONG).show();
+        });
+        LinearLayout.LayoutParams ob = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+        ob.setMarginEnd(dp(6));
+        urlBtns.addView(openStremio, ob);
+        urlBtns.addView(newKey, new LinearLayout.LayoutParams(0, dp(40), 1.0f));
+        card.addView(urlBtns);
+
+        card.addView(createSettingsDivider());
+
+        card.addView(settingsSwitchRow("Torrents from Prowlarr",
+                "Searches your Prowlarr indexers for every title and plays the result through TorrServer while it downloads. Nothing is added to Transmission.",
+                com.jellyarr.app.services.StremioBridge.isTorrentsEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setTorrentsEnabled(ctx, checked);
+                    if (bridgeRefresh != null) bridgeRefresh.run();
+                }));
+        final TextView deps = UiKit.caption(this, "");
+        deps.setPadding(0, dp(2), 0, dp(6));
+        card.addView(deps);
+        final Button tsBtn = UiKit.primary(this, buttonLabel("INSTALL TORRSERVER"), null);
+        card.addView(tsBtn, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        card.addView(createSettingsDivider());
+
+        card.addView(UiKit.text(this, I18n.tr("Use it in AIOStreams"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView how = UiKit.caption(this, I18n.tr(
+                "1. In AIOStreams, open Addons, choose Custom and paste the addon URL above.\n"
+                + "2. Add subtitle addons from the AIOStreams marketplace: OpenSubtitles V3, SubDL or SubSource (all have Arabic).\n"
+                + "3. Sign in to the AIOStreams Android app with your AIOStreams server. Jellyfin titles open from the Jellyarr catalogs; torrents appear next to every other source."));
+        how.setPadding(0, dp(2), 0, dp(4));
+        card.addView(how);
+
+        section.addView(card);
+
+        bridgeRefresh = () -> {
+            com.jellyarr.app.services.StremioBridge b = com.jellyarr.app.services.StremioBridge.getInstance();
+            boolean on = com.jellyarr.app.services.StremioBridge.isEnabled(ctx);
+            if (on && !b.isRunning()) b.start(ctx);
+            if (!on) {
+                status.setText(I18n.tr("Off"));
+                status.setTextColor(AppTheme.textSecondary());
+            } else if (b.isRunning()) {
+                status.setText(I18n.tr("Running on port " + com.jellyarr.app.services.StremioBridge.PORT));
+                status.setTextColor(AppTheme.accent());
+            } else {
+                String err = b.getLastError();
+                status.setText(I18n.tr("Could not start") + (err != null ? ": " + err : ""));
+                status.setTextColor(AppTheme.danger());
+            }
+            urlBox.removeAllViews();
+            String lan = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+            String local = com.jellyarr.app.services.StremioBridge.getLocalManifestUrl(ctx);
+            urlBox.addView(detailCopyRow("LAN", lan, true, "Jellyarr addon URL", lan));
+            if (!lan.equals(local)) {
+                urlBox.addView(detailCopyRow(I18n.tr("This phone"), local, true, "Jellyarr addon URL", local));
+            }
+
+            MediaServiceManager mgr = MediaServiceManager.getInstance(ctx);
+            ManagedService ts = mgr.getService("torrserver");
+            ManagedService pr = mgr.getService("prowlarr");
+            String prState = pr == null || !pr.isInstalled() ? I18n.tr("not installed")
+                    : mgr.isServiceRunning("prowlarr") ? I18n.tr("running") : I18n.tr("stopped");
+            String tsState = ts == null || !ts.isInstalled() ? I18n.tr("not installed")
+                    : mgr.isServiceRunning("torrserver") ? I18n.tr("running") : I18n.tr("stopped");
+            deps.setText("Prowlarr: " + prState + "  ·  TorrServer: " + tsState);
+            if (ts == null) {
+                tsBtn.setVisibility(View.GONE);
+            } else if (!ts.isInstalled()) {
+                tsBtn.setVisibility(View.VISIBLE);
+                tsBtn.setText(buttonLabel("INSTALL TORRSERVER"));
+                tsBtn.setOnClickListener(v -> installServiceAutomatically(ts));
+            } else if (!mgr.isServiceRunning("torrserver")) {
+                tsBtn.setVisibility(View.VISIBLE);
+                tsBtn.setText(buttonLabel("START TORRSERVER"));
+                tsBtn.setOnClickListener(v -> {
+                    mgr.recordServiceActive("torrserver", true);
+                    mgr.startService("torrserver", ctx);
+                    Toast.makeText(ctx, I18n.tr("Starting TorrServer..."), Toast.LENGTH_SHORT).show();
+                    status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 4000);
+                });
+            } else {
+                tsBtn.setVisibility(View.GONE);
+            }
+        };
+        bridgeRefresh.run();
         return section;
     }
 

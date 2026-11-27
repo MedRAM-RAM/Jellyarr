@@ -28,6 +28,8 @@ companion services that find, download and organize your media, and wires them t
 | **Radarr** | `7878` | Movies: monitoring, search, import and renaming |
 | **Prowlarr** | `9696` | Indexer manager, synced to Sonarr and Radarr |
 | **Transmission** | `9091` | BitTorrent download client |
+| **TorrServer** *(optional)* | `8090` | Streams torrents over HTTP while they download |
+| **Jellyarr addon** *(optional)* | `7070` | Stremio addon for AIOStreams and Stremio (built into the app) |
 
 All services listen on the phone and on your local network only.
 
@@ -45,6 +47,10 @@ All services listen on the phone and on your local network only.
   updated automatically.
 - **File management.** Radarr and Sonarr naming and import options in one place, *Organize* (rename every file to
   the current format) and import from a folder with Move or Copy.
+- **Stremio & AIOStreams.** A Stremio addon built into the app (Settings › Stremio & AIOStreams): Jellyfin
+  movie and series catalogs with direct play and Jellyfin's subtitles, and Prowlarr search results streamed
+  through TorrServer. Add its URL to AIOStreams as a custom addon, next to subtitle addons such as
+  OpenSubtitles V3, SubDL or SubSource, and browse it from the AIOStreams Android app.
 - **Automation.** Transmission auto-cleanup and auto-recheck, automatic missing-episode search, Wi-Fi-only mode.
 - **Updates in the app.** Stable and beta channels, background download, install from the notification.
 - **Backup & restore** of every service configuration and database.

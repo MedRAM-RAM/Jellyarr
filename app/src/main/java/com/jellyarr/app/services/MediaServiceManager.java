@@ -258,7 +258,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
         Log.i(TAG, "[LMKRecovery] Scheduling staggered background cold-start for persisted services: " + active);
         serviceExecutor.execute(() -> {
             try {
-                String[] startOrder = {"transmission", "prowlarr", "radarr", "sonarr"};
+                String[] startOrder = {"transmission", "prowlarr", "radarr", "sonarr", "torrserver"};
                 for (String sid : startOrder) {
                     if (!active.contains(sid)) continue;
                     try {
@@ -597,6 +597,28 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                 24
         );
         services.put(transmission.getId(), new ManagedService(transmission));
+
+        // 6. Torrent streaming: TorrServer (plays Prowlarr torrents for the Jellyarr Stremio bridge)
+        ServiceManifest torrserver = new ServiceManifest(
+                "torrserver",
+                "TorrServer",
+                "Streaming",
+                "latest",
+                "Streams torrents over HTTP while they download, for AIOStreams and Stremio through the Jellyarr bridge.",
+                StremioBridge.TORRSERVER_PORT,
+                "/echo",
+                "/",
+                new File(prefix, "bin").getAbsolutePath(),
+                new File(prefix, "bin/torrserver").getAbsolutePath(),
+                new File(home, ".config/torrserver").getAbsolutePath(),
+                new File(home, ".config/torrserver").getAbsolutePath(),
+                new File(home, ".config/torrserver").getAbsolutePath(),
+                "Native ARM64 (Go)",
+                false,
+                60,
+                24
+        );
+        services.put(torrserver.getId(), new ManagedService(torrserver));
     }
 
     private byte[] readAssetQuietly(String assetPath) {
@@ -1002,6 +1024,20 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                             targetDllOrBin.getAbsolutePath(),
                             "--port=" + port,
                             "--host=127.0.0.1"
+                    );
+                } else if ("torrserver".equalsIgnoreCase(id)) {
+                    // Native torrent streaming server (TorrServer, Go)
+                    if (targetDllOrBin.exists()) {
+                        targetDllOrBin.setExecutable(true, false);
+                        try {
+                            android.system.Os.chmod(targetDllOrBin.getAbsolutePath(), 0755);
+                        } catch (Throwable ignored) {}
+                    }
+                    pb = new ProcessBuilder(
+                            targetDllOrBin.getAbsolutePath(),
+                            "-p", String.valueOf(port),
+                            "-d", configDir.getAbsolutePath(),
+                            "-l", new File(logDir, "torrserver.log").getAbsolutePath()
                     );
                 } else if ("transmission".equalsIgnoreCase(id)) {
                     // Native BitTorrent daemon (Transmission)
@@ -1926,6 +1962,8 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
                 killProcessByPattern("prowlarr");
             } else if ("transmission".equalsIgnoreCase(serviceId)) {
                 killProcessByPattern("transmission-daemon");
+            } else if ("torrserver".equalsIgnoreCase(serviceId)) {
+                killProcessByPattern("torrserver");
             }
         }
 
@@ -2689,7 +2727,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
     public void startAllServices() {
         serviceExecutor.execute(() -> {
             ensureForegroundServiceActive();
-            String[] startOrder = {"jellyfin", "transmission", "prowlarr", "radarr", "sonarr"};
+            String[] startOrder = {"jellyfin", "transmission", "prowlarr", "radarr", "sonarr", "torrserver"};
             for (String id : startOrder) {
                 ManagedService svc = services.get(id);
                 if (svc != null && svc.isEnabled() && !svc.isBlocked() && svc.isInstalled() && !svc.isRunning()) {
@@ -2734,7 +2772,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
     public void startCompanionServices() {
         serviceExecutor.execute(() -> {
             ensureForegroundServiceActive();
-            String[] startOrder = {"transmission", "prowlarr", "radarr", "sonarr"};
+            String[] startOrder = {"transmission", "prowlarr", "radarr", "sonarr", "torrserver"};
             for (String id : startOrder) {
                 ManagedService svc = services.get(id);
                 if (svc != null && svc.isEnabled() && !svc.isBlocked() && svc.isInstalled() && !svc.isRunning()) {
@@ -2754,7 +2792,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
      * Strictly does NOT stop Jellyfin core server.
      */
     public void stopCompanionServices() {
-        for (String cid : new String[]{"transmission", "prowlarr", "radarr", "sonarr"}) {
+        for (String cid : new String[]{"transmission", "prowlarr", "radarr", "sonarr", "torrserver"}) {
             recordServiceActive(cid, false);
         }
         serviceExecutor.execute(() -> {
@@ -2793,7 +2831,7 @@ public class MediaServiceManager implements ServiceLifecycleContract, ServiceReg
             }
 
             // 2. Selectively restore only companion services present in targetIds
-            String[] companionOrder = {"transmission", "prowlarr", "radarr", "sonarr"};
+            String[] companionOrder = {"transmission", "prowlarr", "radarr", "sonarr", "torrserver"};
             for (String id : companionOrder) {
                 if (!targetIds.contains(id)) continue;
                 ManagedService svc = services.get(id);

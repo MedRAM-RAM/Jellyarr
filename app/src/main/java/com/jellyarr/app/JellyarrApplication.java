@@ -40,5 +40,7 @@ public class JellyarrApplication extends TermuxApplication {
         } catch (Exception e) {
             Log.e(TAG, "Failed to initialize unified JellyarrMedia storage directories", e);
         }
+        // Stremio / AIOStreams bridge (in-process HTTP server), only when the user turned it on.
+        try { com.jellyarr.app.services.StremioBridge.getInstance().startIfEnabled(context); } catch (Throwable ignored) {}
     }
 }
