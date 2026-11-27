@@ -657,6 +657,14 @@ public final class StremioBridge {
                 String rate = sent > 256 * 1024 ? String.format(Locale.US, " %.1f Mbit/s", sent * 8.0 / 1000.0 / ms) : "";
                 log(String.format(Locale.US, "%s via=%s  first byte %s  %s sent in %.1fs%s%s", kind, req.via,
                         ttfb < 0 ? "-" : ttfb + "ms", human(sent), ms / 1000.0, rate, closedEarly ? "  (player closed)" : ""));
+                Matcher hm = Pattern.compile("link=([0-9a-fA-F]{40})").matcher(r.proxyUrl);
+                if (kind.equals("torrent") && hm.find()) {
+                    final String hash = hm.group(1);
+                    fetchPool.execute(() -> {
+                        String line = peerLine(torrStat(hash));
+                        if (!line.isEmpty()) log("torrent swarm now" + line);
+                    });
+                }
             }
         }
     }
@@ -1856,6 +1864,8 @@ public final class StremioBridge {
             return Resp.text(503, "TorrServer is not running. Start it in Jellyarr.");
         }
 
+        // Players open the same link several times at once (probe, play, seeks): resolve it once, the rest wait.
+        synchronized (ref) {
         if (ref.resolvedHash == null) {
             final long tr = System.currentTimeMillis();
             String link = resolveLink(ref);
@@ -1886,10 +1896,12 @@ public final class StremioBridge {
             }
             if (ref.season >= 0 && epId >= 0) { bestId = epId; bestPath = epPath; }
             if (bestId < 0) return Resp.text(502, "No video file in this torrent.");
-            log(String.format(Locale.US, "torrent opened in TorrServer: %s  (%.1fs to get the file list)", abbreviate(ref.title), (System.currentTimeMillis() - tr) / 1000.0));
+            log(String.format(Locale.US, "torrent opened in TorrServer: %s  (%.1fs to get the file list)%s", abbreviate(ref.title),
+                    (System.currentTimeMillis() - tr) / 1000.0, peerLine(status)));
             ref.resolvedHash = hash;
             ref.resolvedIndex = bestId;
             ref.resolvedName = bestPath.substring(bestPath.lastIndexOf('/') + 1);
+        }
         }
         String to = TORRSERVER + "/stream/" + encPath(ref.resolvedName)
                 + "?link=" + ref.resolvedHash + "&index=" + ref.resolvedIndex + "&play";
@@ -1937,6 +1949,13 @@ public final class StremioBridge {
             conn.disconnect();
         }
         return torrentToMagnet(data);
+    }
+
+    /** " · peers 3/20, seeders 2, 310 KB/s" from a TorrServer status; empty when it has no such fields. */
+    private static String peerLine(JSONObject st) {
+        if (st == null || !st.has("total_peers") && !st.has("active_peers")) return "";
+        return String.format(Locale.US, "  · peers %d/%d, seeders %d, %s/s", st.optInt("active_peers"), st.optInt("total_peers"),
+                st.optInt("connected_seeders"), human((long) st.optDouble("download_speed", 0)));
     }
 
     private JSONObject torrStat(String magnet) {
