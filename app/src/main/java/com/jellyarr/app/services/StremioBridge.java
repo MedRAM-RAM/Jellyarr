@@ -74,6 +74,8 @@ public final class StremioBridge {
     static String subdlApi = "https://api.subdl.com/api/v1/subtitles";
     static String subdlDl = "https://dl.subdl.com";
     private static final int MAX_SUBS_PER_LANG = 8;
+    /** How many of the best torrent results also get a home-network entry when a public address is set. */
+    private static final int LAN_TORRENTS = 5;
     /** How long /stream waits for Prowlarr; slower searches keep running and fill the cache for the next request. */
     static long prowlarrBudgetMs = 12000;
     private static final long PROWLARR_TTL_MS = 15 * 60 * 1000L;
@@ -1637,18 +1639,26 @@ public final class StremioBridge {
             String desc = ref.title + "\n👤 " + r.optInt("seeders", 0)
                     + (size > 0 ? "  💾 " + human(size) : "")
                     + "  ⚙️ " + r.optString("indexer", "Prowlarr");
-            JSONObject s = new JSONObject();
-            s.put("name", "Jellyarr\n🧲 " + quality);
-            s.put("title", desc);
-            s.put("description", desc);
-            s.put("url", self + "/play/" + tokenId);
-            JSONObject hints = new JSONObject();
-            hints.put("bingeGroup", "jellyarr-torrent-" + quality);
-            hints.put("notWebReady", true);
-            if (size > 0) hints.put("videoSize", size);
-            hints.put("filename", ref.title);
-            s.put("behaviorHints", hints);
-            out.put(s);
+            // Over the home network first (no loop out to Cloudflare and back), then the public address.
+            String lan = i < LAN_TORRENTS ? LAN_SELF.get() : null;
+            List<String> bases = new ArrayList<>();
+            if (lan != null) bases.add(lan);
+            bases.add(self);
+            for (String base : bases) {
+                boolean lanVariant = lan != null && base.equals(lan);
+                JSONObject s = new JSONObject();
+                s.put("name", "Jellyarr\n🧲 " + quality + (lanVariant ? " · 🏠 LAN" : ""));
+                s.put("title", desc);
+                s.put("description", desc);
+                s.put("url", base + "/play/" + tokenId);
+                JSONObject hints = new JSONObject();
+                hints.put("bingeGroup", "jellyarr-torrent-" + quality);
+                hints.put("notWebReady", true);
+                if (size > 0) hints.put("videoSize", size);
+                hints.put("filename", lanVariant ? ref.title + " [LAN]" : ref.title);
+                s.put("behaviorHints", hints);
+                out.put(s);
+            }
         }
     }
 
