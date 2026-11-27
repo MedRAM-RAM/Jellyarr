@@ -55,6 +55,13 @@ All services listen on the phone and on your local network only.
   SubDL, Wyzie, SubSource, OpenSubtitles.com (your own keys), OpenSubtitles V3 and any other Stremio subtitle addon
   (shown in turn so no source fills the list), in the languages you pick,
   with the ones that match the playing file first (old Arabic/Hebrew/Cyrillic files are converted to UTF-8).
+  **Automatic subtitle sync:** the best subtitles of each language are downloaded while the list is built and checked
+  (really the right script, then timing against something known to fit the video: a subtitle that matched the file's
+  hash, a text track of the library file, or a subtitle shipped inside the torrent). A clearly out-of-sync subtitle is
+  shifted (offset, 23.976/24/25/30 fps conversions, one cut point) and anything doubtful is left untouched. Each
+  subtitle's `title` (shown by Nuvio and other players) says the source, the fit percentage and what was done.
+  Options: subtitles per language, how many to check, time limit, minimum fit, apply/check-only/off, hearing-impaired
+  handling, per-source switches. Works with Stremio and Nuvio.
   Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
   never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use
   it from apps that are not on your home network, such as a hosted AIOStreams. With a public address set, local

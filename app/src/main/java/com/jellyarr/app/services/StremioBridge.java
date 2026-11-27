@@ -76,7 +76,6 @@ public final class StremioBridge {
     static String wyzieApi = "https://sub.wyzie.io";
     static String subsourceApi = "https://api.subsource.net/api/v1";
     static String oscomApi = "https://api.opensubtitles.com/api/v1";
-    private static final int MAX_SUBS_PER_LANG = 12;
     /** How many of the best torrent results also get a home-network entry when a public address is set. */
     private static final int LAN_TORRENTS = 5;
     /** How long /stream waits for Prowlarr; slower searches keep running and fill the cache for the next request. */
@@ -139,6 +138,7 @@ public final class StremioBridge {
         String title;
         int season = -1;
         int episode = -1;
+        List<String[]> subFiles = new ArrayList<>(); // {file index, path} of .srt files shipped in the torrent
         String resolvedHash; // after first play
         int resolvedIndex = -1;
         String resolvedName;
@@ -331,6 +331,59 @@ public final class StremioBridge {
     public static void setStreamLinks(Context c, String v) {
         prefs(c).edit().putString("stream_links", v.equals("lan") || v.equals("public") ? v : "both").apply();
     }
+
+    // ---- subtitle options
+    private static int intPref(Context c, String k, int d, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, prefs(c).getInt(k, d)));
+    }
+
+    private static boolean saveInt(Context c, String k, String text, int lo, int hi) {
+        try {
+            int v = Integer.parseInt(text == null ? "" : text.trim());
+            if (v < lo || v > hi) return false;
+            prefs(c).edit().putInt(k, v).apply();
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Most subtitles offered per language. */
+    public static int getSubMax(Context c) { return intPref(c, "sub_max", 12, 1, 40); }
+    public static boolean setSubMax(Context c, String t) { return saveInt(c, "sub_max", t, 1, 40); }
+    /** How many per language are downloaded and checked while the list is built (0 = none). */
+    public static int getSubVerify(Context c) { return intPref(c, "sub_verify", 6, 0, 12); }
+    public static boolean setSubVerify(Context c, String t) { return saveInt(c, "sub_verify", t, 0, 12); }
+    /** Seconds the list may wait for those checks. */
+    public static int getSubBudget(Context c) { return intPref(c, "sub_budget", 12, 3, 40); }
+    public static boolean setSubBudget(Context c, String t) { return saveInt(c, "sub_budget", t, 3, 40); }
+    /** Checked subtitles that match the video less than this many percent are hidden. */
+    public static int getSubMinAcc(Context c) { return intPref(c, "sub_min_acc", 0, 0, 90); }
+    public static boolean setSubMinAcc(Context c, String t) { return saveInt(c, "sub_min_acc", t, 0, 90); }
+
+    /** "auto" shifts subtitles that are clearly out of sync, "check" only reports it, "off" never touches them. */
+    public static String getSubSync(Context c) {
+        String v = prefs(c).getString("sub_sync", "auto");
+        return v.equals("check") || v.equals("off") ? v : "auto";
+    }
+    public static void setSubSync(Context c, String v) {
+        prefs(c).edit().putString("sub_sync", v.equals("check") || v.equals("off") ? v : "auto").apply();
+    }
+    /** "any", "exclude" or "prefer" for hearing-impaired subtitles. */
+    public static String getSubHi(Context c) {
+        String v = prefs(c).getString("sub_hi", "any");
+        return v.equals("exclude") || v.equals("prefer") ? v : "any";
+    }
+    public static void setSubHi(Context c, String v) {
+        prefs(c).edit().putString("sub_hi", v.equals("exclude") || v.equals("prefer") ? v : "any").apply();
+    }
+    public static boolean isSubTitles(Context c) { return prefs(c).getBoolean("sub_titles", true); }
+    public static void setSubTitles(Context c, boolean on) { prefs(c).edit().putBoolean("sub_titles", on).apply(); }
+    public static boolean isOsV3(Context c) { return prefs(c).getBoolean("sub_osv3", true); }
+    public static void setOsV3(Context c, boolean on) { prefs(c).edit().putBoolean("sub_osv3", on).apply(); }
+    /** Checking OpenSubtitles.com results downloads them, which counts against the key's daily quota. */
+    public static boolean isVerifyOscom(Context c) { return prefs(c).getBoolean("sub_verify_oscom", false); }
+    public static void setVerifyOscom(Context c, boolean on) { prefs(c).edit().putBoolean("sub_verify_oscom", on).apply(); }
 
     public static int getMaxTorrents(Context c) { return prefs(c).getInt("max_torrents", 15); }
 
@@ -1231,12 +1284,82 @@ public final class StremioBridge {
     private static final class Sub {
         String id, url, lang, name;
         int score;
-        int source; // 0 SubDL, 1 OpenSubtitles, 2 other addons
+        int source; // 0 SubDL/Wyzie/SubSource/OpenSubtitles.com, 1 OpenSubtitles v3, 2 other addons
+        String provider = "";
+        boolean hi;
+        boolean trusted;     // matched the exact file by hash
+        SubRef ref;
+        Verdict verdict;     // set when the file was downloaded and checked
+    }
+
+    // ------------------------------------------------------------------ what is being played, and what to check against
+
+    /** Identifies the file being played (as far as the player says) and what its subtitles can be checked against. */
+    private static final class SyncCtx {
+        String key = "", type, imdb, filename, videoHash;
+        int season = -1, episode = -1;
+        long videoSize;
+        LocalMatch local;
+        final List<SubRef> hashRefs = Collections.synchronizedList(new ArrayList<SubRef>());
+        boolean refDone;
+        RefInfo ref;
+    }
+
+    private static final class LocalMatch {
+        String itemId, msId, name;
+        long size;
+        double runtimeSec;
+        JSONArray streams;
+    }
+
+    private static final class RefInfo {
+        List<SubtitleSync.Cue> cues;
+        String label;
+    }
+
+    /** The outcome of downloading and checking one subtitle. */
+    private static final class Verdict {
+        boolean drop, verified, trusted;
+        int accuracy = -1;
+        String status = "", detail = "", text;
+    }
+
+    private final Map<String, Verdict> verdicts = Collections.synchronizedMap(
+            new LinkedHashMap<String, Verdict>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Verdict> e) {
+                    return size() > 200;
+                }
+            });
+
+    private final Map<String, String> rawTexts = Collections.synchronizedMap(
+            new LinkedHashMap<String, String>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> e) {
+                    return size() > 80;
+                }
+            });
+
+    private static String rawKey(SubRef r) { return r.kind + ":" + r.id + "|" + r.lang + "|" + r.season + "|" + r.episode; }
+
+    private static String verdictKey(SubRef r, String mode) {
+        return rawKey(r) + "|" + (r.sync == null ? "" : r.sync.key) + "|" + mode;
+    }
+
+    /** The subtitle exactly as the provider gives it (cached, so checking and serving download it once). */
+    private String fetchRaw(Context c, SubRef r) throws Exception {
+        String k = rawKey(r);
+        String hit = rawTexts.get(k);
+        if (hit != null) return hit;
+        String text = fetchSubtitleText(c, r);
+        if (text != null) rawTexts.put(k, text);
+        return text;
     }
 
     /**
-     * Jellyfin's own subtitle files, then SubDL, OpenSubtitles and any extra addons asked in parallel, in the
-     * configured languages; within a language the ones that look like the playing file come first.
+     * Jellyfin's own subtitle files, then every provider asked in parallel, in the configured languages. The best
+     * candidates of each language are downloaded and checked while the list is built (script, then timing against
+     * a reference that fits the video), and each entry's title says where it came from and how well it fits.
      */
     private JSONObject subtitles(Context c, String type, String id, String extraRaw, String self) throws Exception {
         JSONArray out = new JSONArray();
@@ -1256,24 +1379,40 @@ public final class StremioBridge {
             String canon = canonLang(l);
             if (canon != null && !wanted.contains(canon)) wanted.add(canon);
         }
-        final String filename = parseExtra(dec(extraRaw)).get("filename");
-        final String key = getSubdlKey(c);
+        final Map<String, String> extras = parseExtra(dec(extraRaw));
         final String[] p = id.split(":");
         final boolean series = "series".equals(type) && p.length >= 3;
-        final int season = series ? parseInt(p[1]) : -1;
-        final int episode = series ? parseInt(p[2]) : -1;
+        final SyncCtx x = new SyncCtx();
+        x.type = type; x.imdb = p[0];
+        x.season = series ? parseInt(p[1]) : -1;
+        x.episode = series ? parseInt(p[2]) : -1;
+        x.filename = extras.get("filename");
+        String vh = extras.get("videoHash");
+        x.videoHash = vh != null && vh.matches("[0-9a-fA-F]{16}") ? vh.toLowerCase(Locale.ROOT) : null;
+        try { x.videoSize = Long.parseLong(extras.getOrDefault("videoSize", "0")); } catch (Throwable ignored) {}
+        x.key = Integer.toHexString((x.filename + "|" + x.videoHash + "|" + x.videoSize).hashCode());
+        final String mode = getSubSync(c);
 
+        // The file being played may be the library file: then its hash is known and so is its own timing.
+        if (!mode.equals("off")) {
+            x.local = localMatch(c, x);
+            if (x.local != null && x.videoHash == null) x.videoHash = localHash(c, x.local);
+        }
+
+        final String key = getSubdlKey(c), wk = getWyzieKey(c), sk = getSubsourceKey(c), ok = getOscomKey(c);
+        final String hash = x.videoHash;
         List<Callable<List<Sub>>> jobs = new ArrayList<>();
-        jobs.add(() -> addonSubs(OPENSUBS, type, id, extraRaw, 1, "os-"));
-        if (!key.isEmpty()) jobs.add(() -> subdlSubs(key, p[0], series, season, episode, wanted, self));
-        final String wk = getWyzieKey(c), sk = getSubsourceKey(c), ok = getOscomKey(c);
-        if (!wk.isEmpty()) jobs.add(() -> wyzieSubs(wk, p[0], series, season, episode, wanted, self));
-        if (!sk.isEmpty()) jobs.add(() -> subsourceSubs(sk, p[0], series, season, episode, wanted, self));
-        if (!ok.isEmpty()) jobs.add(() -> oscomSubs(ok, p[0], series, season, episode, wanted, self));
+        if (isOsV3(c)) jobs.add(() -> addonSubs(OPENSUBS, type, id, extraRaw, 1, "os-", "OpenSubtitles", self));
+        if (!key.isEmpty()) jobs.add(() -> subdlSubs(key, p[0], series, x.season, x.episode, wanted, self));
+        if (!wk.isEmpty()) jobs.add(() -> wyzieSubs(wk, p[0], series, x.season, x.episode, wanted, self));
+        if (!sk.isEmpty()) jobs.add(() -> subsourceSubs(sk, p[0], series, x.season, x.episode, wanted, self));
+        if (!ok.isEmpty()) jobs.add(() -> oscomSubs(ok, p[0], series, x.season, x.episode, wanted, self, hash));
         int n = 0;
         for (String base : addonBases(getSubAddons(c))) {
-            final String tag = "x" + (n++) + "-";
-            jobs.add(() -> addonSubs(base, type, id, extraRaw, 2, tag));
+            final String tag = "x" + n + "-";
+            final String label = hostOf(base);
+            n++;
+            jobs.add(() -> addonSubs(base, type, id, extraRaw, 2, tag, label, self));
         }
         List<Future<List<Sub>>> futures = new ArrayList<>();
         for (Callable<List<Sub>> j : jobs) futures.add(fetchPool.submit(j));
@@ -1288,44 +1427,480 @@ public final class StremioBridge {
             }
         }
 
+        final String hi = getSubHi(c);
         Set<String> seen = new HashSet<>();
-        List<Sub> unique = new ArrayList<>();
-        for (Sub s : all) {
-            if (s.lang == null || s.url == null || !seen.add(s.url)) continue;
-            s.score = similarity(s.name, filename);
-            unique.add(s);
+        List<Sub> pool = new ArrayList<>();
+        for (Sub sub : all) {
+            if (sub.lang == null || sub.url == null || !seen.add(sub.url)) continue;
+            if (hi.equals("exclude") && sub.hi) continue;
+            if (sub.ref != null) sub.ref.sync = x;
+            if (sub.trusted && sub.ref != null) x.hashRefs.add(sub.ref);
+            sub.score = similarity(sub.name, x.filename);
+            pool.add(sub);
         }
-        Collections.sort(unique, (x, y) -> x.score != y.score ? Integer.compare(y.score, x.score) : Integer.compare(x.source, y.source));
-        if (wanted.isEmpty()) {
-            for (int i = 0; i < unique.size() && i < 40; i++) put(out, unique.get(i));
-        } else {
-            for (String l : wanted) {
-                // One from each provider in turn (each provider's best first), so one source cannot fill the list.
+        // before checking: exact-file matches first, then the closest release names, hearing-impaired last if preferred
+        final boolean preferHi = hi.equals("prefer");
+        Collections.sort(pool, (u, w) -> {
+            if (u.trusted != w.trusted) return u.trusted ? -1 : 1;
+            if (u.score != w.score) return Integer.compare(w.score, u.score);
+            if (preferHi && u.hi != w.hi) return u.hi ? -1 : 1;
+            return Integer.compare(u.source, w.source);
+        });
+
+        List<String> groups = new ArrayList<>(wanted);
+        if (groups.isEmpty()) for (Sub sub : pool) if (!groups.contains(sub.lang)) groups.add(sub.lang);
+        int maxPerLang = getSubMax(c);
+
+        // ---- download and check the best of each language, within a time limit
+        int verifyN = getSubVerify(c);
+        final boolean oscomOk = isVerifyOscom(c);
+        List<Sub> toCheck = new ArrayList<>();
+        if (verifyN > 0) {
+            for (String g : groups) {
+                // one from each provider in turn (each one's best first), so every source gets checked
                 Map<String, List<Sub>> byProvider = new LinkedHashMap<>();
-                for (Sub s : unique) {
-                    if (!l.equals(s.lang)) continue;
-                    String prov = s.id.contains("-") ? s.id.substring(0, s.id.indexOf('-')) : s.id;
-                    List<Sub> q = byProvider.get(prov);
-                    if (q == null) { q = new ArrayList<>(); byProvider.put(prov, q); }
-                    q.add(s);
+                for (Sub sub : pool) {
+                    if (!g.equals(sub.lang) || sub.ref == null) continue;
+                    if (sub.provider.equals("OpenSubtitles.com") && !sub.trusted && !oscomOk) continue;
+                    List<Sub> q = byProvider.get(sub.provider);
+                    if (q == null) { q = new ArrayList<>(); byProvider.put(sub.provider, q); }
+                    q.add(sub);
                 }
                 int k = 0;
-                for (int round = 0; k < MAX_SUBS_PER_LANG; round++) {
+                for (int round = 0; k < verifyN; round++) {
                     boolean any = false;
                     for (List<Sub> q : byProvider.values()) {
-                        if (round < q.size() && k < MAX_SUBS_PER_LANG) { put(out, q.get(round)); k++; any = true; }
+                        if (round < q.size() && k < verifyN) { toCheck.add(q.get(round)); k++; any = true; }
                     }
                     if (!any) break;
                 }
             }
         }
+        List<Future<Verdict>> checks = new ArrayList<>();
+        for (Sub sub : toCheck) checks.add(fetchPool.submit(() -> verify(c, x, sub, mode)));
+        long vDeadline = System.currentTimeMillis() + getSubBudget(c) * 1000L;
+        int done = 0;
+        for (int i = 0; i < toCheck.size(); i++) {
+            try {
+                toCheck.get(i).verdict = checks.get(i).get(Math.max(1, vDeadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
+                done++;
+            } catch (Throwable t) {
+                // too slow: it is listed unchecked and keeps going, so the next request already has the answer
+            }
+        }
+        // anything checked earlier (a previous request) counts even if it was not in this round
+        for (Sub sub : pool) {
+            if (sub.verdict == null && sub.ref != null) sub.verdict = verdicts.get(verdictKey(sub.ref, mode));
+        }
+        int minAcc = getSubMinAcc(c);
+        List<Sub> kept = new ArrayList<>();
+        for (Sub sub : pool) {
+            Verdict v = sub.verdict;
+            if (v != null && v.drop) continue;
+            if (v != null && v.verified && !v.trusted && minAcc > 0 && v.accuracy >= 0 && v.accuracy < minAcc) continue;
+            kept.add(sub);
+        }
+        // checked-and-fitting first, then unchecked, then checked-but-unconvincing; best accuracy first inside each
+        Collections.sort(kept, (u, w) -> {
+            int tu = tier(u), tw = tier(w);
+            if (tu != tw) return Integer.compare(tu, tw);
+            int au = accuracyOf(u, x.filename), aw = accuracyOf(w, x.filename);
+            if (au != aw) return Integer.compare(aw, au);
+            if (preferHi && u.hi != w.hi) return u.hi ? -1 : 1;
+            return Integer.compare(u.source, w.source);
+        });
+        boolean titles = isSubTitles(c);
+        for (String g : groups) {
+            for (Sub sub : spread(kept, g, maxPerLang)) put(out, sub, titles, x.filename);
+        }
+        log(String.format(Locale.US, "subtitles %s  %d found, %d checked in %dms%s%s", id, pool.size(), done,
+                System.currentTimeMillis() - (vDeadline - getSubBudget(c) * 1000L),
+                x.local != null ? "  · library file recognised" : "", x.videoHash != null ? "  · hash " + x.videoHash.substring(0, 8) : ""));
         return new JSONObject().put("subtitles", out);
     }
 
-    private static void put(JSONArray out, Sub s) {
+    private static String hostOf(String base) {
+        try { return new URL(base).getHost().replaceFirst("^www\\.", ""); } catch (Throwable t) { return "addon"; }
+    }
+
+    /** Candidates of one language in the given order, but no provider takes more than its share of the slots. */
+    private static List<Sub> spread(List<Sub> ordered, String lang, int max) {
+        List<Sub> ofLang = new ArrayList<>();
+        Set<String> providers = new HashSet<>();
+        for (Sub s : ordered) if (lang.equals(s.lang)) { ofLang.add(s); providers.add(s.provider); }
+        int cap = Math.max(2, (int) Math.ceil(max / (double) Math.max(1, providers.size())) + 1);
+        Map<String, Integer> used = new HashMap<>();
+        List<Sub> out = new ArrayList<>(), skipped = new ArrayList<>();
+        for (Sub s : ofLang) {
+            if (out.size() >= max) break;
+            int u = used.containsKey(s.provider) ? used.get(s.provider) : 0;
+            if (u >= cap) { skipped.add(s); continue; }
+            used.put(s.provider, u + 1);
+            out.add(s);
+        }
+        for (Sub s : skipped) if (out.size() < max) out.add(s);
+        return out;
+    }
+
+    /** 0 exact file / fitted, 1 not checked, 2 checked but not convincing. */
+    private static int tier(Sub s) {
+        Verdict v = s.verdict;
+        if (v == null) return s.trusted ? 0 : 1;
+        if (v.trusted) return 0;
+        if (v.verified && (v.status.startsWith("✔"))) return 0;
+        if (v.verified) return 2;
+        return 1;
+    }
+
+    private static int accuracyOf(Sub s, String filename) {
+        if (s.verdict != null && s.verdict.accuracy >= 0) return s.verdict.accuracy;
+        int r = releasePct(s.name, filename);
+        return r < 0 ? 0 : r / 2;   // a release-name guess counts for less than a measured fit
+    }
+
+    private static void put(JSONArray out, Sub s, boolean titles, String filename) {
         try {
-            out.put(new JSONObject().put("id", s.id).put("url", s.url).put("lang", s.lang));
+            JSONObject o = new JSONObject().put("id", s.id).put("url", s.url).put("lang", s.lang);
+            if (titles) {
+                o.put("title", titleOf(s, filename));
+                String f = (s.name == null || s.name.isEmpty() ? s.provider + "-" + s.lang : s.name).replaceAll("[^A-Za-z0-9._ \\-]", "_");
+                o.put("file", f.endsWith(".srt") ? f : f + ".srt");
+            }
+            out.put(o);
         } catch (Throwable ignored) {}
+    }
+
+    /** Two lines, which players such as Nuvio show: how it fits, then where it comes from. */
+    private static String titleOf(Sub s, String filename) {
+        Verdict v = s.verdict;
+        String line1;
+        if (v != null && v.trusted) {
+            line1 = "[✔ Exact file match (hash)]";
+        } else if (v != null && !v.status.isEmpty()) {
+            line1 = "[" + v.status + (v.accuracy >= 0 ? " | " + v.accuracy + "%" : "") + "]" + (v.detail.isEmpty() ? "" : " (" + v.detail + ")");
+        } else {
+            int r = releasePct(s.name, filename);
+            line1 = r >= 0 ? "[≈ Release " + r + "% | not checked]" : "[Not checked]";
+        }
+        String name = s.name == null || s.name.isEmpty() ? "" : " " + s.name;
+        return line1 + "\n[" + s.provider + (s.hi ? " · HI" : "") + "]" + name;
+    }
+
+    // ------------------------------------------------------------------ references, checking and sync
+
+    private static String normName(String n) {
+        if (n == null) return "";
+        String t = n.replaceAll("(?i)\\s*\\[LAN\\]\\s*$", "").trim();
+        int dot = t.lastIndexOf('.');
+        if (dot > 0 && t.length() - dot <= 5) t = t.substring(0, dot);
+        return t.toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean sameFile(String played, String local) {
+        String a = normName(played), b = normName(local);
+        return !a.isEmpty() && (a.equals(b) || releasePct(a, b) >= 95);
+    }
+
+    /** The library file the player says it is playing, if the title is in Jellyfin; null when it cannot be told. */
+    private LocalMatch localMatch(Context c, SyncCtx x) {
+        if (x.filename == null && x.videoSize <= 0) return null;
+        try {
+            List<String> ids = imdbIndex(c).get(x.imdb);
+            if (ids == null) return null;
+            for (String itemId : ids) {
+                String target = itemId;
+                if (x.season >= 0) {
+                    target = findEpisode(c, itemId, x.season, x.episode);
+                    if (target == null) continue;
+                }
+                JSONObject it = new JSONObject(jfGet(c, "/Users/" + userId(c) + "/Items/" + enc(target)));
+                JSONArray srcs = it.optJSONArray("MediaSources");
+                for (int i = 0; srcs != null && i < srcs.length(); i++) {
+                    JSONObject ms = srcs.getJSONObject(i);
+                    String path = ms.optString("Path", "");
+                    String name = path.substring(path.lastIndexOf('/') + 1);
+                    long size = ms.optLong("Size", 0);
+                    if ((x.videoSize > 0 && size == x.videoSize) || (x.filename != null && sameFile(x.filename, name))) {
+                        LocalMatch m = new LocalMatch();
+                        m.itemId = target; m.msId = ms.optString("Id", target); m.name = name; m.size = size;
+                        m.runtimeSec = it.optLong("RunTimeTicks", 0) / 1e7;
+                        m.streams = ms.optJSONArray("MediaStreams");
+                        return m;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "library match: " + t.getMessage());
+        }
+        return null;
+    }
+
+    /** The OpenSubtitles hash of the library file (its size plus its first and last 64 KB): two small range reads. */
+    private String localHash(Context c, LocalMatch m) {
+        if (m.size < 131072) return null;
+        try {
+            Map<String, String> h = new HashMap<>();
+            h.put("X-Emby-Token", jfToken(c));
+            String url = JF + "/Videos/" + m.itemId + "/stream?static=true&MediaSourceId=" + enc(m.msId);
+            int[] st = new int[1];
+            h.put("Range", "bytes=0-65535");
+            byte[] head = httpBytes("GET", url, h, null, 70000, st);
+            if ((st[0] != 206 && st[0] != 200) || head.length != 65536) return null;
+            h.put("Range", "bytes=" + (m.size - 65536) + "-" + (m.size - 1));
+            byte[] tail = httpBytes("GET", url, h, null, 70000, st);
+            if ((st[0] != 206 && st[0] != 200) || tail.length != 65536) return null;
+            return osHash(m.size, head, tail);
+        } catch (Throwable t) {
+            Log.w(TAG, "library hash: " + t.getMessage());
+            return null;
+        }
+    }
+
+    static String osHash(long size, byte[] head, byte[] tail) {
+        return String.format(Locale.US, "%016x", size + sumLe64(head) + sumLe64(tail));
+    }
+
+    private static long sumLe64(byte[] b) {
+        long sum = 0;
+        for (int i = 0; i + 8 <= b.length; i += 8) {
+            long v = 0;
+            for (int k = 7; k >= 0; k--) v = (v << 8) | (b[i + k] & 0xFF);
+            sum += v;
+        }
+        return sum;
+    }
+
+    private static RefInfo refInfo(String text, String label, double runtimeSec) {
+        if (text == null) return null;
+        List<SubtitleSync.Cue> cues = SubtitleSync.parse(text);
+        if (cues.size() < SubtitleSync.MIN_CUES) return null;
+        long end = 0;
+        for (SubtitleSync.Cue c : cues) end = Math.max(end, c.end);
+        if (runtimeSec > 600 && end / 1000.0 < runtimeSec * 0.5) return null; // forced / signs-only tracks
+        RefInfo r = new RefInfo();
+        r.cues = cues; r.label = label;
+        return r;
+    }
+
+    private static RefInfo refIfReady(SyncCtx x) {
+        synchronized (x) { return x.refDone ? x.ref : null; }
+    }
+
+    /**
+     * Something that is known to fit the video, in order of trust: a subtitle that matched the file's hash, a text
+     * track of the library file itself, a subtitle shipped inside the torrent. Null when there is none.
+     */
+    private RefInfo resolveRef(Context c, SyncCtx x) {
+        synchronized (x) {
+            if (x.refDone) return x.ref;
+            RefInfo r = null;
+            try {
+                for (SubRef hr : new ArrayList<>(x.hashRefs)) {
+                    if (r != null) break;
+                    r = refInfo(fetchRaw(c, hr), "OpenSubtitles hash match", 0);
+                }
+                if (r == null && x.local != null) r = refFromLibrary(c, x.local);
+                if (r == null) r = refFromTorrent(c, x);
+            } catch (Throwable t) {
+                Log.w(TAG, "reference: " + t.getMessage());
+            }
+            x.ref = r;
+            x.refDone = true;
+            log(r == null ? "sync reference: none for this file" : "sync reference: " + r.label + " (" + r.cues.size() + " lines)");
+            return r;
+        }
+    }
+
+    private RefInfo refFromLibrary(Context c, LocalMatch m) throws Exception {
+        if (m.streams == null) return null;
+        List<JSONObject> tracks = new ArrayList<>();
+        for (int i = 0; i < m.streams.length(); i++) {
+            JSONObject st = m.streams.optJSONObject(i);
+            if (st == null || !"Subtitle".equals(st.optString("Type")) || st.optBoolean("IsForced") || !st.optBoolean("IsTextSubtitleStream", true)) continue;
+            tracks.add(st);
+        }
+        Collections.sort(tracks, (a, b) -> {
+            boolean ea = "eng".equals(canonLang(a.optString("Language", ""))), eb = "eng".equals(canonLang(b.optString("Language", "")));
+            return ea == eb ? 0 : ea ? -1 : 1;
+        });
+        for (int i = 0; i < tracks.size() && i < 3; i++) {
+            JSONObject st = tracks.get(i);
+            SubRef r = new SubRef();
+            r.kind = "jf";
+            r.id = "/Videos/" + m.itemId + "/" + m.msId + "/Subtitles/" + st.optInt("Index") + "/0/Stream.srt";
+            String lang = canonLang(st.optString("Language", ""));
+            r.lang = lang == null ? "und" : lang;
+            try {
+                RefInfo ri = refInfo(fetchSubtitleText(c, r), "Jellyfin file (" + r.lang + " track)", m.runtimeSec);
+                if (ri != null) return ri;
+            } catch (Throwable t) {
+                Log.w(TAG, "library track: " + t.getMessage());
+            }
+        }
+        return null;
+    }
+
+    private RefInfo refFromTorrent(Context c, SyncCtx x) {
+        if (x.filename == null) return null;
+        TorrentRef best = null;
+        int bestPct = 79;
+        List<TorrentRef> all;
+        synchronized (tokens) { all = new ArrayList<>(tokens.values()); }
+        for (TorrentRef t : all) {
+            if (t.resolvedHash == null || t.subFiles.isEmpty()) continue;
+            int pct = releasePct(t.title, x.filename);
+            if (pct > bestPct) { bestPct = pct; best = t; }
+        }
+        if (best == null) return null;
+        for (int i = 0; i < best.subFiles.size() && i < 3; i++) {
+            String[] f = best.subFiles.get(i);
+            SubRef r = new SubRef();
+            r.kind = "tor";
+            r.id = "/stream/" + encPath(f[1].substring(f[1].lastIndexOf('/') + 1)) + "?link=" + best.resolvedHash + "&index=" + f[0] + "&play";
+            r.lang = "und";
+            try {
+                RefInfo ri = refInfo(fetchSubtitleText(c, r), "subtitle inside the torrent", 0);
+                if (ri != null) return ri;
+            } catch (Throwable t) {
+                Log.w(TAG, "torrent subtitle: " + t.getMessage());
+            }
+        }
+        return null;
+    }
+
+    /** Downloads a candidate and checks it: really the right script, then its timing against the reference. */
+    private Verdict verify(Context c, SyncCtx x, Sub s, String mode) {
+        SubRef r = s.ref;
+        String vk = verdictKey(r, mode);
+        Verdict cached = verdicts.get(vk);
+        if (cached != null) return cached;
+        Verdict v = new Verdict();
+        String text;
+        try {
+            text = fetchRaw(c, r);
+        } catch (QuotaException q) {
+            v.status = "≈ Not checked (daily download limit reached)";
+            return v;
+        } catch (Throwable t) {
+            v.status = "≈ Could not download to check";
+            log("subtitle " + s.provider + " " + r.lang + " could not be downloaded: " + t.getMessage());
+            return v;
+        }
+        if (text == null) { v.drop = true; log("subtitle " + s.provider + " " + r.lang + " has no matching file"); verdicts.put(vk, v); return v; }
+        String problem = scriptProblem(r.lang, text);
+        if (problem != null) {
+            v.drop = true; v.status = problem;
+            log("subtitle dropped (" + s.provider + " " + r.lang + "): " + problem);
+            verdicts.put(vk, v);
+            return v;
+        }
+        if (SubtitleSync.parse(text).size() < 15) { v.drop = true; v.status = "too few lines"; verdicts.put(vk, v); return v; }
+        v.text = text;
+        if (s.trusted) {
+            v.trusted = true; v.verified = true; v.accuracy = 100; v.status = "✔ Exact file match (hash)";
+        } else if (mode.equals("off")) {
+            v.status = "≈ Sync check is off";
+            v.accuracy = Math.max(-1, releasePct(s.name, x.filename));
+        } else {
+            RefInfo ref = resolveRef(c, x);
+            if (ref == null) {
+                v.status = "≈ Not verified (nothing to compare with)";
+                v.accuracy = Math.max(-1, releasePct(s.name, x.filename));
+            } else {
+                SubtitleSync.Result res = SubtitleSync.align(ref.cues, SubtitleSync.parse(text));
+                log(String.format(Locale.US, "sync %s %s: %s  [vs %s]", s.provider, r.lang, res.note, ref.label));
+                String n = res.note;
+                v.accuracy = res.scoreAfter > 0 || res.scoreBefore > 0 ? (int) Math.round(Math.max(res.scoreAfter, res.scoreBefore) * 100) : -1;
+                v.verified = true;
+                if (res.applied) {
+                    boolean parts = n.startsWith("applied in two parts");
+                    v.detail = parts ? "fixed in two parts" : String.format(Locale.US, "%+.2fs%s", res.offsetSec,
+                            Math.abs(res.ratio - 1) > 0.0004 ? String.format(Locale.US, " ×%.4f", res.ratio) : "");
+                    if (mode.equals("check")) {
+                        v.status = "≈ Out of sync with " + ref.label + ", not changed";
+                    } else {
+                        v.status = "✔ Synced to " + ref.label;
+                        v.text = SubtitleSync.write(res.cues);
+                    }
+                } else if (n.startsWith("already in sync") || n.startsWith("no measurable gain")) {
+                    v.status = "✔ In sync with " + ref.label;
+                } else if (n.startsWith("timing differs")) {
+                    v.status = "⚠ Different cut from " + ref.label + ", left as is";
+                } else if (n.startsWith("covers a different part")) {
+                    v.status = "⚠ Partial subtitle"; v.accuracy = -1;
+                } else if (n.startsWith("too few cues")) {
+                    v.status = "≈ Too few lines to check"; v.verified = false; v.accuracy = -1;
+                } else {
+                    v.status = "⚠ Does not match " + ref.label;
+                }
+            }
+        }
+        verdicts.put(vk, v);
+        return v;
+    }
+
+    /** Percent of shared words between a subtitle's release name and the playing file, plus a bonus for the same group. */
+    static int releasePct(String release, String filename) {
+        if (release == null || filename == null || release.isEmpty() || filename.isEmpty()) return -1;
+        String[] a = release.toLowerCase(Locale.ROOT).split("[^a-z0-9]+"), b = filename.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
+        Set<String> sa = new HashSet<>(), sb = new HashSet<>();
+        for (String t : a) if (t.length() >= 2 && !t.equals("srt") && !t.equals("mkv") && !t.equals("mp4")) sa.add(t);
+        for (String t : b) if (t.length() >= 2 && !t.equals("srt") && !t.equals("mkv") && !t.equals("mp4")) sb.add(t);
+        if (sa.isEmpty() || sb.isEmpty()) return -1;
+        int inter = 0;
+        for (String t : sa) if (sb.contains(t)) inter++;
+        int pct = (int) Math.round(100.0 * inter / (sa.size() + sb.size() - inter));
+        String ga = lastToken(a), gb = lastToken(b);
+        if (!ga.isEmpty() && ga.equals(gb) && ga.length() >= 3) pct = Math.min(100, pct + 15);
+        return pct;
+    }
+
+    /** null when the text is in the language it claims (or too short to tell); otherwise why it was dropped. */
+    static String scriptProblem(String lang, String text) {
+        String expect = scriptOf(lang);
+        if (expect == null || text == null) return null;
+        int[] counts = new int[8]; // latin, arabic, hebrew, cyrillic, greek, cjk, thai, indic
+        int letters = 0, seen = 0;
+        for (String line : text.split("\n")) {
+            String t = line.trim();
+            if (t.isEmpty() || t.contains("-->") || t.matches("\\d+")) continue;
+            t = t.replaceAll("<[^>]*>|\\{[^}]*\\}", "");
+            for (int i = 0; i < t.length() && seen < 80000; i++, seen++) {
+                int cp = t.charAt(i);
+                if (!Character.isLetter(cp)) continue;
+                letters++;
+                if (cp >= 0x0600 && cp <= 0x06FF || cp >= 0x0750 && cp <= 0x077F || cp >= 0xFB50 && cp <= 0xFDFF || cp >= 0xFE70 && cp <= 0xFEFF) counts[1]++;
+                else if (cp >= 0x0590 && cp <= 0x05FF) counts[2]++;
+                else if (cp >= 0x0400 && cp <= 0x04FF) counts[3]++;
+                else if (cp >= 0x0370 && cp <= 0x03FF) counts[4]++;
+                else if (cp >= 0x4E00 && cp <= 0x9FFF || cp >= 0x3040 && cp <= 0x30FF || cp >= 0xAC00 && cp <= 0xD7AF) counts[5]++;
+                else if (cp >= 0x0E00 && cp <= 0x0E7F) counts[6]++;
+                else if (cp >= 0x0900 && cp <= 0x09FF) counts[7]++;
+                else if (cp < 0x250) counts[0]++;
+            }
+        }
+        if (letters < 120) return null;
+        int idx = "latin arabic hebrew cyrillic greek cjk thai indic".indexOf(expect);
+        int which = idx < 0 ? 0 : java.util.Arrays.asList("latin", "arabic", "hebrew", "cyrillic", "greek", "cjk", "thai", "indic").indexOf(expect);
+        if (counts[which] < letters * 0.5) return "✖ Not really " + expect + " text";
+        return null;
+    }
+
+    private static String scriptOf(String lang) {
+        if (lang == null) return null;
+        switch (lang) {
+            case "ara": case "per": case "urd": case "kur": return "arabic";
+            case "heb": return "hebrew";
+            case "rus": case "ukr": case "bul": return "cyrillic";
+            case "ell": return "greek";
+            case "chi": case "jpn": case "kor": return "cjk";
+            case "tha": return "thai";
+            case "hin": case "ben": return "indic";
+            case "eng": case "fre": case "spa": case "ger": case "ita": case "por": case "pob": case "tur": case "pol": case "dut":
+            case "swe": case "dan": case "nor": case "fin": case "hun": case "cze": case "rum": case "hrv": case "vie": case "ind":
+                return "latin";
+            default: return null;
+        }
     }
 
     /** How many words the release name shares with the playing file, plus a bonus for the same release group. */
@@ -1350,8 +1925,8 @@ public final class StremioBridge {
         return "";
     }
 
-    /** Any Stremio subtitle addon (OpenSubtitles V3 is one): its /subtitles answer, with languages normalised. */
-    private List<Sub> addonSubs(String base, String type, String id, String extraRaw, int source, String tag) {
+    /** Any Stremio subtitle addon (OpenSubtitles V3 is one): its /subtitles answer, served through the bridge. */
+    private List<Sub> addonSubs(String base, String type, String id, String extraRaw, int source, String tag, String provider, String self) {
         List<Sub> out = new ArrayList<>();
         String url = base + "/subtitles/" + type + "/" + id + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
         JSONObject d = fetchJson(url, 20000, SUBS_TTL_MS);
@@ -1361,17 +1936,19 @@ public final class StremioBridge {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) continue;
             String u = o.optString("url", "");
-            if (!u.startsWith("http://") && !u.startsWith("https://")) continue;
-            Sub s = new Sub();
-            s.id = tag + o.optString("id", String.valueOf(i));
-            s.url = u;
-            s.lang = canonLang(o.optString("lang", ""));
-            s.name = o.optString("subtitleFileName", o.optString("movieReleaseName", o.optString("title", "")));
-            s.source = source;
-            out.add(s);
+            String lang = canonLang(o.optString("lang", ""));
+            if (!u.startsWith("https://") || lang == null) continue;
+            SubRef r = new SubRef();
+            r.kind = "url"; r.id = u; r.lang = lang;
+            r.season = seasonOf(id); r.episode = episodeOf(id);
+            String name = o.optString("subtitleFileName", o.optString("movieReleaseName", o.optString("title", "")));
+            out.add(meta(makeSub(tag + o.optString("id", String.valueOf(i)), subLink(self, r), lang, name, source), provider, false, false, r));
         }
         return out;
     }
+
+    private static int seasonOf(String id) { String[] p = id.split(":"); return p.length >= 3 ? parseInt(p[1]) : -1; }
+    private static int episodeOf(String id) { String[] p = id.split(":"); return p.length >= 3 ? parseInt(p[2]) : -1; }
 
     private static final Pattern SUBDL_PATH = Pattern.compile("^/subtitle/(\\d{1,12}-\\d{1,12})\\.zip$");
     private static final String PROVIDER_UA = "Jellyarr v3.0";
@@ -1382,6 +1959,7 @@ public final class StremioBridge {
         String id;     // provider id (Wyzie: its download address)
         String lang;
         int season = -1, episode = -1;
+        SyncCtx sync;
     }
 
     private final Map<String, SubRef> subRefs = Collections.synchronizedMap(
@@ -1396,6 +1974,11 @@ public final class StremioBridge {
         String t = randomHex(8);
         subRefs.put(t, ref);
         return self + "/sub/t/" + t + ".srt";
+    }
+
+    private static Sub meta(Sub s, String provider, boolean hi, boolean trusted, SubRef r) {
+        s.provider = provider; s.hi = hi; s.trusted = trusted; s.ref = r;
+        return s;
     }
 
     private static Sub makeSub(String id, String url, String lang, String name, int source) {
@@ -1443,7 +2026,7 @@ public final class StremioBridge {
             SubRef r = new SubRef();
             r.kind = "subdl"; r.id = m.group(1); r.lang = lang;
             if (series) { r.season = season; r.episode = episode; }
-            out.add(makeSub("subdl-" + m.group(1), subLink(self, r), lang, o.optString("release_name", o.optString("name", "")), 0));
+            out.add(meta(makeSub("subdl-" + m.group(1), subLink(self, r), lang, o.optString("release_name", o.optString("name", "")), 0), "SubDL", o.optBoolean("hi"), false, r));
         }
         return out;
     }
@@ -1469,8 +2052,8 @@ public final class StremioBridge {
                 if (!url.startsWith("https://") || lang == null) continue;
                 SubRef r = new SubRef();
                 r.kind = "wyzie"; r.id = url; r.lang = lang;
-                out.add(makeSub("wyzie-" + o.optString("id", String.valueOf(i)), subLink(self, r), lang,
-                        o.optString("release", o.optString("fileName", "")), 0));
+                out.add(meta(makeSub("wyzie-" + o.optString("id", String.valueOf(i)), subLink(self, r), lang,
+                        o.optString("release", o.optString("fileName", "")), 0), "Wyzie", o.optBoolean("isHearingImpaired"), false, r));
             }
         } catch (Throwable t) {
             Log.w(TAG, "wyzie: " + t.getMessage());
@@ -1508,7 +2091,7 @@ public final class StremioBridge {
                     SubRef r = new SubRef();
                     r.kind = "subsource"; r.id = String.valueOf(o.optLong("subtitleId")); r.lang = l;
                     if (series) { r.season = season; r.episode = episode; }
-                    out.add(makeSub("subsource-" + r.id, subLink(self, r), l, rel.toString().trim(), 0));
+                    out.add(meta(makeSub("subsource-" + r.id, subLink(self, r), l, rel.toString().trim(), 0), "SubSource", o.optBoolean("hearingImpaired"), false, r));
                 }
             }
         } catch (Throwable t) {
@@ -1518,7 +2101,7 @@ public final class StremioBridge {
     }
 
     /** OpenSubtitles.com: its API wants the query parameters in alphabetical order, or it redirects. */
-    private List<Sub> oscomSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self) {
+    private List<Sub> oscomSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self, String hash) {
         List<Sub> out = new ArrayList<>();
         Map<String, String> h = new HashMap<>();
         h.put("Api-Key", key);
@@ -1533,6 +2116,7 @@ public final class StremioBridge {
         }
         List<String> cs = codes(wanted, 2, false);
         if (!cs.isEmpty()) q.put("languages", String.join(",", cs).toLowerCase(Locale.ROOT));
+        if (hash != null) q.put("moviehash", hash);
         StringBuilder url = new StringBuilder(oscomApi).append("/subtitles?");
         for (Map.Entry<String, String> e : q.entrySet()) url.append(e.getKey()).append('=').append(enc(e.getValue()).replace("%2C", ",")).append('&');
         url.setLength(url.length() - 1);
@@ -1548,7 +2132,8 @@ public final class StremioBridge {
                 if (files == null || files.length() == 0 || lang == null) continue;
                 SubRef r = new SubRef();
                 r.kind = "oscom"; r.id = String.valueOf(files.getJSONObject(0).optLong("file_id")); r.lang = lang;
-                out.add(makeSub("oscom-" + r.id, subLink(self, r), lang, at.optString("release", ""), 0));
+                out.add(meta(makeSub("oscom-" + r.id, subLink(self, r), lang, at.optString("release", ""), 0), "OpenSubtitles.com",
+                        at.optBoolean("hearing_impaired"), at.optBoolean("moviehash_match"), r));
             }
         } catch (Throwable t) {
             Log.w(TAG, "opensubtitles.com: " + t.getMessage());
@@ -1566,21 +2151,31 @@ public final class StremioBridge {
 
     private static final Pattern SUB_TOKEN = Pattern.compile("^([0-9a-f]{16})\\.srt$");
 
-    /** Opens a subtitle link: downloads from the provider (once; replays come from the cache), picks the file, UTF-8. */
+    /** Opens a subtitle link: the checked (and synced) text when it exists, else the download, synced if possible. */
     private Resp subFile(Context c, String name) {
         Matcher m = SUB_TOKEN.matcher(name);
         if (!m.matches()) return Resp.text(404, "Not found");
         SubRef ref = subRefs.get(m.group(1));
         if (ref == null) return Resp.text(404, "This subtitle link expired. Open the title again.");
-        String cacheKey = ref.kind + ":" + ref.id + "|" + ref.lang + "|" + ref.season + "|" + ref.episode;
-        byte[] body = srtCache.get(cacheKey);
+        String mode = getSubSync(c);
+        String vk = verdictKey(ref, mode);
+        byte[] body = srtCache.get(vk);
         if (body == null) {
+            Verdict v = verdicts.get(vk);
             long t0 = System.currentTimeMillis();
             try {
-                String text = fetchSubtitleText(c, ref);
+                String text = v != null && v.text != null ? v.text : fetchRaw(c, ref);
                 if (text == null) return Resp.text(404, "No matching subtitle file in this download.");
+                if (v == null && ref.sync != null && mode.equals("auto")) {
+                    RefInfo ri = refIfReady(ref.sync);   // never waits here: the check normally ran while the list was built
+                    if (ri != null) {
+                        SubtitleSync.Result res = SubtitleSync.align(ri.cues, SubtitleSync.parse(text));
+                        log(String.format(Locale.US, "sync %s %s: %s  [vs %s]", ref.kind, ref.lang, res.note, ri.label));
+                        if (res.applied) text = SubtitleSync.write(res.cues);
+                    }
+                }
                 body = text.getBytes(StandardCharsets.UTF_8);
-                srtCache.put(cacheKey, body);
+                srtCache.put(vk, body);
                 log(String.format(Locale.US, "subtitle %s %s  %s  (%.1fs)", ref.kind, ref.lang, human(body.length), (System.currentTimeMillis() - t0) / 1000.0));
             } catch (QuotaException q) {
                 log("subtitle " + ref.kind + ": " + q.getMessage());
@@ -1641,8 +2236,41 @@ public final class StremioBridge {
                 if (st[0] != 200) throw new Exception("OpenSubtitles file HTTP " + st[0]);
                 return decodeSubtitle(b, ref.lang);
             }
+            case "url": {
+                URL u = new URL(ref.id);
+                if (!publicHttps(u)) throw new Exception("blocked address");
+                byte[] b = httpBytes("GET", ref.id, null, null, 6 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("HTTP " + st[0]);
+                if (b.length > 4 && b[0] == 'P' && b[1] == 'K') return pickSrt(b, ref.lang, ref.season, ref.episode);
+                return decodeSubtitle(b, ref.lang);
+            }
+            case "jf": { // a subtitle track of the library file (the reference), kept only for the sync check
+                Map<String, String> h = new HashMap<>();
+                h.put("X-Emby-Token", jfToken(c));
+                byte[] b = httpBytes("GET", JF + ref.id, h, null, 6 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("Jellyfin HTTP " + st[0]);
+                return decodeSubtitle(b, ref.lang);
+            }
+            case "tor": { // a subtitle file shipped inside the torrent
+                byte[] b = httpBytes("GET", TORRSERVER + ref.id, null, null, 3 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("TorrServer HTTP " + st[0]);
+                return decodeSubtitle(b, ref.lang);
+            }
             default:
                 return null;
+        }
+    }
+
+    /** Only https addresses that are not on this device or its networks: the address came from a third party. */
+    private static boolean publicHttps(URL u) {
+        try {
+            if (!u.getProtocol().equals("https") || u.getHost().equalsIgnoreCase("localhost")) return false;
+            for (java.net.InetAddress a : java.net.InetAddress.getAllByName(u.getHost())) {
+                if (a.isLoopbackAddress() || a.isSiteLocalAddress() || a.isLinkLocalAddress() || a.isAnyLocalAddress() || a.isMulticastAddress()) return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -2176,6 +2804,10 @@ public final class StremioBridge {
                 JSONObject f = files.getJSONObject(i);
                 String path = f.optString("path", "");
                 long len = f.optLong("length", 0);
+                if (path.toLowerCase(Locale.ROOT).endsWith(".srt") && len > 15000 && len < 3L * 1024 * 1024) {
+                    ref.subFiles.add(new String[]{String.valueOf(f.optInt("id")), path});
+                    continue;
+                }
                 if (!VIDEO_EXT.matcher(path).find()) continue;
                 if (path.toLowerCase(Locale.ROOT).contains("sample") && len < 300L * 1024 * 1024) continue;
                 if (len > bestLen) { bestLen = len; bestId = f.optInt("id"); bestPath = path; }

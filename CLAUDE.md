@@ -23,3 +23,8 @@ The owner wants every app build published as a GitHub **release**, not left as a
 - `cloudflared` is built in CI from upstream plus `ci/cloudflared/jellyarr_android_dns.go` (Android has no
   resolv.conf) and shipped as an APK asset.
 - Arabic UI strings live in `app/src/main/assets/i18n_ar.json` (one line; edit it with a JSON tool).
+- Subtitle sync (`services/SubtitleSync.java`): aligns a candidate to a reference by comparing when speech happens
+  (language independent), FFT cross-correlation, then Theil-Sen refinement; applied only with a strong, clearly
+  better match, otherwise the file is returned unchanged. The reference is never guessed: only the library file,
+  a hash-matched subtitle or a subtitle inside the torrent. Keep `SyncTest`-style synthetic tests (known offset,
+  fps ratio, cuts, unrelated and partial files) green when changing it.

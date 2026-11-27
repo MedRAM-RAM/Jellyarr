@@ -11001,6 +11001,78 @@ public final class JellyarrActivity extends AppCompatActivity
                 text -> com.jellyarr.app.services.StremioBridge.setSubAddons(ctx, text),
                 true, false, "Saved.");
 
+        // ---- subtitle options: how many, how they are checked and synced, what their titles say
+        TextView optHead = UiKit.text(this, I18n.tr("Subtitle options"), 13.5f, AppTheme.text(), UiKit.BOLD);
+        optHead.setPadding(0, dp(14), 0, dp(2));
+        card.addView(optHead);
+        card.addView(UiKit.caption(this, I18n.tr("Each subtitle's title (shown by Nuvio and some players) says where it comes from, how well it fits the video and whether it was synced.")));
+        addBridgeTextSetting(card, "Subtitles per language",
+                "How many subtitles to offer for each language (1 to 40). Providers take turns, so one source cannot fill the list.",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubMax(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubMax(ctx, text),
+                false, false, "Saved.");
+        addBridgeTextSetting(card, "Check the best N per language",
+                "These are downloaded while the list is built and checked: the script must match the language and the timing is compared with the video (0 to 12; 0 turns checking off).",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubVerify(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubVerify(ctx, text),
+                false, false, "Saved.");
+        addBridgeTextSetting(card, "Checking time limit (seconds)",
+                "How long the list may wait for those checks (3 to 40). Slower ones are listed unchecked and finish in the background.",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubBudget(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubBudget(ctx, text),
+                false, false, "Saved.");
+        addBridgeTextSetting(card, "Hide checked subtitles below (%)",
+                "Subtitles that were checked and fit the video less than this are hidden (0 to 90; 0 hides nothing).",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubMinAcc(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubMinAcc(ctx, text),
+                false, false, "Saved.");
+
+        final Button syncBtn = UiKit.outline(this, "", null);
+        final Runnable syncLabel = () -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubSync(ctx);
+            syncBtn.setText(buttonLabel(m.equals("check") ? "AUTO SYNC: CHECK ONLY" : m.equals("off") ? "AUTO SYNC: OFF" : "AUTO SYNC: APPLY"));
+        };
+        syncLabel.run();
+        syncBtn.setOnClickListener(v -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubSync(ctx);
+            com.jellyarr.app.services.StremioBridge.setSubSync(ctx, m.equals("auto") ? "check" : m.equals("check") ? "off" : "auto");
+            syncLabel.run();
+        });
+        LinearLayout.LayoutParams syncLp = new LinearLayout.LayoutParams(-1, dp(42));
+        syncLp.topMargin = dp(10);
+        card.addView(syncBtn, syncLp);
+        TextView syncHint = UiKit.caption(this, I18n.tr("Apply: a subtitle that is clearly out of sync is shifted to fit (only when it can be compared with something known to fit the video: the library file, an exact file match or a subtitle inside the torrent). Check only: reported in the title but not changed. Off: never touched."));
+        syncHint.setPadding(0, dp(4), 0, dp(4));
+        card.addView(syncHint);
+
+        final Button hiBtn = UiKit.outline(this, "", null);
+        final Runnable hiLabel = () -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubHi(ctx);
+            hiBtn.setText(buttonLabel(m.equals("exclude") ? "HEARING-IMPAIRED: HIDE" : m.equals("prefer") ? "HEARING-IMPAIRED: PREFER" : "HEARING-IMPAIRED: ALLOW"));
+        };
+        hiLabel.run();
+        hiBtn.setOnClickListener(v -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubHi(ctx);
+            com.jellyarr.app.services.StremioBridge.setSubHi(ctx, m.equals("any") ? "exclude" : m.equals("exclude") ? "prefer" : "any");
+            hiLabel.run();
+        });
+        LinearLayout.LayoutParams hiLp = new LinearLayout.LayoutParams(-1, dp(42));
+        hiLp.topMargin = dp(8);
+        card.addView(hiBtn, hiLp);
+
+        card.addView(settingsSwitchRow("Details in the subtitle title",
+                "Source, fit percentage and sync status in each subtitle's title. Turn off if your player shows titles badly.",
+                com.jellyarr.app.services.StremioBridge.isSubTitles(this),
+                (v, checked) -> com.jellyarr.app.services.StremioBridge.setSubTitles(ctx, checked)));
+        card.addView(settingsSwitchRow("OpenSubtitles V3 (free, no key)",
+                "The Stremio OpenSubtitles addon as one more source.",
+                com.jellyarr.app.services.StremioBridge.isOsV3(this),
+                (v, checked) -> com.jellyarr.app.services.StremioBridge.setOsV3(ctx, checked)));
+        card.addView(settingsSwitchRow("Check OpenSubtitles.com results",
+                "Checking downloads each file, which counts against the key's daily limit. Off: they are listed unchecked and downloaded when picked (exact file matches are always checked).",
+                com.jellyarr.app.services.StremioBridge.isVerifyOscom(this),
+                (v, checked) -> com.jellyarr.app.services.StremioBridge.setVerifyOscom(ctx, checked)));
+
         card.addView(createSettingsDivider());
 
         card.addView(UiKit.text(this, I18n.tr("Recent activity"), 13.5f, AppTheme.text(), UiKit.BOLD));
