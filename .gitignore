@@ -46,6 +46,3 @@ Thumbs.db
 
 # Showcase website
 website/
-
-# built in CI by .github/actions/build-cloudflared
-app/src/main/assets/cloudflared-android-arm64

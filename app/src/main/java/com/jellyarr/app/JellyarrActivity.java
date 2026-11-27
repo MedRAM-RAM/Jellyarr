@@ -8162,40 +8162,6 @@ public final class JellyarrActivity extends AppCompatActivity
         cacheDeb.delete();
     }
 
-    /** cloudflared is built in CI (with the Android DNS patch) and ships inside the APK; it goes to $PREFIX/bin/cloudflared. */
-    private void installCloudflared(ManagedService svc, File prefix) throws Exception {
-        File bin = new File(prefix, "bin");
-        if (!bin.exists()) bin.mkdirs();
-        File target = new File(bin, "cloudflared");
-        File tmp = new File(getCacheDir(), "cloudflared.install");
-        try (java.io.InputStream in = getAssets().open(com.jellyarr.app.services.CloudflareTunnel.ASSET_NAME);
-             java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
-            byte[] buf = new byte[64 * 1024];
-            int n;
-            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
-        } catch (java.io.FileNotFoundException e) {
-            tmp.delete();
-            throw new Exception("This build does not include the Cloudflare Tunnel. Install the APK built by CI.");
-        }
-        try (FileInputStream fis = new FileInputStream(tmp)) {
-            byte[] magic = new byte[4];
-            if (fis.read(magic) != 4 || magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
-                tmp.delete();
-                throw new Exception("The bundled cloudflared is not an executable");
-            }
-        }
-        if (target.exists()) target.delete();
-        if (!tmp.renameTo(target)) {
-            BackupRestoreManager.copyFile(tmp, target);
-            tmp.delete();
-        }
-        target.setExecutable(true, false);
-        try { android.system.Os.chmod(target.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
-        File cfg = new File(TermuxConstants.TERMUX_HOME_DIR, ".config/cloudflared");
-        if (!cfg.exists()) cfg.mkdirs();
-        svc.reconcileInstalledState();
-    }
-
     /** TorrServer ships one static ARM64 Android binary per release; it goes to $PREFIX/bin/torrserver. */
     private static final String[] TORRSERVER_URLS = {
             "https://github.com/YouROK/TorrServer/releases/latest/download/TorrServer-android-arm64",
@@ -8294,10 +8260,6 @@ public final class JellyarrActivity extends AppCompatActivity
 
         if ("torrserver".equalsIgnoreCase(id)) {
             installTorrServer(svc, prefix, progress);
-            return;
-        }
-        if (com.jellyarr.app.services.CloudflareTunnel.SERVICE_ID.equalsIgnoreCase(id)) {
-            installCloudflared(svc, prefix);
             return;
         }
 
@@ -10794,49 +10756,6 @@ public final class JellyarrActivity extends AppCompatActivity
         pubWarn.setPadding(0, 0, 0, dp(4));
         card.addView(pubWarn);
 
-        // Cloudflare Tunnel run by the app itself (cloudflared), so the public address needs nothing else.
-        card.addView(createSettingsDivider());
-        card.addView(UiKit.text(this, I18n.tr("Cloudflare Tunnel"), 13.5f, AppTheme.text(), UiKit.BOLD));
-        TextView tunHint = UiKit.caption(this, I18n.tr(
-                "Jellyarr runs the tunnel itself. In the Cloudflare dashboard open Zero Trust > Networks > Tunnels, create a tunnel, add a public hostname with service HTTP and URL localhost:7070, then paste the tunnel token (or the whole install command) below."));
-        tunHint.setPadding(0, dp(2), 0, dp(6));
-        card.addView(tunHint);
-        LinearLayout tokRow = UiKit.row(this);
-        tokRow.setGravity(Gravity.CENTER_VERTICAL);
-        final android.widget.EditText tokInput = new android.widget.EditText(this);
-        tokInput.setText(com.jellyarr.app.services.CloudflareTunnel.getToken(this));
-        tokInput.setHint("eyJ...");
-        tokInput.setTextColor(AppTheme.text());
-        tokInput.setTextSize(12.5f);
-        tokInput.setSingleLine(true);
-        tokInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        tokInput.setTextDirection(View.TEXT_DIRECTION_LTR);
-        tokRow.addView(tokInput, new LinearLayout.LayoutParams(0, -2, 1.0f));
-        Button tokSave = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
-        tokSave.setTextSize(10f);
-        tokSave.setPadding(dp(10), 0, dp(10), 0);
-        LinearLayout.LayoutParams tokLp = new LinearLayout.LayoutParams(-2, dp(32));
-        tokLp.setMarginStart(dp(8));
-        tokRow.addView(tokSave, tokLp);
-        final Runnable tokDirty = UiStyle.bindDirty(tokSave, tokInput,
-                () -> com.jellyarr.app.services.CloudflareTunnel.getToken(ctx));
-        tokSave.setOnClickListener(v -> {
-            if (!com.jellyarr.app.services.CloudflareTunnel.setToken(ctx, tokInput.getText().toString())) {
-                Toast.makeText(ctx, I18n.tr("This is not a Cloudflare tunnel token. Copy it from the tunnel page in the dashboard."), Toast.LENGTH_LONG).show();
-                return;
-            }
-            tokInput.setText(com.jellyarr.app.services.CloudflareTunnel.getToken(ctx));
-            tokDirty.run();
-            if (bridgeRefresh != null) bridgeRefresh.run();
-            Toast.makeText(ctx, I18n.tr("Saved."), Toast.LENGTH_SHORT).show();
-        });
-        card.addView(tokRow);
-        final TextView tunStatus = UiKit.caption(this, "");
-        tunStatus.setPadding(0, dp(6), 0, dp(6));
-        card.addView(tunStatus);
-        final Button tunBtn = UiKit.primary(this, buttonLabel("INSTALL TUNNEL"), null);
-        card.addView(tunBtn, new LinearLayout.LayoutParams(-1, dp(42)));
-
         card.addView(createSettingsDivider());
 
         card.addView(settingsSwitchRow("Torrents from Prowlarr",
@@ -10966,74 +10885,9 @@ public final class JellyarrActivity extends AppCompatActivity
             } else {
                 tsBtn.setVisibility(View.GONE);
             }
-            refreshTunnelRow(tunStatus, tunBtn);
         };
         bridgeRefresh.run();
         return section;
-    }
-
-    /** Cloudflare Tunnel status line and its install / start / stop button (health is read off the UI thread). */
-    private void refreshTunnelRow(final TextView status, final Button btn) {
-        final android.content.Context ctx = this;
-        final MediaServiceManager mgr = MediaServiceManager.getInstance(ctx);
-        final ManagedService cf = mgr.getService(com.jellyarr.app.services.CloudflareTunnel.SERVICE_ID);
-        if (cf == null) {
-            status.setText("");
-            btn.setVisibility(View.GONE);
-            return;
-        }
-        final boolean hasToken = !com.jellyarr.app.services.CloudflareTunnel.getToken(ctx).isEmpty();
-        if (!cf.isInstalled()) {
-            btn.setVisibility(View.VISIBLE);
-            if (!com.jellyarr.app.services.CloudflareTunnel.isBundled(ctx)) {
-                status.setText(I18n.tr("This build does not include the tunnel."));
-                status.setTextColor(AppTheme.danger());
-                btn.setVisibility(View.GONE);
-                return;
-            }
-            status.setText(I18n.tr("Not installed"));
-            status.setTextColor(AppTheme.textSecondary());
-            btn.setText(buttonLabel("INSTALL TUNNEL"));
-            btn.setOnClickListener(v -> installServiceAutomatically(cf));
-            return;
-        }
-        if (!hasToken) {
-            status.setText(I18n.tr("Paste your tunnel token above."));
-            status.setTextColor(AppTheme.textSecondary());
-            btn.setVisibility(View.GONE);
-            return;
-        }
-        btn.setVisibility(View.VISIBLE);
-        if (!mgr.isServiceRunning(cf.getId())) {
-            status.setText(cf.getLastError() != null && cf.getLastError().length() > 0 && cf.getState() == com.jellyarr.app.model.ServiceState.ERROR
-                    ? I18n.tr("Stopped") + ": " + cf.getLastError() : I18n.tr("Stopped"));
-            status.setTextColor(AppTheme.textSecondary());
-            btn.setText(buttonLabel("START TUNNEL"));
-            btn.setOnClickListener(v -> {
-                mgr.recordServiceActive(cf.getId(), true);
-                mgr.startService(cf.getId(), ctx);
-                status.setText(I18n.tr("Connecting..."));
-                status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 6000);
-                status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 20000);
-            });
-            return;
-        }
-        btn.setText(buttonLabel("STOP TUNNEL"));
-        btn.setOnClickListener(v -> {
-            mgr.recordServiceActive(cf.getId(), false);
-            mgr.stopService(cf.getId());
-            status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 1500);
-        });
-        status.setText(I18n.tr("Connecting..."));
-        status.setTextColor(AppTheme.textSecondary());
-        runBg(() -> {
-            final boolean ready = mgr.isServiceHealthy(cf);
-            runOnUiThread(() -> {
-                status.setText(I18n.tr(ready ? "Connected to Cloudflare" : "Connecting..."));
-                status.setTextColor(ready ? AppTheme.accent() : AppTheme.textSecondary());
-                if (!ready) status.postDelayed(() -> { if (bridgeRefresh != null && isUiAlive()) bridgeRefresh.run(); }, 6000);
-            });
-        });
     }
 
     private void refreshCompanionButtons() {
