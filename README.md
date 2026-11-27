@@ -30,6 +30,7 @@ companion services that find, download and organize your media, and wires them t
 | **Transmission** | `9091` | BitTorrent download client |
 | **TorrServer** *(optional)* | `8090` | Streams torrents over HTTP while they download |
 | **Jellyarr addon** *(optional)* | `7070` | Stremio addon for AIOStreams and Stremio (built into the app) |
+| **Cloudflare Tunnel** *(optional)* | `20244` | Runs `cloudflared` inside the app to give the addon a public HTTPS address |
 
 All services listen on the phone and on your local network only.
 
@@ -53,7 +54,9 @@ All services listen on the phone and on your local network only.
   Prowlarr streamed through TorrServer, and subtitles from Jellyfin and OpenSubtitles in the languages you pick.
   Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
   never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use
-  it from apps that are not on your home network, such as a hosted AIOStreams.
+  it from apps that are not on your home network, such as a hosted AIOStreams. The app can run the Cloudflare
+  Tunnel itself: paste your tunnel token in the same settings page. `cloudflared` is built in CI from the upstream
+  source plus a small DNS patch for Android (`ci/cloudflared`) and shipped inside the APK.
 - **Automation.** Transmission auto-cleanup and auto-recheck, automatic missing-episode search, Wi-Fi-only mode.
 - **Updates in the app.** Stable and beta channels, background download, install from the notification.
 - **Backup & restore** of every service configuration and database.
