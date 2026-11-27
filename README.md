@@ -47,10 +47,10 @@ All services listen on the phone and on your local network only.
   updated automatically.
 - **File management.** Radarr and Sonarr naming and import options in one place, *Organize* (rename every file to
   the current format) and import from a folder with Move or Copy.
-- **Stremio & AIOStreams.** A Stremio addon built into the app (Settings › Stremio & AIOStreams): Jellyfin
-  movie and series catalogs with direct play and Jellyfin's subtitles, and Prowlarr search results streamed
-  through TorrServer. Add its URL to AIOStreams as a custom addon, next to subtitle addons such as
-  OpenSubtitles V3, SubDL or SubSource, and browse it from the AIOStreams Android app.
+- **Stremio addon.** Built into the app (Settings › Stremio & AIOStreams). Add its URL to Stremio, or to any
+  app that takes Stremio addons, and you get your Jellyfin library with direct play, Popular and Featured
+  catalogs with posters and descriptions (genres, search, a 📁 badge on what you already own), torrents from
+  Prowlarr streamed through TorrServer, and subtitles from Jellyfin and OpenSubtitles in the languages you pick.
 - **Automation.** Transmission auto-cleanup and auto-recheck, automatic missing-episode search, Wi-Fi-only mode.
 - **Updates in the app.** Stable and beta channels, background download, install from the notification.
 - **Backup & restore** of every service configuration and database.

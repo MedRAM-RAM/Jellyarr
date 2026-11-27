@@ -10721,11 +10721,60 @@ public final class JellyarrActivity extends AppCompatActivity
 
         card.addView(createSettingsDivider());
 
-        card.addView(UiKit.text(this, I18n.tr("Use it in AIOStreams"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        card.addView(settingsSwitchRow("Catalogs",
+                "Popular and Featured lists with posters, ratings and descriptions (from Cinemeta), with genres and search. Needs internet.",
+                com.jellyarr.app.services.StremioBridge.isCatalogsEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setCatalogsEnabled(ctx, checked);
+                    Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
+                }));
+        card.addView(settingsSwitchRow("Subtitles",
+                "Jellyfin's own subtitle files plus OpenSubtitles in the languages below.",
+                com.jellyarr.app.services.StremioBridge.isSubtitlesEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setSubtitlesEnabled(ctx, checked);
+                    Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
+                }));
+        LinearLayout langRow = UiKit.row(this);
+        langRow.setGravity(Gravity.CENTER_VERTICAL);
+        langRow.setPadding(0, dp(6), 0, dp(4));
+        langRow.addView(UiKit.text(this, I18n.tr("Subtitle languages"), 12.5f, AppTheme.text(), UiKit.MEDIUM),
+                new LinearLayout.LayoutParams(0, -2, 1.0f));
+        final android.widget.EditText langInput = new android.widget.EditText(this);
+        langInput.setText(com.jellyarr.app.services.StremioBridge.getSubtitleLangs(this));
+        langInput.setTextColor(AppTheme.text());
+        langInput.setTextSize(13f);
+        langInput.setGravity(Gravity.CENTER);
+        langInput.setSingleLine(true);
+        langInput.setHint("ara,eng");
+        langInput.setTextDirection(View.TEXT_DIRECTION_LTR);
+        langRow.addView(langInput, new LinearLayout.LayoutParams(dp(120), -2));
+        Button langSave = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        langSave.setTextSize(10f);
+        langSave.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams langLp = new LinearLayout.LayoutParams(-2, dp(32));
+        langLp.setMarginStart(dp(8));
+        langRow.addView(langSave, langLp);
+        final Runnable langDirty = UiStyle.bindDirty(langSave, langInput,
+                () -> com.jellyarr.app.services.StremioBridge.getSubtitleLangs(ctx));
+        langSave.setOnClickListener(v -> {
+            com.jellyarr.app.services.StremioBridge.setSubtitleLangs(ctx, langInput.getText().toString());
+            langInput.setText(com.jellyarr.app.services.StremioBridge.getSubtitleLangs(ctx));
+            langDirty.run();
+            Toast.makeText(ctx, I18n.tr("Saved."), Toast.LENGTH_SHORT).show();
+        });
+        card.addView(langRow);
+        TextView langHint = UiKit.caption(this, I18n.tr("Three-letter codes, in order: ara = Arabic, eng = English, fre = French. Leave empty for every language."));
+        langHint.setPadding(0, 0, 0, dp(4));
+        card.addView(langHint);
+
+        card.addView(createSettingsDivider());
+
+        card.addView(UiKit.text(this, I18n.tr("Use it in Stremio"), 13.5f, AppTheme.text(), UiKit.BOLD));
         TextView how = UiKit.caption(this, I18n.tr(
-                "1. In AIOStreams, open Addons, choose Custom and paste the addon URL above.\n"
-                + "2. Add subtitle addons from the AIOStreams marketplace: OpenSubtitles V3, SubDL or SubSource (all have Arabic).\n"
-                + "3. Sign in to the AIOStreams Android app with your AIOStreams server. Jellyfin titles open from the Jellyarr catalogs; torrents appear next to every other source."));
+                "1. In Stremio open Addons, tap Add addon and paste the addon URL above (or tap OPEN IN STREMIO). Nothing else is needed.\n"
+                + "2. You get your Jellyfin library, Popular and Featured lists, torrents from Prowlarr and subtitles in the languages above.\n"
+                + "3. Using AIOStreams? Its server fetches this addon itself, so it can only reach a home-network address if it runs on your own network."));
         how.setPadding(0, dp(2), 0, dp(4));
         card.addView(how);
 

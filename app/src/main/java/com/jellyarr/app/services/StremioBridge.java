@@ -64,6 +64,16 @@ public final class StremioBridge {
     private static final String PROWLARR = "http://127.0.0.1:9696";
     private static final String TORRSERVER = "http://127.0.0.1:" + TORRSERVER_PORT;
     private static final String CINEMETA = "https://v3-cinemeta.strem.io";
+    private static final String OPENSUBS = "https://opensubtitles-v3.strem.io";
+    private static final String[] GENRES_MOVIE = {"Action", "Adventure", "Animation", "Biography", "Comedy", "Crime",
+            "Documentary", "Drama", "Family", "Fantasy", "History", "Horror", "Mystery", "Romance", "Sci-Fi", "Sport",
+            "Thriller", "War", "Western"};
+    private static final String[] GENRES_SERIES = {"Action", "Adventure", "Animation", "Biography", "Comedy", "Crime",
+            "Documentary", "Drama", "Family", "Fantasy", "History", "Horror", "Mystery", "Romance", "Sci-Fi", "Sport",
+            "Thriller", "War", "Western", "Reality-TV", "Talk-Show", "Game-Show"};
+    private static final long CATALOG_TTL_MS = 10 * 60 * 1000L;
+    private static final long META_TTL_MS = 6 * 60 * 60 * 1000L;
+    private static final long SUBS_TTL_MS = 15 * 60 * 1000L;
     private static final int PAGE = 50;
     private static final long INDEX_TTL_MS = 5 * 60 * 1000L;
     private static final int MAX_TOKENS = 3000;
@@ -91,11 +101,17 @@ public final class StremioBridge {
                 }
             });
 
-    private final Map<String, JSONObject> cinemetaCache = Collections.synchronizedMap(
-            new LinkedHashMap<String, JSONObject>(64, 0.75f, true) {
+    private static final class CachedJson {
+        final long at;
+        final JSONObject json;
+        CachedJson(long at, JSONObject json) { this.at = at; this.json = json; }
+    }
+
+    private final Map<String, CachedJson> jsonCache = Collections.synchronizedMap(
+            new LinkedHashMap<String, CachedJson>(64, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, JSONObject> e) {
-                    return size() > 500;
+                protected boolean removeEldestEntry(Map.Entry<String, CachedJson> e) {
+                    return size() > 300;
                 }
             });
 
@@ -129,6 +145,37 @@ public final class StremioBridge {
     public static boolean isTorrentsEnabled(Context c) { return prefs(c).getBoolean("torrents", true); }
 
     public static void setTorrentsEnabled(Context c, boolean on) { prefs(c).edit().putBoolean("torrents", on).apply(); }
+
+    public static boolean isCatalogsEnabled(Context c) { return prefs(c).getBoolean("catalogs", true); }
+
+    public static void setCatalogsEnabled(Context c, boolean on) { prefs(c).edit().putBoolean("catalogs", on).apply(); }
+
+    public static boolean isSubtitlesEnabled(Context c) { return prefs(c).getBoolean("subtitles", true); }
+
+    public static void setSubtitlesEnabled(Context c, boolean on) { prefs(c).edit().putBoolean("subtitles", on).apply(); }
+
+    /** ISO 639-2 codes of the subtitle languages to offer, in order (e.g. "ara,eng"). Empty means every language. */
+    public static String getSubtitleLangs(Context c) { return prefs(c).getString("sub_langs", "ara,eng"); }
+
+    public static void setSubtitleLangs(Context c, String langs) {
+        prefs(c).edit().putString("sub_langs", normalizeLangs(langs)).apply();
+    }
+
+    static String normalizeLangs(String raw) {
+        if (raw == null) return "";
+        StringBuilder sb = new StringBuilder();
+        Set<String> seen = new HashSet<>();
+        for (String part : raw.split("[,;\\s]+")) {
+            String l = part.trim().toLowerCase(Locale.ROOT);
+            if (l.isEmpty()) continue;
+            if (l.equals("ar")) l = "ara";
+            else if (l.equals("en")) l = "eng";
+            if (!l.matches("[a-z]{2,3}(-[a-z]{2,4})?") || !seen.add(l)) continue;
+            if (sb.length() > 0) sb.append(',');
+            sb.append(l);
+        }
+        return sb.toString();
+    }
 
     public static int getMaxTorrents(Context c) { return prefs(c).getInt("max_torrents", 15); }
 
@@ -362,7 +409,7 @@ public final class StremioBridge {
         String host = publicHost(req.host);
         String self = "http://" + host + ":" + PORT + "/" + key;
 
-        if (rest.equals("manifest.json")) return Resp.json(manifest(c), 3600);
+        if (rest.equals("manifest.json")) return Resp.json(manifest(c), 0);
         if (rest.isEmpty() || rest.equals("configure")) return Resp.text(200, "Jellyarr Bridge: add " + self + "/manifest.json to AIOStreams or Stremio.");
 
         String[] seg = rest.split("/");
@@ -371,12 +418,14 @@ public final class StremioBridge {
         String resource = seg[0];
         String type = seg[1];
         String id = dec(stripJson(seg[2]));
-        String extra = seg.length >= 4 ? dec(stripJson(seg[3])) : "";
+        String extraRaw = seg.length >= 4 ? stripJson(seg[3]) : "";
+        String extra = dec(extraRaw);
 
         switch (resource) {
-            case "catalog": return Resp.json(catalog(c, type, id, extra, host), 60);
+            case "catalog": return Resp.json(catalog(c, type, id, extra, extraRaw, host), 60);
             case "meta": return Resp.json(meta(c, type, id, host), 60);
             case "stream": return Resp.json(streams(c, type, id, host, self), 0);
+            case "subtitles": return Resp.json(subtitles(c, type, id, extraRaw, host), 0);
             default: return Resp.text(404, "Not found");
         }
     }
@@ -407,35 +456,47 @@ public final class StremioBridge {
     private JSONObject manifest(Context c) throws Exception {
         JSONObject m = new JSONObject();
         m.put("id", "app.jellyarr.bridge");
-        m.put("version", "1.0.0");
+        m.put("version", "1.1.0");
         m.put("name", "Jellyarr");
-        m.put("description", "Your Jellyfin library on this phone, plus Prowlarr torrents streamed through TorrServer.");
+        m.put("description", "Your Jellyfin library, Prowlarr torrents (via TorrServer), catalogs and subtitles in one addon.");
         m.put("logo", "https://raw.githubusercontent.com/MedRAM-RAM/Jellyarr/main/art/jellyarr_logo_v11-1_dark.svg");
         m.put("types", new JSONArray().put("movie").put("series"));
         m.put("idPrefixes", new JSONArray().put("tt").put("jellyarr:"));
 
+        JSONArray types = new JSONArray().put("movie").put("series");
+        JSONArray prefixes = new JSONArray().put("tt").put("jellyarr:");
         JSONArray resources = new JSONArray();
         resources.put("catalog");
-        resources.put(new JSONObject().put("name", "meta")
-                .put("types", new JSONArray().put("movie").put("series"))
-                .put("idPrefixes", new JSONArray().put("jellyarr:")));
-        resources.put(new JSONObject().put("name", "stream")
-                .put("types", new JSONArray().put("movie").put("series"))
-                .put("idPrefixes", new JSONArray().put("tt").put("jellyarr:")));
+        resources.put(new JSONObject().put("name", "meta").put("types", types).put("idPrefixes", prefixes));
+        resources.put(new JSONObject().put("name", "stream").put("types", types).put("idPrefixes", prefixes));
+        if (isSubtitlesEnabled(c)) {
+            resources.put(new JSONObject().put("name", "subtitles").put("types", types).put("idPrefixes", prefixes));
+        }
         m.put("resources", resources);
 
         JSONArray catalogs = new JSONArray();
-        catalogs.put(catalogDef("movie", "jellyarr-movies", "Jellyfin Movies"));
-        catalogs.put(catalogDef("series", "jellyarr-series", "Jellyfin Series"));
+        catalogs.put(catalogDef("movie", "jellyarr-movies", "Jellyfin Movies", null, true));
+        catalogs.put(catalogDef("series", "jellyarr-series", "Jellyfin Series", null, true));
+        if (isCatalogsEnabled(c)) {
+            catalogs.put(catalogDef("movie", "jellyarr-popular", "Jellyarr Popular", GENRES_MOVIE, true));
+            catalogs.put(catalogDef("series", "jellyarr-popular", "Jellyarr Popular", GENRES_SERIES, true));
+            catalogs.put(catalogDef("movie", "jellyarr-featured", "Jellyarr Featured", GENRES_MOVIE, false));
+            catalogs.put(catalogDef("series", "jellyarr-featured", "Jellyarr Featured", GENRES_SERIES, false));
+        }
         m.put("catalogs", catalogs);
         m.put("behaviorHints", new JSONObject().put("configurable", false).put("configurationRequired", false));
         return m;
     }
 
-    private static JSONObject catalogDef(String type, String id, String name) throws Exception {
-        JSONArray extra = new JSONArray()
-                .put(new JSONObject().put("name", "search").put("isRequired", false))
-                .put(new JSONObject().put("name", "skip").put("isRequired", false));
+    private static JSONObject catalogDef(String type, String id, String name, String[] genres, boolean search) throws Exception {
+        JSONArray extra = new JSONArray();
+        if (genres != null) {
+            JSONArray opts = new JSONArray();
+            for (String g : genres) opts.put(g);
+            extra.put(new JSONObject().put("name", "genre").put("isRequired", false).put("options", opts));
+        }
+        if (search) extra.put(new JSONObject().put("name", "search").put("isRequired", false));
+        extra.put(new JSONObject().put("name", "skip").put("isRequired", false));
         return new JSONObject().put("type", type).put("id", id).put("name", name).put("extra", extra);
     }
 
@@ -516,8 +577,12 @@ public final class StremioBridge {
         return "http://" + host + ":8096/Items/" + itemId + "/Images/" + kind + "?maxHeight=" + maxH + "&quality=90";
     }
 
-    private JSONObject catalog(Context c, String type, String id, String extra, String host) throws Exception {
+    private JSONObject catalog(Context c, String type, String id, String extra, String extraRaw, String host) throws Exception {
         JSONArray metas = new JSONArray();
+        if ("jellyarr-popular".equals(id) || "jellyarr-featured".equals(id)) {
+            if (!isCatalogsEnabled(c) || !("movie".equals(type) || "series".equals(type))) return new JSONObject().put("metas", metas);
+            return proxyCatalog(c, type, "jellyarr-popular".equals(id) ? "top" : "imdbRating", extraRaw);
+        }
         String jfType;
         if ("jellyarr-movies".equals(id) && "movie".equals(type)) jfType = "Movie";
         else if ("jellyarr-series".equals(id) && "series".equals(type)) jfType = "Series";
@@ -572,7 +637,58 @@ public final class StremioBridge {
         return m;
     }
 
+    private static final String LOCAL_BADGE = "📁 In your Jellyfin library";
+
+    private boolean isLocal(Context c, String imdb) {
+        try {
+            return imdb != null && imdbIndex(c).containsKey(imdb);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void badge(JSONObject meta) throws Exception {
+        String d = meta.optString("description", "");
+        meta.put("description", d.isEmpty() ? LOCAL_BADGE : LOCAL_BADGE + "\n\n" + d);
+    }
+
+    /** Cinemeta's Popular / Featured catalogs (genre, search and paging pass through), flagged when already local. */
+    private JSONObject proxyCatalog(Context c, String type, String upstream, String extraRaw) throws Exception {
+        String url = CINEMETA + "/catalog/" + type + "/" + upstream + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
+        JSONObject d = fetchJson(url, 15000, CATALOG_TTL_MS);
+        JSONArray out = new JSONArray();
+        JSONArray metas = d == null ? null : d.optJSONArray("metas");
+        if (metas != null) {
+            for (int i = 0; i < metas.length(); i++) {
+                JSONObject src = metas.optJSONObject(i);
+                if (src == null) continue;
+                String imdb = src.optString("id", src.optString("imdb_id", ""));
+                if (!imdb.startsWith("tt")) continue;
+                JSONObject m = new JSONObject();
+                m.put("id", imdb);
+                m.put("type", type);
+                m.put("name", src.optString("name"));
+                for (String k : new String[]{"poster", "background", "logo", "description", "releaseInfo", "imdbRating", "genres", "runtime"}) {
+                    if (src.has(k)) m.put(k, src.get(k));
+                }
+                if (isLocal(c, imdb)) badge(m);
+                out.put(m);
+            }
+        }
+        return new JSONObject().put("metas", out);
+    }
+
     private JSONObject meta(Context c, String type, String id, String host) throws Exception {
+        if (id.startsWith("tt")) {
+            String imdb = id.split(":")[0];
+            JSONObject cm = cinemeta(type, imdb);
+            if (cm == null) return new JSONObject().put("meta", JSONObject.NULL);
+            JSONObject m = new JSONObject(cm.toString());
+            m.put("id", imdb);
+            m.put("type", type);
+            if (isLocal(c, imdb)) badge(m);
+            return new JSONObject().put("meta", m);
+        }
         if (!id.startsWith("jellyarr:")) return new JSONObject().put("meta", JSONObject.NULL);
         String itemId = id.substring("jellyarr:".length());
         String uid = userId(c);
@@ -645,6 +761,103 @@ public final class StremioBridge {
         return new JSONObject().put("streams", out);
     }
 
+    private static final Pattern STREMIO_ID = Pattern.compile("^tt\\d+(:\\d+:\\d+)?$");
+
+    /** Jellyfin's own subtitle files for the item, then OpenSubtitles in the configured languages. */
+    private JSONObject subtitles(Context c, String type, String id, String extraRaw, String host) throws Exception {
+        JSONArray out = new JSONArray();
+        if (!isSubtitlesEnabled(c)) return new JSONObject().put("subtitles", out);
+
+        try {
+            addLocalSubtitles(c, out, type, id, host);
+        } catch (Throwable t) {
+            Log.w(TAG, "local subtitles: " + t.getMessage());
+        }
+
+        if (STREMIO_ID.matcher(id).matches() && ("movie".equals(type) || "series".equals(type))) {
+            String url = OPENSUBS + "/subtitles/" + type + "/" + id + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
+            JSONObject d = fetchJson(url, 20000, SUBS_TTL_MS);
+            JSONArray subs = d == null ? null : d.optJSONArray("subtitles");
+            if (subs != null) {
+                String langs = getSubtitleLangs(c);
+                List<String> order = new ArrayList<>();
+                for (String l : langs.split(",")) if (!l.trim().isEmpty()) order.add(l.trim());
+                if (order.isEmpty()) {
+                    addSubs(out, subs, null, 40);
+                } else {
+                    for (String l : order) addSubs(out, subs, l, 8);
+                }
+            }
+        }
+        return new JSONObject().put("subtitles", out);
+    }
+
+    private static void addSubs(JSONArray out, JSONArray subs, String lang, int max) {
+        int n = 0;
+        for (int i = 0; i < subs.length() && n < max; i++) {
+            JSONObject s = subs.optJSONObject(i);
+            if (s == null) continue;
+            String url = s.optString("url", "");
+            String l = s.optString("lang", "");
+            if (url.isEmpty() || (lang != null && !lang.equalsIgnoreCase(l))) continue;
+            try {
+                out.put(new JSONObject().put("id", "os-" + s.optString("id", String.valueOf(i))).put("url", url).put("lang", l));
+                n++;
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void addLocalSubtitles(Context c, JSONArray out, String type, String id, String host) throws Exception {
+        List<String> itemIds = new ArrayList<>();
+        if (id.startsWith("jellyarr:")) {
+            itemIds.add(id.substring("jellyarr:".length()));
+        } else {
+            String[] p = id.split(":");
+            int season = p.length >= 3 ? parseInt(p[1]) : -1;
+            int episode = p.length >= 3 ? parseInt(p[2]) : -1;
+            List<String> ids = imdbIndex(c).get(p[0]);
+            if (ids == null) return;
+            for (String itemId : ids) {
+                if ("series".equals(type) && season >= 0) {
+                    String ep = findEpisode(c, itemId, season, episode);
+                    if (ep != null) itemIds.add(ep);
+                } else if (!"series".equals(type)) {
+                    itemIds.add(itemId);
+                }
+            }
+        }
+        String token = jfToken(c);
+        String base = "http://" + host + ":8096";
+        for (String itemId : itemIds) {
+            JSONObject it = new JSONObject(jfGet(c, "/Users/" + userId(c) + "/Items/" + enc(itemId)));
+            JSONArray sources = it.optJSONArray("MediaSources");
+            if (sources == null) continue;
+            for (int i = 0; i < sources.length(); i++) {
+                JSONObject ms = sources.getJSONObject(i);
+                collectExternalSubs(ms, itemId, ms.optString("Id", itemId), base, token, out);
+            }
+        }
+    }
+
+    /** External (sidecar) subtitle streams of a Jellyfin media source, as Stremio subtitle objects. */
+    private static void collectExternalSubs(JSONObject ms, String itemId, String msId, String base, String token,
+                                            JSONArray subs) throws Exception {
+        JSONArray streamsArr = ms.optJSONArray("MediaStreams");
+        if (streamsArr == null) return;
+        for (int k = 0; k < streamsArr.length(); k++) {
+            JSONObject st = streamsArr.getJSONObject(k);
+            if (!"Subtitle".equals(st.optString("Type")) || !st.optBoolean("IsExternal")
+                    || !st.optBoolean("SupportsExternalStream", true)) continue;
+            int idx = st.optInt("Index");
+            String codec = st.optString("Codec", "srt").toLowerCase(Locale.ROOT);
+            String fmt = codec.contains("ass") || codec.contains("ssa") ? "ass" : codec.contains("vtt") ? "vtt" : "srt";
+            subs.put(new JSONObject()
+                    .put("id", "jellyfin-" + msId + "-" + idx)
+                    .put("url", base + "/Videos/" + itemId + "/" + msId + "/Subtitles/" + idx + "/0/Stream." + fmt + "?api_key=" + token)
+                    .put("lang", st.optString("Language", "und")));
+        }
+    }
+
     private String findEpisode(Context c, String seriesId, int season, int episode) throws Exception {
         JSONObject eps = new JSONObject(jfGet(c, "/Shows/" + enc(seriesId) + "/Episodes?userId=" + userId(c) + "&season=" + season));
         JSONArray arr = eps.optJSONArray("Items");
@@ -687,17 +900,9 @@ public final class StremioBridge {
                     JSONObject st = streamsArr.getJSONObject(k);
                     String t = st.optString("Type");
                     if ("Video".equals(t) && res.isEmpty()) res = resolutionLabel(st.optInt("Width", 0), st.optInt("Height", 0));
-                    if ("Subtitle".equals(t) && st.optBoolean("IsExternal") && st.optBoolean("SupportsExternalStream", true)) {
-                        int idx = st.optInt("Index");
-                        String codec = st.optString("Codec", "srt").toLowerCase(Locale.ROOT);
-                        String fmt = codec.contains("ass") || codec.contains("ssa") ? "ass" : codec.contains("vtt") ? "vtt" : "srt";
-                        subs.put(new JSONObject()
-                                .put("id", "jellyfin-" + msId + "-" + idx)
-                                .put("url", base + "/Videos/" + itemId + "/" + msId + "/Subtitles/" + idx + "/0/Stream." + fmt + "?api_key=" + token)
-                                .put("lang", st.optString("Language", "und")));
-                    }
                 }
             }
+            collectExternalSubs(ms, itemId, msId, base, token, subs);
             String url = base + "/Videos/" + itemId + "/stream?static=true&MediaSourceId=" + enc(msId) + "&api_key=" + token;
             JSONObject s = new JSONObject();
             s.put("name", "Jellyarr\n📁 " + (res.isEmpty() ? "Local" : res));
@@ -821,21 +1026,37 @@ public final class StremioBridge {
     }
 
     private JSONObject cinemeta(String type, String imdb) {
-        String k = type + ":" + imdb;
-        JSONObject cached = cinemetaCache.get(k);
-        if (cached != null) return cached;
+        JSONObject d = fetchJson(CINEMETA + "/meta/" + type + "/" + imdb + ".json", 12000, META_TTL_MS);
+        return d == null ? null : d.optJSONObject("meta");
+    }
+
+    /** GET a JSON document (redirects followed), cached for {@code ttlMs}; null when unreachable. */
+    private JSONObject fetchJson(String url, int readTimeoutMs, long ttlMs) {
+        long now = System.currentTimeMillis();
+        CachedJson hit = jsonCache.get(url);
+        if (hit != null && now - hit.at < ttlMs) return hit.json;
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(CINEMETA + "/meta/" + type + "/" + imdb + ".json").openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(10000);
-            if (conn.getResponseCode() != 200) return null;
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(readTimeoutMs);
+            conn.setRequestProperty("User-Agent", "Jellyarr-Bridge/1.1");
+            conn.setRequestProperty("Accept", "application/json");
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                Log.w(TAG, "HTTP " + code + " for " + url);
+                conn.disconnect();
+                return hit != null ? hit.json : null;
+            }
             try (InputStream in = conn.getInputStream()) {
-                JSONObject meta = new JSONObject(new String(readAll(in, 4 * 1024 * 1024), StandardCharsets.UTF_8)).optJSONObject("meta");
-                if (meta != null) cinemetaCache.put(k, meta);
-                return meta;
+                JSONObject o = new JSONObject(new String(readAll(in, 8 * 1024 * 1024), StandardCharsets.UTF_8));
+                jsonCache.put(url, new CachedJson(now, o));
+                return o;
+            } finally {
+                conn.disconnect();
             }
         } catch (Throwable t) {
-            return null;
+            Log.w(TAG, "fetch " + url + ": " + t.getMessage());
+            return hit != null ? hit.json : null;
         }
     }
 
