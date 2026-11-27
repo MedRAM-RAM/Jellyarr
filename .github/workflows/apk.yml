@@ -2,7 +2,7 @@ name: Build APK (Jellyarr)
 
 on:
   push:
-    branches: [ 'feature/**' ]
+    branches: [ 'feature/**', 'ccr-*', 'claude/**' ]
   workflow_dispatch:
     inputs:
       channel:

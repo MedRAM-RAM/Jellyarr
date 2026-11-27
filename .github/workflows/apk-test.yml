@@ -1,8 +1,7 @@
 name: Test Build APK (no publish)
 
 on:
-  push:
-    branches: [ 'ccr-*', 'claude/**' ]
+  # Pushes are built (and published as a pre-release) by apk.yml; this one is for manual test builds only.
   workflow_dispatch:
 
 permissions:
