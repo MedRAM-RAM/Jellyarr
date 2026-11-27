@@ -10966,6 +10966,28 @@ public final class JellyarrActivity extends AppCompatActivity
 
         card.addView(createSettingsDivider());
 
+        card.addView(UiKit.text(this, I18n.tr("Recent activity"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView actHint = UiKit.caption(this, I18n.tr("How long each step took (Jellyfin, Prowlarr, TorrServer) and the speed of the video. If something is slow, this shows where."));
+        actHint.setPadding(0, dp(2), 0, dp(6));
+        card.addView(actHint);
+        final TextView actText = UiKit.mono(this, "");
+        actText.setTextSize(10.5f);
+        actText.setTextDirection(View.TEXT_DIRECTION_LTR);
+        card.addView(actText);
+        LinearLayout actBtns = new LinearLayout(this);
+        actBtns.setOrientation(LinearLayout.HORIZONTAL);
+        actBtns.setPadding(0, dp(6), 0, 0);
+        Button actRefresh = UiKit.outline(this, buttonLabel("REFRESH"), v -> { if (bridgeRefresh != null) bridgeRefresh.run(); });
+        Button actCopy = UiKit.tonal(this, buttonLabel("COPY"), v ->
+                copyUrlToClipboard("Jellyarr activity", com.jellyarr.app.services.StremioBridge.getInstance().getActivity(60)));
+        LinearLayout.LayoutParams ab = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
+        ab.setMarginEnd(dp(6));
+        actBtns.addView(actRefresh, ab);
+        actBtns.addView(actCopy, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
+        card.addView(actBtns);
+
+        card.addView(createSettingsDivider());
+
         card.addView(UiKit.text(this, I18n.tr("Use it in Stremio"), 13.5f, AppTheme.text(), UiKit.BOLD));
         TextView how = UiKit.caption(this, I18n.tr(
                 "1. In Stremio open Addons, tap Add addon and paste the addon URL above (or tap OPEN IN STREMIO). Nothing else is needed.\n"
@@ -11029,6 +11051,8 @@ public final class JellyarrActivity extends AppCompatActivity
             } else {
                 tsBtn.setVisibility(View.GONE);
             }
+            String act = com.jellyarr.app.services.StremioBridge.getInstance().getActivity(12);
+            actText.setText(act.isEmpty() ? I18n.tr("No activity yet.") : act);
             refreshTunnelRow(tunStatus, tunBtn);
         };
         bridgeRefresh.run();

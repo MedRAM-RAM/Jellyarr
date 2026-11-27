@@ -56,7 +56,8 @@ All services listen on the phone and on your local network only.
   with the ones that match the playing file first (old Arabic/Hebrew/Cyrillic files are converted to UTF-8).
   Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
   never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use
-  it from apps that are not on your home network, such as a hosted AIOStreams. The app can run the Cloudflare
+  it from apps that are not on your home network, such as a hosted AIOStreams. With a public address set, local
+  files also get a 🏠 LAN entry that streams over the home network instead of looping through the internet. The app can run the Cloudflare
   Tunnel itself: paste your tunnel token in the same settings page. `cloudflared` is built in CI from the upstream
   source plus a small DNS patch for Android (`ci/cloudflared`) and shipped inside the APK.
 - **Automation.** Transmission auto-cleanup and auto-recheck, automatic missing-episode search, Wi-Fi-only mode.

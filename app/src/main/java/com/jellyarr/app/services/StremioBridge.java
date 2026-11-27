@@ -74,6 +74,9 @@ public final class StremioBridge {
     static String subdlApi = "https://api.subdl.com/api/v1/subtitles";
     static String subdlDl = "https://dl.subdl.com";
     private static final int MAX_SUBS_PER_LANG = 8;
+    /** How long /stream waits for Prowlarr; slower searches keep running and fill the cache for the next request. */
+    static long prowlarrBudgetMs = 12000;
+    private static final long PROWLARR_TTL_MS = 15 * 60 * 1000L;
     private static final String[] GENRES_MOVIE = {"Action", "Adventure", "Animation", "Biography", "Comedy", "Crime",
             "Documentary", "Drama", "Family", "Fantasy", "History", "Horror", "Mystery", "Romance", "Sci-Fi", "Sport",
             "Thriller", "War", "Western"};
@@ -423,6 +426,45 @@ public final class StremioBridge {
         String path;
         String host;
         String range;
+        String via = "";
+    }
+
+    // ---- activity log: what was asked and how long it took, to find out what is slow
+    private final java.util.ArrayDeque<String> activity = new java.util.ArrayDeque<>();
+
+    private void log(String line) {
+        String t = new java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(new java.util.Date());
+        synchronized (activity) {
+            activity.addFirst(t + "  " + line);
+            while (activity.size() > 60) activity.removeLast();
+        }
+    }
+
+    /** The newest {@code max} lines, newest first. */
+    public String getActivity(int max) {
+        StringBuilder sb = new StringBuilder();
+        synchronized (activity) {
+            int n = 0;
+            for (String l : activity) {
+                if (n++ >= max) break;
+                sb.append(l).append('\n');
+            }
+        }
+        return sb.toString().trim();
+    }
+
+    /** Set per request when a public address is configured: the same server reached over the home network. */
+    private static final ThreadLocal<String> LAN_SELF = new ThreadLocal<>();
+
+    private String viaOf(Context c, String host) {
+        String h = host == null ? "" : host.trim();
+        int colon = h.lastIndexOf(':');
+        if (colon > 0 && h.indexOf(']') < colon) h = h.substring(0, colon);
+        String pub = getPublicUrl(c);
+        if (!pub.isEmpty() && pub.toLowerCase(Locale.ROOT).contains("//" + h.toLowerCase(Locale.ROOT))) return "public";
+        if (h.startsWith("192.168.") || h.startsWith("10.") || h.startsWith("172.") || h.startsWith("100.")
+                || h.equals("localhost") || h.startsWith("127.")) return "lan";
+        return h.isEmpty() ? "?" : "other";
     }
 
     private static final class Resp {
@@ -474,6 +516,8 @@ public final class StremioBridge {
             Req req = readRequest(in);
             Resp resp;
             if (req == null) return;
+            Context cc = app;
+            if (cc != null) req.via = viaOf(cc, req.host);
             if ("OPTIONS".equals(req.method)) {
                 resp = Resp.text(204, "");
             } else if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
@@ -494,6 +538,8 @@ public final class StremioBridge {
             write(sock.getOutputStream(), resp, "HEAD".equals(req.method));
         } catch (Throwable t) {
             Log.d(TAG, "connection: " + t.getMessage());
+        } finally {
+            LAN_SELF.remove();
         }
     }
 
@@ -550,6 +596,10 @@ public final class StremioBridge {
     /** Streams an upstream response (Jellyfin, TorrServer) to the client, passing Range through for seeking. */
     private void pipe(OutputStream out, Req req, Resp r) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(r.proxyUrl).openConnection();
+        final long t0 = System.currentTimeMillis();
+        long ttfb = -1;
+        long sent = 0;
+        boolean closedEarly = false;
         try {
             conn.setInstanceFollowRedirects(false);
             conn.setConnectTimeout(8000);
@@ -567,6 +617,7 @@ public final class StremioBridge {
                 write(out, Resp.text(502, "The source did not answer."), "HEAD".equals(req.method));
                 return;
             }
+            ttfb = System.currentTimeMillis() - t0;
             InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
             StringBuilder sb = new StringBuilder();
             sb.append("HTTP/1.1 ").append(code).append(' ').append(reason(code)).append("\r\n");
@@ -587,10 +638,24 @@ public final class StremioBridge {
             if ("HEAD".equals(req.method) || in == null) return;
             byte[] buf = new byte[64 * 1024];
             int n;
-            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
-            out.flush();
+            try {
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                    sent += n;
+                }
+                out.flush();
+            } catch (java.io.IOException e) {
+                closedEarly = true; // the player closed the connection (seeking, stopping)
+            }
         } finally {
             conn.disconnect();
+            String kind = r.proxyUrl.contains("/Videos/") && r.proxyUrl.contains("/stream") ? "video" : r.proxyUrl.contains(":" + TORRSERVER_PORT + "/") ? "torrent" : null;
+            if (kind != null && (sent > 256 * 1024 || ttfb > 3000)) {
+                long ms = Math.max(1, System.currentTimeMillis() - t0);
+                String rate = sent > 256 * 1024 ? String.format(Locale.US, " %.1f Mbit/s", sent * 8.0 / 1000.0 / ms) : "";
+                log(String.format(Locale.US, "%s via=%s  first byte %s  %s sent in %.1fs%s%s", kind, req.via,
+                        ttfb < 0 ? "-" : ttfb + "ms", human(sent), ms / 1000.0, rate, closedEarly ? "  (player closed)" : ""));
+            }
         }
     }
 
@@ -627,6 +692,10 @@ public final class StremioBridge {
         String rest = path.substring(prefix.length());
         String pub = getPublicUrl(c);
         String self = (pub.isEmpty() ? "http://" + publicHost(req.host) + ":" + PORT : pub) + "/" + key;
+        if (!pub.isEmpty()) {
+            String lanIp = NetworkUtils.getRawLanIp();
+            if (lanIp != null && !lanIp.isEmpty()) LAN_SELF.set("http://" + lanIp + ":" + PORT + "/" + key);
+        }
 
         if (rest.equals("manifest.json")) return Resp.json(manifest(c), 0);
         if (rest.isEmpty() || rest.equals("configure")) return Resp.text(200, "Jellyarr Bridge: add " + self + "/manifest.json to AIOStreams or Stremio.");
@@ -1070,6 +1139,7 @@ public final class StremioBridge {
         String imdb = p[0];
         int season = p.length >= 3 ? parseInt(p[1]) : -1;
         int episode = p.length >= 3 ? parseInt(p[2]) : -1;
+        final long t0 = System.currentTimeMillis();
 
         // Local files first
         try {
@@ -1088,6 +1158,9 @@ public final class StremioBridge {
             Log.w(TAG, "local streams: " + t.getMessage());
         }
 
+        final int local = out.length();
+        final long t1 = System.currentTimeMillis();
+
         // Torrents through Prowlarr + TorrServer
         if (isTorrentsEnabled(c)) {
             try {
@@ -1096,6 +1169,8 @@ public final class StremioBridge {
                 Log.w(TAG, "torrent streams: " + t.getMessage());
             }
         }
+        log(String.format(Locale.US, "streams %s  local %d (%dms)  torrents %d (%dms)", id, local, t1 - t0,
+                out.length() - local, System.currentTimeMillis() - t1));
         return new JSONObject().put("streams", out);
     }
 
@@ -1469,21 +1544,28 @@ public final class StremioBridge {
                     if ("Video".equals(t) && res.isEmpty()) res = resolutionLabel(st.optInt("Width", 0), st.optInt("Height", 0));
                 }
             }
-            collectExternalSubs(ms, itemId, msId, self, subs);
-            String url = self + "/jf/video/" + itemId + "/" + enc(msId);
-            JSONObject s = new JSONObject();
-            s.put("name", "Jellyarr\n📁 " + (res.isEmpty() ? "Local" : res));
-            String desc = "🏠 Jellyfin library\n📄 " + file + (size > 0 ? "\n💾 " + human(size) : "");
-            s.put("title", desc);
-            s.put("description", desc);
-            s.put("url", url);
-            if (subs.length() > 0) s.put("subtitles", subs);
-            JSONObject hints = new JSONObject();
-            hints.put("bingeGroup", "jellyarr-local");
-            hints.put("filename", file);
-            if (size > 0) hints.put("videoSize", size);
-            s.put("behaviorHints", hints);
-            out.put(s);
+            String lan = LAN_SELF.get();
+            List<String> bases = new ArrayList<>();
+            if (lan != null) bases.add(lan);
+            bases.add(self);
+            for (String base : bases) {
+                boolean lanVariant = lan != null && base.equals(lan);
+                JSONArray vsubs = new JSONArray();
+                collectExternalSubs(ms, itemId, msId, base, vsubs);
+                JSONObject s = new JSONObject();
+                s.put("name", "Jellyarr\n📁 " + (res.isEmpty() ? "Local" : res) + (lan == null ? "" : lanVariant ? " · 🏠 LAN" : " · 🌐"));
+                String desc = "🏠 Jellyfin library\n📄 " + file + (size > 0 ? "\n💾 " + human(size) : "");
+                s.put("title", desc);
+                s.put("description", desc);
+                s.put("url", base + "/jf/video/" + itemId + "/" + enc(msId));
+                if (vsubs.length() > 0) s.put("subtitles", vsubs);
+                JSONObject hints = new JSONObject();
+                hints.put("bingeGroup", "jellyarr-local");
+                hints.put("filename", lanVariant ? file + " [LAN]" : file);
+                if (size > 0) hints.put("videoSize", size);
+                s.put("behaviorHints", hints);
+                out.put(s);
+            }
         }
     }
 
@@ -1495,24 +1577,29 @@ public final class StremioBridge {
         if (key == null || key.isEmpty()) return;
         boolean series = "series".equals(type) && season >= 0;
 
-        List<JSONObject> results = new ArrayList<>();
+        // The searches run in parallel and are cached. Within the budget we return what has arrived; the slower
+        // ones keep running and fill the cache, so the next request for this title is instant and complete.
+        final long deadline = System.currentTimeMillis() + prowlarrBudgetMs;
+        final String fkey = key;
+        List<Future<List<JSONObject>>> searches = new ArrayList<>();
         if (series) {
-            results.addAll(prowlarrSearch(key, "tvsearch", "{ImdbId:" + imdb + "}{Season:" + season + "}{Episode:" + episode + "}", "5000"));
-            if (results.size() < 5) {
-                results.addAll(prowlarrSearch(key, "tvsearch", "{ImdbId:" + imdb + "}{Season:" + season + "}", "5000"));
-            }
+            final String epQ = "{ImdbId:" + imdb + "}{Season:" + season + "}{Episode:" + episode + "}";
+            final String seQ = "{ImdbId:" + imdb + "}{Season:" + season + "}";
+            searches.add(fetchPool.submit(() -> prowlarrCached(fkey, "tvsearch", epQ, "5000")));
+            searches.add(fetchPool.submit(() -> prowlarrCached(fkey, "tvsearch", seQ, "5000")));
         } else {
-            results.addAll(prowlarrSearch(key, "movie", "{ImdbId:" + imdb + "}", "2000"));
+            final String mvQ = "{ImdbId:" + imdb + "}";
+            searches.add(fetchPool.submit(() -> prowlarrCached(fkey, "movie", mvQ, "2000")));
         }
-        if (results.isEmpty()) {
+        List<JSONObject> results = new ArrayList<>();
+        for (Future<List<JSONObject>> f : searches) results.addAll(await(f, deadline));
+        if (results.isEmpty() && deadline - System.currentTimeMillis() > 2000) {
             JSONObject cm = cinemeta(series ? "series" : "movie", imdb);
-            if (cm != null) {
-                String name = cm.optString("name", "");
-                if (!name.isEmpty()) {
-                    String q = series ? name + String.format(Locale.US, " S%02dE%02d", season, episode)
-                            : name + yearOf(cm);
-                    results.addAll(prowlarrSearch(key, "search", q, series ? "5000" : "2000"));
-                }
+            String name = cm == null ? "" : cm.optString("name", "");
+            if (!name.isEmpty()) {
+                final String q = series ? name + String.format(Locale.US, " S%02dE%02d", season, episode) : name + yearOf(cm);
+                final String cats = series ? "5000" : "2000";
+                results.addAll(await(fetchPool.submit(() -> prowlarrCached(fkey, "search", q, cats)), deadline));
             }
         }
 
@@ -1563,6 +1650,50 @@ public final class StremioBridge {
             s.put("behaviorHints", hints);
             out.put(s);
         }
+    }
+
+    /** A finished search's result, or empty when it is still running at the deadline (it carries on in the background). */
+    private static List<JSONObject> await(Future<List<JSONObject>> f, long deadline) {
+        try {
+            return f.get(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            Log.w(TAG, "Prowlarr is still searching; answering without it");
+            return new ArrayList<>();
+        } catch (Throwable t) {
+            return new ArrayList<>();
+        }
+    }
+
+    private List<JSONObject> prowlarrCached(String key, String type, String query, String cats) {
+        String ck = "prowlarr|" + type + "|" + query + "|" + cats;
+        CachedJson hit = jsonCache.get(ck);
+        if (hit != null && System.currentTimeMillis() - hit.at < PROWLARR_TTL_MS) return fromCache(hit.json);
+        long t0 = System.currentTimeMillis();
+        List<JSONObject> found = prowlarrSearch(key, type, query, cats);
+        JSONArray slim = new JSONArray();
+        for (JSONObject r : found) {
+            JSONObject o = new JSONObject();
+            for (String k : new String[]{"protocol", "title", "size", "seeders", "indexer", "infoHash", "magnetUrl", "downloadUrl"}) {
+                if (r.has(k)) try { o.put(k, r.get(k)); } catch (Throwable ignored) {}
+            }
+            slim.put(o);
+        }
+        log(String.format(Locale.US, "Prowlarr %s  %d results (%.1fs)", type, found.size(), (System.currentTimeMillis() - t0) / 1000.0));
+        if (slim.length() > 0) {
+            try { jsonCache.put(ck, new CachedJson(System.currentTimeMillis(), new JSONObject().put("r", slim))); } catch (Throwable ignored) {}
+        }
+        try {
+            return fromCache(new JSONObject().put("r", slim));
+        } catch (Throwable t) {
+            return found;
+        }
+    }
+
+    private static List<JSONObject> fromCache(JSONObject o) {
+        List<JSONObject> out = new ArrayList<>();
+        JSONArray a = o.optJSONArray("r");
+        if (a != null) for (int i = 0; i < a.length(); i++) { JSONObject x = a.optJSONObject(i); if (x != null) out.add(x); }
+        return out;
     }
 
     private List<JSONObject> prowlarrSearch(String key, String type, String query, String cats) {
@@ -1682,6 +1813,10 @@ public final class StremioBridge {
         return seasonOk && ep.find();
     }
 
+    private static String abbreviate(String s) {
+        return s == null ? "" : s.length() > 48 ? s.substring(0, 45) + "..." : s;
+    }
+
     private static String qualityOf(String title) {
         String t = title.toLowerCase(Locale.ROOT);
         if (t.contains("2160p") || t.contains("4k") || t.contains("uhd")) return "4K";
@@ -1712,6 +1847,7 @@ public final class StremioBridge {
         }
 
         if (ref.resolvedHash == null) {
+            final long tr = System.currentTimeMillis();
             String link = resolveLink(ref);
             if (link == null) return Resp.text(502, "Could not get the torrent from Prowlarr.");
             JSONObject status = torrStat(link);
@@ -1740,6 +1876,7 @@ public final class StremioBridge {
             }
             if (ref.season >= 0 && epId >= 0) { bestId = epId; bestPath = epPath; }
             if (bestId < 0) return Resp.text(502, "No video file in this torrent.");
+            log(String.format(Locale.US, "torrent opened in TorrServer: %s  (%.1fs to get the file list)", abbreviate(ref.title), (System.currentTimeMillis() - tr) / 1000.0));
             ref.resolvedHash = hash;
             ref.resolvedIndex = bestId;
             ref.resolvedName = bestPath.substring(bestPath.lastIndexOf('/') + 1);
