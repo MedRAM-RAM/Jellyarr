@@ -65,6 +65,9 @@ jobs:
           readelf -d "$SO" | grep -E 'NEEDED|RPATH|RUNPATH' || true
           sha256sum "$SO"
 
+      - name: Build cloudflared (Android DNS patch)
+        uses: ./.github/actions/build-cloudflared
+
       - name: Download Termux bootstraps
         run: |
           chmod +x gradlew
