@@ -31,16 +31,10 @@ runs:
         CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
           -ldflags "-s -w -X main.Version=${{ inputs.tag }}" -o "$RUNNER_TEMP/cloudflared" ./cmd/cloudflared
         file "$RUNNER_TEMP/cloudflared"
-        # Sanity run under emulation: plain, and with the DNS patch switched on (the init path must not crash).
-        # The package name differs between runner images, and this check must never block the APK build.
-        sudo apt-get update -qq || true
-        if sudo apt-get install -y -qq qemu-user-static || sudo apt-get install -y -qq qemu-user; then
-          QEMU="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
-          "$QEMU" "$RUNNER_TEMP/cloudflared" --version
-          JELLYARR_DNS="127.0.0.1:1,1.1.1.1" "$QEMU" "$RUNNER_TEMP/cloudflared" --version
-        else
-          echo "::warning::No qemu package on this runner: skipped the emulated run of cloudflared (build and ELF check passed)"
-        fi
+        # Run it under emulation: plain, and with the DNS patch switched on (the init path must not crash)
+        sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+        qemu-aarch64-static "$RUNNER_TEMP/cloudflared" --version
+        JELLYARR_DNS="127.0.0.1:1,1.1.1.1" qemu-aarch64-static "$RUNNER_TEMP/cloudflared" --version
         mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets"
         cp "$RUNNER_TEMP/cloudflared" "$GITHUB_WORKSPACE/app/src/main/assets/cloudflared-android-arm64"
         ls -la "$GITHUB_WORKSPACE/app/src/main/assets/cloudflared-android-arm64"
