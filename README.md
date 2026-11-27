@@ -52,7 +52,8 @@ All services listen on the phone and on your local network only.
   app that takes Stremio addons, and you get your Jellyfin library with direct play, Popular and Featured
   catalogs (Popular, Featured, New by year; genres, search, a 📁 badge on what you already own, plus any other
   Stremio catalog addon you add), torrents from Prowlarr streamed through TorrServer, and subtitles from Jellyfin,
-  SubDL (your own free API key), OpenSubtitles and any other Stremio subtitle addon, in the languages you pick,
+  SubDL, Wyzie, SubSource, OpenSubtitles.com (your own keys), OpenSubtitles V3 and any other Stremio subtitle addon
+  (shown in turn so no source fills the list), in the languages you pick,
   with the ones that match the playing file first (old Arabic/Hebrew/Cyrillic files are converted to UTF-8).
   Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
   never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use

@@ -73,7 +73,10 @@ public final class StremioBridge {
     // Package-private and not final so tests can point them at a local server.
     static String subdlApi = "https://api.subdl.com/api/v1/subtitles";
     static String subdlDl = "https://dl.subdl.com";
-    private static final int MAX_SUBS_PER_LANG = 8;
+    static String wyzieApi = "https://sub.wyzie.io";
+    static String subsourceApi = "https://api.subsource.net/api/v1";
+    static String oscomApi = "https://api.opensubtitles.com/api/v1";
+    private static final int MAX_SUBS_PER_LANG = 12;
     /** How many of the best torrent results also get a home-network entry when a public address is set. */
     private static final int LAN_TORRENTS = 5;
     /** How long /stream waits for Prowlarr; slower searches keep running and fill the cache for the next request. */
@@ -201,6 +204,20 @@ public final class StremioBridge {
         return true;
     }
 
+    public static String getWyzieKey(Context c) { return prefs(c).getString("wyzie_key", ""); }
+    public static boolean setWyzieKey(Context c, String k) { return saveKey(c, "wyzie_key", k); }
+    public static String getSubsourceKey(Context c) { return prefs(c).getString("subsource_key", ""); }
+    public static boolean setSubsourceKey(Context c, String k) { return saveKey(c, "subsource_key", k); }
+    public static String getOscomKey(Context c) { return prefs(c).getString("oscom_key", ""); }
+    public static boolean setOscomKey(Context c, String k) { return saveKey(c, "oscom_key", k); }
+
+    private static boolean saveKey(Context c, String pref, String key) {
+        String v = key == null ? "" : key.trim();
+        if (!v.isEmpty() && !v.matches("[A-Za-z0-9_\\-]{10,200}")) return false;
+        prefs(c).edit().putString(pref, v).apply();
+        return true;
+    }
+
     /** Other Stremio subtitle addons to ask as well (SubSource, SubHero, OpenSubtitles V3+...), one address per line. */
     public static String getSubAddons(Context c) { return prefs(c).getString("sub_addons", ""); }
 
@@ -300,6 +317,19 @@ public final class StremioBridge {
             case "vie": return "windows-1258";
             default: return "windows-1252";
         }
+    }
+
+    /**
+     * Where video, subtitles and posters are served from when a public address is set: "both" (a home-network entry
+     * and a public one), "lan" (home network only: the tunnel carries just the addon's lists) or "public".
+     */
+    public static String getStreamLinks(Context c) {
+        String v = prefs(c).getString("stream_links", "both");
+        return v.equals("lan") || v.equals("public") ? v : "both";
+    }
+
+    public static void setStreamLinks(Context c, String v) {
+        prefs(c).edit().putString("stream_links", v.equals("lan") || v.equals("public") ? v : "both").apply();
     }
 
     public static int getMaxTorrents(Context c) { return prefs(c).getInt("max_torrents", 15); }
@@ -674,6 +704,7 @@ public final class StremioBridge {
             case 200: return "OK";
             case 204: return "No Content";
             case 206: return "Partial Content";
+            case 429: return "Too Many Requests";
             case 302: return "Found";
             case 401: return "Unauthorized";
             case 403: return "Forbidden";
@@ -704,7 +735,12 @@ public final class StremioBridge {
         String self = (pub.isEmpty() ? "http://" + publicHost(req.host) + ":" + PORT : pub) + "/" + key;
         if (!pub.isEmpty()) {
             String lanIp = NetworkUtils.getRawLanIp();
-            if (lanIp != null && !lanIp.isEmpty()) LAN_SELF.set("http://" + lanIp + ":" + PORT + "/" + key);
+            String lanSelf = lanIp != null && !lanIp.isEmpty() ? "http://" + lanIp + ":" + PORT + "/" + key : null;
+            String mode = getStreamLinks(c);
+            if (lanSelf != null) {
+                if (mode.equals("lan")) self = lanSelf;        // only the lists travel through the tunnel
+                else if (mode.equals("both")) LAN_SELF.set(lanSelf);
+            }
         }
 
         if (rest.equals("manifest.json")) return Resp.json(manifest(c), 0);
@@ -713,7 +749,7 @@ public final class StremioBridge {
         String[] seg = rest.split("/");
         if (seg.length >= 2 && seg[0].equals("play")) return play(c, seg[1]);
         if (seg.length >= 2 && seg[0].equals("jf")) return jf(c, seg, q >= 0 ? req.path.substring(q + 1) : "");
-        if (seg.length == 3 && seg[0].equals("sub") && seg[1].equals("subdl")) return subdlFile(seg[2], q >= 0 ? req.path.substring(q + 1) : "");
+        if (seg.length == 3 && seg[0].equals("sub") && seg[1].equals("t")) return subFile(c, seg[2]);
         if (seg.length < 3) return Resp.text(404, "Not found");
         String resource = seg[0];
         String type = seg[1];
@@ -1230,6 +1266,10 @@ public final class StremioBridge {
         List<Callable<List<Sub>>> jobs = new ArrayList<>();
         jobs.add(() -> addonSubs(OPENSUBS, type, id, extraRaw, 1, "os-"));
         if (!key.isEmpty()) jobs.add(() -> subdlSubs(key, p[0], series, season, episode, wanted, self));
+        final String wk = getWyzieKey(c), sk = getSubsourceKey(c), ok = getOscomKey(c);
+        if (!wk.isEmpty()) jobs.add(() -> wyzieSubs(wk, p[0], series, season, episode, wanted, self));
+        if (!sk.isEmpty()) jobs.add(() -> subsourceSubs(sk, p[0], series, season, episode, wanted, self));
+        if (!ok.isEmpty()) jobs.add(() -> oscomSubs(ok, p[0], series, season, episode, wanted, self));
         int n = 0;
         for (String base : addonBases(getSubAddons(c))) {
             final String tag = "x" + (n++) + "-";
@@ -1260,10 +1300,22 @@ public final class StremioBridge {
             for (int i = 0; i < unique.size() && i < 40; i++) put(out, unique.get(i));
         } else {
             for (String l : wanted) {
-                int k = 0;
+                // One from each provider in turn (each provider's best first), so one source cannot fill the list.
+                Map<String, List<Sub>> byProvider = new LinkedHashMap<>();
                 for (Sub s : unique) {
-                    if (k >= MAX_SUBS_PER_LANG) break;
-                    if (l.equals(s.lang)) { put(out, s); k++; }
+                    if (!l.equals(s.lang)) continue;
+                    String prov = s.id.contains("-") ? s.id.substring(0, s.id.indexOf('-')) : s.id;
+                    List<Sub> q = byProvider.get(prov);
+                    if (q == null) { q = new ArrayList<>(); byProvider.put(prov, q); }
+                    q.add(s);
+                }
+                int k = 0;
+                for (int round = 0; k < MAX_SUBS_PER_LANG; round++) {
+                    boolean any = false;
+                    for (List<Sub> q : byProvider.values()) {
+                        if (round < q.size() && k < MAX_SUBS_PER_LANG) { put(out, q.get(round)); k++; any = true; }
+                    }
+                    if (!any) break;
                 }
             }
         }
@@ -1322,21 +1374,58 @@ public final class StremioBridge {
     }
 
     private static final Pattern SUBDL_PATH = Pattern.compile("^/subtitle/(\\d{1,12}-\\d{1,12})\\.zip$");
+    private static final String PROVIDER_UA = "Jellyarr v3.0";
 
-    /** SubDL searched directly (API key from the user); each result is served by {@link #subdlFile}. */
+    /** What a subtitle link served by the bridge stands for; the provider is asked only when the file is opened. */
+    private static final class SubRef {
+        String kind;   // subdl, subsource, wyzie, oscom
+        String id;     // provider id (Wyzie: its download address)
+        String lang;
+        int season = -1, episode = -1;
+    }
+
+    private final Map<String, SubRef> subRefs = Collections.synchronizedMap(
+            new LinkedHashMap<String, SubRef>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, SubRef> e) {
+                    return size() > 600;
+                }
+            });
+
+    private String subLink(String self, SubRef ref) {
+        String t = randomHex(8);
+        subRefs.put(t, ref);
+        return self + "/sub/t/" + t + ".srt";
+    }
+
+    private static Sub makeSub(String id, String url, String lang, String name, int source) {
+        Sub s = new Sub();
+        s.id = id; s.url = url; s.lang = lang; s.name = name; s.source = source;
+        return s;
+    }
+
+    private static List<String> codes(List<String> wanted, int column, boolean lower) {
+        List<String> out = new ArrayList<>();
+        for (String w : wanted) {
+            for (String[] row : LANGS) {
+                if (row[0].equals(w)) {
+                    String v = row[column];
+                    if (w.equals("pob") && column == 2) v = "pt-br";
+                    if (!v.isEmpty()) out.add(lower ? v.toLowerCase(Locale.ROOT) : v);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** SubDL: searched with the user's own key. Its result urls carry that key; only the zip's id is kept. */
     private List<Sub> subdlSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self) {
         List<Sub> out = new ArrayList<>();
-        StringBuilder codes = new StringBuilder();
-        for (String w : wanted) {
-            String code = subdlCode(w);
-            if (code == null) continue;
-            if (codes.length() > 0) codes.append(',');
-            codes.append(code);
-        }
-        if (!wanted.isEmpty() && codes.length() == 0) return out;
+        List<String> cs = codes(wanted, 3, false);
+        if (!wanted.isEmpty() && cs.isEmpty()) return out;
         StringBuilder q = new StringBuilder(subdlApi).append("?api_key=").append(enc(key))
                 .append("&imdb_id=").append(imdb).append("&subs_per_page=30&client=jellyarr");
-        if (codes.length() > 0) q.append("&languages=").append(codes);
+        if (!cs.isEmpty()) q.append("&languages=").append(String.join(",", cs));
         if (series) q.append("&type=tv&season_number=").append(season).append("&episode_number=").append(episode);
         else q.append("&type=movie");
         JSONObject d = fetchJson(q.toString(), 20000, SUBS_TTL_MS);
@@ -1345,16 +1434,124 @@ public final class StremioBridge {
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) continue;
-            Matcher m = SUBDL_PATH.matcher(o.optString("url", ""));
+            String path = o.optString("url", "");
+            int qm = path.indexOf('?');
+            if (qm >= 0) path = path.substring(0, qm);
+            Matcher m = SUBDL_PATH.matcher(path);
             String lang = canonLang(o.optString("language", o.optString("lang", "")));
             if (!m.matches() || lang == null) continue;
-            Sub s = new Sub();
-            s.id = "subdl-" + m.group(1);
-            s.url = self + "/sub/subdl/" + m.group(1) + ".srt?l=" + lang + (series ? "&s=" + season + "&e=" + episode : "");
-            s.lang = lang;
-            s.name = o.optString("release_name", o.optString("name", ""));
-            s.source = 0;
-            out.add(s);
+            SubRef r = new SubRef();
+            r.kind = "subdl"; r.id = m.group(1); r.lang = lang;
+            if (series) { r.season = season; r.episode = episode; }
+            out.add(makeSub("subdl-" + m.group(1), subLink(self, r), lang, o.optString("release_name", o.optString("name", "")), 0));
+        }
+        return out;
+    }
+
+    /** Wyzie: results are direct UTF-8 .srt addresses; they are served through the bridge to keep its tokens private. */
+    private List<Sub> wyzieSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self) {
+        List<Sub> out = new ArrayList<>();
+        List<String> cs = codes(wanted, 2, true);
+        if (!wanted.isEmpty() && cs.isEmpty()) return out;
+        StringBuilder q = new StringBuilder(wyzieApi).append("/search?id=").append(imdb).append("&format=srt");
+        if (series) q.append("&season=").append(season).append("&episode=").append(episode);
+        if (!cs.isEmpty()) q.append("&language=").append(String.join(",", cs));
+        q.append("&key=").append(enc(key));
+        String body = fetchText(q.toString(), null, 20000, SUBS_TTL_MS);
+        if (body == null) return out;
+        try {
+            JSONArray arr = new JSONArray(body);
+            for (int i = 0; i < arr.length() && out.size() < 40; i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null || o.optBoolean("machine") || o.optBoolean("ai")) continue;
+                String url = o.optString("url", "");
+                String lang = canonLang(o.optString("language", ""));
+                if (!url.startsWith("https://") || lang == null) continue;
+                SubRef r = new SubRef();
+                r.kind = "wyzie"; r.id = url; r.lang = lang;
+                out.add(makeSub("wyzie-" + o.optString("id", String.valueOf(i)), subLink(self, r), lang,
+                        o.optString("release", o.optString("fileName", "")), 0));
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "wyzie: " + t.getMessage());
+        }
+        return out;
+    }
+
+    /** SubSource: the title (and season) is found by IMDb id, then its subtitles are listed per language. */
+    private List<Sub> subsourceSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self) {
+        List<Sub> out = new ArrayList<>();
+        Map<String, String> h = new HashMap<>();
+        h.put("X-API-Key", key);
+        try {
+            String mv = fetchText(subsourceApi + "/movies/search?searchType=imdb&imdb=" + imdb + (series ? "&season=" + season : ""), h, 15000, META_TTL_MS);
+            if (mv == null) return out;
+            JSONArray data = new JSONObject(mv).optJSONArray("data");
+            long movieId = -1;
+            for (int i = 0; data != null && i < data.length() && movieId < 0; i++) {
+                JSONObject o = data.optJSONObject(i);
+                if (o != null && (!series || o.isNull("season") || o.optInt("season", season) == season)) movieId = o.optLong("movieId", -1);
+            }
+            if (movieId < 0) return out;
+            List<String> names = codes(wanted, 4, true);
+            if (names.isEmpty()) names.add("");
+            for (String lang : names) {
+                String body = fetchText(subsourceApi + "/subtitles?movieId=" + movieId + (lang.isEmpty() ? "" : "&language=" + enc(lang)) + "&limit=30", h, 15000, SUBS_TTL_MS);
+                JSONArray arr = body == null ? null : new JSONObject(body).optJSONArray("data");
+                for (int i = 0; arr != null && i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    String l = o == null ? null : canonLang(o.optString("language", lang));
+                    if (o == null || l == null || o.optBoolean("foreignParts")) continue;
+                    JSONArray ri = o.optJSONArray("releaseInfo");
+                    StringBuilder rel = new StringBuilder();
+                    for (int k = 0; ri != null && k < ri.length() && k < 4; k++) rel.append(ri.optString(k)).append(' ');
+                    SubRef r = new SubRef();
+                    r.kind = "subsource"; r.id = String.valueOf(o.optLong("subtitleId")); r.lang = l;
+                    if (series) { r.season = season; r.episode = episode; }
+                    out.add(makeSub("subsource-" + r.id, subLink(self, r), l, rel.toString().trim(), 0));
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "subsource: " + t.getMessage());
+        }
+        return out;
+    }
+
+    /** OpenSubtitles.com: its API wants the query parameters in alphabetical order, or it redirects. */
+    private List<Sub> oscomSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self) {
+        List<Sub> out = new ArrayList<>();
+        Map<String, String> h = new HashMap<>();
+        h.put("Api-Key", key);
+        h.put("User-Agent", PROVIDER_UA);
+        java.util.TreeMap<String, String> q = new java.util.TreeMap<>();
+        String digits = imdb.replaceFirst("^tt", "");
+        if (series) {
+            q.put("parent_imdb_id", digits); q.put("season_number", String.valueOf(season));
+            q.put("episode_number", String.valueOf(episode)); q.put("type", "episode");
+        } else {
+            q.put("imdb_id", digits); q.put("type", "movie");
+        }
+        List<String> cs = codes(wanted, 2, false);
+        if (!cs.isEmpty()) q.put("languages", String.join(",", cs).toLowerCase(Locale.ROOT));
+        StringBuilder url = new StringBuilder(oscomApi).append("/subtitles?");
+        for (Map.Entry<String, String> e : q.entrySet()) url.append(e.getKey()).append('=').append(enc(e.getValue()).replace("%2C", ",")).append('&');
+        url.setLength(url.length() - 1);
+        String body = fetchText(url.toString(), h, 20000, SUBS_TTL_MS);
+        if (body == null) return out;
+        try {
+            JSONArray arr = new JSONObject(body).optJSONArray("data");
+            for (int i = 0; arr != null && i < arr.length(); i++) {
+                JSONObject at = arr.getJSONObject(i).optJSONObject("attributes");
+                if (at == null || at.optBoolean("machine_translated") || at.optBoolean("ai_translated") || at.optBoolean("foreign_parts_only")) continue;
+                JSONArray files = at.optJSONArray("files");
+                String lang = canonLang(at.optString("language", ""));
+                if (files == null || files.length() == 0 || lang == null) continue;
+                SubRef r = new SubRef();
+                r.kind = "oscom"; r.id = String.valueOf(files.getJSONObject(0).optLong("file_id")); r.lang = lang;
+                out.add(makeSub("oscom-" + r.id, subLink(self, r), lang, at.optString("release", ""), 0));
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "opensubtitles.com: " + t.getMessage());
         }
         return out;
     }
@@ -1363,42 +1560,34 @@ public final class StremioBridge {
             new LinkedHashMap<String, byte[]>(32, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, byte[]> e) {
-                    return size() > 60;
+                    return size() > 80;
                 }
             });
 
-    private static final Pattern SUBDL_FILE = Pattern.compile("^(\\d{1,12}-\\d{1,12})\\.srt$");
+    private static final Pattern SUB_TOKEN = Pattern.compile("^([0-9a-f]{16})\\.srt$");
 
-    /** Downloads a SubDL zip, picks the right .srt (the episode inside a pack) and serves it as UTF-8. */
-    private Resp subdlFile(String name, String query) {
-        Matcher m = SUBDL_FILE.matcher(name);
+    /** Opens a subtitle link: downloads from the provider (once; replays come from the cache), picks the file, UTF-8. */
+    private Resp subFile(Context c, String name) {
+        Matcher m = SUB_TOKEN.matcher(name);
         if (!m.matches()) return Resp.text(404, "Not found");
-        Map<String, String> q = parseExtra(query);
-        String lang = q.getOrDefault("l", "");
-        if (!lang.matches("[a-z]{3}")) lang = "";
-        int season = q.containsKey("s") ? parseInt(q.get("s")) : -1;
-        int episode = q.containsKey("e") ? parseInt(q.get("e")) : -1;
-        String cacheKey = m.group(1) + "|" + lang + "|" + season + "|" + episode;
+        SubRef ref = subRefs.get(m.group(1));
+        if (ref == null) return Resp.text(404, "This subtitle link expired. Open the title again.");
+        String cacheKey = ref.kind + ":" + ref.id + "|" + ref.lang + "|" + ref.season + "|" + ref.episode;
         byte[] body = srtCache.get(cacheKey);
         if (body == null) {
+            long t0 = System.currentTimeMillis();
             try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(subdlDl + "/subtitle/" + m.group(1) + ".zip").openConnection();
-                conn.setConnectTimeout(8000);
-                conn.setReadTimeout(30000);
-                conn.setRequestProperty("User-Agent", "Jellyarr-Bridge/1.2");
-                if (conn.getResponseCode() != 200) return Resp.text(502, "SubDL did not return the file.");
-                byte[] zip;
-                try (InputStream in = conn.getInputStream()) {
-                    zip = readAll(in, 6 * 1024 * 1024);
-                } finally {
-                    conn.disconnect();
-                }
-                String text = pickSrt(zip, lang.isEmpty() ? null : lang, season, episode);
+                String text = fetchSubtitleText(c, ref);
                 if (text == null) return Resp.text(404, "No matching subtitle file in this download.");
                 body = text.getBytes(StandardCharsets.UTF_8);
                 srtCache.put(cacheKey, body);
+                log(String.format(Locale.US, "subtitle %s %s  %s  (%.1fs)", ref.kind, ref.lang, human(body.length), (System.currentTimeMillis() - t0) / 1000.0));
+            } catch (QuotaException q) {
+                log("subtitle " + ref.kind + ": " + q.getMessage());
+                return Resp.text(429, q.getMessage());
             } catch (Throwable t) {
-                Log.w(TAG, "subdl download: " + t.getMessage());
+                Log.w(TAG, "subtitle " + ref.kind + ": " + t.getMessage());
+                log("subtitle " + ref.kind + " failed: " + t.getMessage());
                 return Resp.text(502, "Could not download the subtitle.");
             }
         }
@@ -1407,6 +1596,106 @@ public final class StremioBridge {
         r.body = body;
         r.maxAge = 3600;
         return r;
+    }
+
+    private static final class QuotaException extends Exception {
+        QuotaException(String m) { super(m); }
+    }
+
+    private String fetchSubtitleText(Context c, SubRef ref) throws Exception {
+        int[] st = new int[1];
+        switch (ref.kind) {
+            case "subdl": {
+                byte[] zip = httpBytes("GET", subdlDl + "/subtitle/" + ref.id + ".zip", null, null, 6 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("SubDL HTTP " + st[0]);
+                return pickSrt(zip, ref.lang, ref.season, ref.episode);
+            }
+            case "subsource": {
+                Map<String, String> h = new HashMap<>();
+                h.put("X-API-Key", getSubsourceKey(c));
+                byte[] zip = httpBytes("GET", subsourceApi + "/subtitles/" + ref.id + "/download", h, null, 10 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("SubSource HTTP " + st[0]);
+                return pickSrt(zip, ref.lang, ref.season, ref.episode);
+            }
+            case "wyzie": {
+                URL u = new URL(ref.id);
+                if (!u.getHost().equals(new URL(wyzieApi).getHost())) throw new Exception("unexpected Wyzie host");
+                byte[] b = httpBytes("GET", ref.id, null, null, 3 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("Wyzie HTTP " + st[0]);
+                return decodeSubtitle(b, ref.lang);
+            }
+            case "oscom": {
+                Map<String, String> h = new HashMap<>();
+                h.put("Api-Key", getOscomKey(c));
+                h.put("User-Agent", PROVIDER_UA);
+                h.put("Content-Type", "application/json");
+                h.put("Accept", "application/json");
+                byte[] resp = httpBytes("POST", oscomApi + "/download", h, ("{\"file_id\":" + Long.parseLong(ref.id) + "}").getBytes(StandardCharsets.UTF_8), 64 * 1024, st);
+                if (st[0] == 406 || st[0] == 429) throw new QuotaException("OpenSubtitles daily download limit reached.");
+                if (st[0] != 200) throw new Exception("OpenSubtitles HTTP " + st[0]);
+                JSONObject j = new JSONObject(new String(resp, StandardCharsets.UTF_8));
+                String link = j.optString("link", "");
+                URL lu = new URL(link);
+                if (!lu.getProtocol().equals("https") || !lu.getHost().endsWith("opensubtitles.com")) throw new Exception("unexpected download host");
+                byte[] b = httpBytes("GET", link, null, null, 3 * 1024 * 1024, st);
+                if (st[0] != 200) throw new Exception("OpenSubtitles file HTTP " + st[0]);
+                return decodeSubtitle(b, ref.lang);
+            }
+            default:
+                return null;
+        }
+    }
+
+    /** One HTTP call returning the body (up to {@code max} bytes); the status goes to {@code status[0]}. */
+    private static byte[] httpBytes(String method, String url, Map<String, String> headers, byte[] body, int max, int[] status) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            conn.setRequestMethod(method);
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(30000);
+            conn.setRequestProperty("User-Agent", PROVIDER_UA);
+            if (headers != null) for (Map.Entry<String, String> e : headers.entrySet()) conn.setRequestProperty(e.getKey(), e.getValue());
+            if (body != null) {
+                conn.setDoOutput(true);
+                try (OutputStream os = conn.getOutputStream()) { os.write(body); }
+            }
+            status[0] = conn.getResponseCode();
+            InputStream in = status[0] >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            return in == null ? new byte[0] : readAll(in, max);
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    /** GET returning the body as text (redirects followed), cached; null when unreachable. */
+    private String fetchText(String url, Map<String, String> headers, int readTimeoutMs, long ttlMs) {
+        long now = System.currentTimeMillis();
+        CachedJson hit = jsonCache.get("text|" + url);
+        if (hit != null && now - hit.at < ttlMs) return hit.json.optString("t", null);
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(readTimeoutMs);
+            conn.setRequestProperty("User-Agent", PROVIDER_UA);
+            conn.setRequestProperty("Accept", "application/json");
+            if (headers != null) for (Map.Entry<String, String> e : headers.entrySet()) conn.setRequestProperty(e.getKey(), e.getValue());
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                Log.w(TAG, "HTTP " + code + " for " + redact(url));
+                conn.disconnect();
+                return null;
+            }
+            try (InputStream in = conn.getInputStream()) {
+                String body = new String(readAll(in, 8 * 1024 * 1024), StandardCharsets.UTF_8);
+                jsonCache.put("text|" + url, new CachedJson(now, new JSONObject().put("t", body)));
+                return body;
+            } finally {
+                conn.disconnect();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "fetch " + redact(url) + ": " + t.getMessage());
+            return null;
+        }
     }
 
     /** The subtitle text inside a zip: the episode's file for a series, the main one for a movie; null when unsure. */

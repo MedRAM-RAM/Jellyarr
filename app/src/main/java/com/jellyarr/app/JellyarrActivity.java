@@ -10842,6 +10842,28 @@ public final class JellyarrActivity extends AppCompatActivity
         pubWarn.setPadding(0, 0, 0, dp(4));
         card.addView(pubWarn);
 
+        // Where video, subtitles and posters come from when a public address is set.
+        final Button linksBtn = UiKit.outline(this, "", null);
+        final Runnable linksLabel = () -> {
+            String m = com.jellyarr.app.services.StremioBridge.getStreamLinks(ctx);
+            linksBtn.setText(buttonLabel(m.equals("lan") ? "STREAM LINKS: HOME NETWORK ONLY"
+                    : m.equals("public") ? "STREAM LINKS: PUBLIC ONLY" : "STREAM LINKS: BOTH"));
+        };
+        linksLabel.run();
+        linksBtn.setOnClickListener(v -> {
+            String m = com.jellyarr.app.services.StremioBridge.getStreamLinks(ctx);
+            com.jellyarr.app.services.StremioBridge.setStreamLinks(ctx, m.equals("both") ? "lan" : m.equals("lan") ? "public" : "both");
+            linksLabel.run();
+            Toast.makeText(ctx, I18n.tr("Saved."), Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams linksLp = new LinearLayout.LayoutParams(-1, dp(42));
+        linksLp.topMargin = dp(10);
+        card.addView(linksBtn, linksLp);
+        TextView linksHint = UiKit.caption(this, I18n.tr(
+                "Both: a home-network entry first and a public one. Home network only: video, subtitles and posters never use the tunnel, only the lists do (works at home only). Public only: everything through the public address."));
+        linksHint.setPadding(0, dp(4), 0, dp(4));
+        card.addView(linksHint);
+
         // Cloudflare Tunnel run by the app itself (cloudflared), so the public address needs nothing else.
         card.addView(createSettingsDivider());
         card.addView(UiKit.text(this, I18n.tr("Cloudflare Tunnel"), 13.5f, AppTheme.text(), UiKit.BOLD));
@@ -10957,6 +10979,21 @@ public final class JellyarrActivity extends AppCompatActivity
                 "Free key from subdl.com (Account > API). Jellyarr searches SubDL itself from this phone, so the key stays between you and SubDL.",
                 () -> com.jellyarr.app.services.StremioBridge.getSubdlKey(ctx),
                 text -> com.jellyarr.app.services.StremioBridge.setSubdlKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "Wyzie API key",
+                "Key from sub.wyzie.io. Wyzie gathers subtitles from several sources and serves them as UTF-8.",
+                () -> com.jellyarr.app.services.StremioBridge.getWyzieKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setWyzieKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "SubSource API key",
+                "Free key from subsource.net (your profile page).",
+                () -> com.jellyarr.app.services.StremioBridge.getSubsourceKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setSubsourceKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "OpenSubtitles.com API key",
+                "Key from opensubtitles.com. Each file counts against the key's daily download limit, so a file is downloaded once and kept.",
+                () -> com.jellyarr.app.services.StremioBridge.getOscomKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setOscomKey(ctx, text),
                 false, true, "Saved.");
         addBridgeTextSetting(card, "Extra subtitle addons",
                 "One addon address per line (up to 5), for example SubSource, SubHero or OpenSubtitles V3+. Their results are merged and sorted with the others.",
