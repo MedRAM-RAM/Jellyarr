@@ -10,6 +10,9 @@ The owner wants every app build published as a GitHub **release**, not left as a
   (https://github.com/MedRAM-RAM/Jellyarr/releases) and the APK size. Do this in every conversation.
 - Never describe the Actions artifact as the way to get the app. If the run fails, read its logs and fix it.
 - Stable releases are the owner's call (`release.yml`, tags `v*`); do not create those unasked.
+- **Always bump the version** (`versionCode` and `versionName`) before publishing a build. The app does not treat
+  a build with the same version as new, so the update bar and the cancel-download feature misbehave otherwise.
+- **While an update is downloading, show that it is in progress** ("جاري التنزيل" / "downloading") in the update bar.
 
 ## Working here
 - Build check without a device: `./gradlew :app:compileDebugJavaWithJavac` (needs the Android SDK; set
