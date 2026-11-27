@@ -49,8 +49,10 @@ All services listen on the phone and on your local network only.
   the current format) and import from a folder with Move or Copy.
 - **Stremio addon.** Built into the app (Settings › Stremio & AIOStreams). Add its URL to Stremio, or to any
   app that takes Stremio addons, and you get your Jellyfin library with direct play, Popular and Featured
-  catalogs with posters and descriptions (genres, search, a 📁 badge on what you already own), torrents from
-  Prowlarr streamed through TorrServer, and subtitles from Jellyfin and OpenSubtitles in the languages you pick.
+  catalogs (Popular, Featured, New by year; genres, search, a 📁 badge on what you already own, plus any other
+  Stremio catalog addon you add), torrents from Prowlarr streamed through TorrServer, and subtitles from Jellyfin,
+  SubDL (your own free API key), OpenSubtitles and any other Stremio subtitle addon, in the languages you pick,
+  with the ones that match the playing file first (old Arabic/Hebrew/Cyrillic files are converted to UTF-8).
   Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
   never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use
   it from apps that are not on your home network, such as a hosted AIOStreams.

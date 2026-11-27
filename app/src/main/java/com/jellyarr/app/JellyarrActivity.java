@@ -10657,6 +10657,54 @@ public final class JellyarrActivity extends AppCompatActivity
 
     private Runnable bridgeRefresh;
 
+    /** A titled text field with SAVE (optionally multi-line or masked); {@code saver} returns false for invalid input. */
+    private void addBridgeTextSetting(LinearLayout card, String title, String hint,
+                                      final java.util.function.Supplier<String> getter,
+                                      final java.util.function.Predicate<String> saver,
+                                      boolean multiline, boolean secret, final String savedToast) {
+        final android.content.Context ctx = this;
+        TextView t = UiKit.text(this, I18n.tr(title), 12.5f, AppTheme.text(), UiKit.MEDIUM);
+        t.setPadding(0, dp(12), 0, dp(2));
+        card.addView(t);
+        final android.widget.EditText input = new android.widget.EditText(this);
+        input.setText(getter.get());
+        input.setTextColor(AppTheme.text());
+        input.setTextSize(12.5f);
+        input.setTextDirection(View.TEXT_DIRECTION_LTR);
+        if (multiline) {
+            input.setSingleLine(false);
+            input.setMinLines(3);
+            input.setGravity(Gravity.TOP | Gravity.START);
+            input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                    | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        } else {
+            input.setSingleLine(true);
+            input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                    | (secret ? android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD : 0));
+        }
+        card.addView(input, new LinearLayout.LayoutParams(-1, -2));
+        Button save = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        save.setTextSize(10f);
+        save.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(32));
+        lp.gravity = Gravity.END;
+        lp.topMargin = dp(4);
+        card.addView(save, lp);
+        final Runnable dirty = UiStyle.bindDirty(save, input, () -> getter.get());
+        save.setOnClickListener(v -> {
+            if (!saver.test(input.getText().toString())) {
+                Toast.makeText(ctx, I18n.tr("Invalid value. Check the address or key and try again."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            input.setText(getter.get());
+            dirty.run();
+            Toast.makeText(ctx, I18n.tr(savedToast), Toast.LENGTH_LONG).show();
+        });
+        TextView h = UiKit.caption(this, I18n.tr(hint));
+        h.setPadding(0, dp(2), 0, dp(4));
+        card.addView(h);
+    }
+
     /** Settings > Stremio & AIOStreams: the in-app Stremio addon (StremioBridge) and TorrServer. */
     private View buildStremioBridgeSection() {
         final android.content.Context ctx = this;
@@ -10774,14 +10822,19 @@ public final class JellyarrActivity extends AppCompatActivity
         card.addView(createSettingsDivider());
 
         card.addView(settingsSwitchRow("Catalogs",
-                "Popular and Featured lists with posters, ratings and descriptions (from Cinemeta), with genres and search. Needs internet.",
+                "Popular, Featured and New (by year) lists with posters, ratings and descriptions (from Cinemeta), with genres and search. Needs internet.",
                 com.jellyarr.app.services.StremioBridge.isCatalogsEnabled(this),
                 (v, checked) -> {
                     com.jellyarr.app.services.StremioBridge.setCatalogsEnabled(ctx, checked);
                     Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
                 }));
+        addBridgeTextSetting(card, "Extra catalog addons",
+                "One addon address per line (up to 5). Their lists are added here, so you browse everything from this one addon. Only titles with an IMDb id are kept.",
+                () -> com.jellyarr.app.services.StremioBridge.getCatAddons(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setCatAddons(ctx, text),
+                true, false, "Saved. Remove and add the addon again so your apps reload it.");
         card.addView(settingsSwitchRow("Subtitles",
-                "Jellyfin's own subtitle files plus OpenSubtitles in the languages below.",
+                "Jellyfin's own subtitle files plus SubDL, OpenSubtitles and other addons in the languages below.",
                 com.jellyarr.app.services.StremioBridge.isSubtitlesEnabled(this),
                 (v, checked) -> {
                     com.jellyarr.app.services.StremioBridge.setSubtitlesEnabled(ctx, checked);
@@ -10819,6 +10872,16 @@ public final class JellyarrActivity extends AppCompatActivity
         TextView langHint = UiKit.caption(this, I18n.tr("Three-letter codes, in order: ara = Arabic, eng = English, fre = French. Leave empty for every language."));
         langHint.setPadding(0, 0, 0, dp(4));
         card.addView(langHint);
+        addBridgeTextSetting(card, "SubDL API key",
+                "Free key from subdl.com (Account > API). Jellyarr searches SubDL itself from this phone, so the key stays between you and SubDL.",
+                () -> com.jellyarr.app.services.StremioBridge.getSubdlKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setSubdlKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "Extra subtitle addons",
+                "One addon address per line (up to 5), for example SubSource, SubHero or OpenSubtitles V3+. Their results are merged and sorted with the others.",
+                () -> com.jellyarr.app.services.StremioBridge.getSubAddons(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setSubAddons(ctx, text),
+                true, false, "Saved.");
 
         card.addView(createSettingsDivider());
 

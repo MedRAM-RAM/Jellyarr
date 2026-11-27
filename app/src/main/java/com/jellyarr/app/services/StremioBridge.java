@@ -33,7 +33,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -65,6 +70,10 @@ public final class StremioBridge {
     private static final String TORRSERVER = "http://127.0.0.1:" + TORRSERVER_PORT;
     private static final String CINEMETA = "https://v3-cinemeta.strem.io";
     private static final String OPENSUBS = "https://opensubtitles-v3.strem.io";
+    // Package-private and not final so tests can point them at a local server.
+    static String subdlApi = "https://api.subdl.com/api/v1/subtitles";
+    static String subdlDl = "https://dl.subdl.com";
+    private static final int MAX_SUBS_PER_LANG = 8;
     private static final String[] GENRES_MOVIE = {"Action", "Adventure", "Animation", "Biography", "Comedy", "Crime",
             "Documentary", "Drama", "Family", "Fantasy", "History", "Horror", "Mystery", "Romance", "Sci-Fi", "Sport",
             "Thriller", "War", "Western"};
@@ -175,6 +184,117 @@ public final class StremioBridge {
             sb.append(l);
         }
         return sb.toString();
+    }
+
+    // SubDL (free API key from the SubDL account page), searched directly from this phone.
+    public static String getSubdlKey(Context c) { return prefs(c).getString("subdl_key", ""); }
+
+    public static boolean setSubdlKey(Context c, String key) {
+        String v = key == null ? "" : key.trim();
+        if (!v.isEmpty() && !v.matches("[A-Za-z0-9_\\-]{10,128}")) return false;
+        prefs(c).edit().putString("subdl_key", v).apply();
+        return true;
+    }
+
+    /** Other Stremio subtitle addons to ask as well (SubSource, SubHero, OpenSubtitles V3+...), one address per line. */
+    public static String getSubAddons(Context c) { return prefs(c).getString("sub_addons", ""); }
+
+    public static boolean setSubAddons(Context c, String text) {
+        String n = normalizeAddonList(text);
+        if (n == null) return false;
+        prefs(c).edit().putString("sub_addons", n).apply();
+        return true;
+    }
+
+    /** Other Stremio catalog addons whose lists are added to this one, one address per line. */
+    public static String getCatAddons(Context c) { return prefs(c).getString("cat_addons", ""); }
+
+    public static boolean setCatAddons(Context c, String text) {
+        String n = normalizeAddonList(text);
+        if (n == null) return false;
+        prefs(c).edit().putString("cat_addons", n).apply();
+        return true;
+    }
+
+    private static final int MAX_ADDONS = 5;
+
+    /** Lines to manifest URLs (stremio:// becomes https://, a missing /manifest.json is added); null when a line is invalid. */
+    static String normalizeAddonList(String text) {
+        List<String> out = new ArrayList<>();
+        for (String line : (text == null ? "" : text).split("[\\r\\n]+")) {
+            String u = line.trim();
+            if (u.isEmpty()) continue;
+            if (u.regionMatches(true, 0, "stremio://", 0, 10)) u = "https://" + u.substring(10);
+            if (!u.matches("(?i)https?://[^\\s/?#]+(/[^\\s?#]*)?")) return null;
+            while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+            if (!u.toLowerCase(Locale.ROOT).endsWith("/manifest.json")) u = u + "/manifest.json";
+            if (!out.contains(u)) out.add(u);
+            if (out.size() > MAX_ADDONS) return null;
+        }
+        return String.join("\n", out);
+    }
+
+    /** Base addresses (without /manifest.json) of a saved addon list. */
+    static List<String> addonBases(String saved) {
+        List<String> out = new ArrayList<>();
+        for (String u : (saved == null ? "" : saved).split("\n")) {
+            u = u.trim();
+            if (u.isEmpty()) continue;
+            out.add(u.substring(0, u.length() - "/manifest.json".length()));
+        }
+        return out;
+    }
+
+    // iso3, alternative iso3, iso2, SubDL code, English name
+    private static final String[][] LANGS = {
+            {"ara", "", "ar", "AR", "arabic"}, {"eng", "", "en", "EN", "english"}, {"fre", "fra", "fr", "FR", "french"},
+            {"spa", "", "es", "ES", "spanish"}, {"ger", "deu", "de", "DE", "german"}, {"ita", "", "it", "IT", "italian"},
+            {"por", "", "pt", "PT", "portuguese"}, {"pob", "", "pb", "BR_PT", "brazilian"}, {"tur", "", "tr", "TR", "turkish"},
+            {"rus", "", "ru", "RU", "russian"}, {"per", "fas", "fa", "FA", "persian"}, {"heb", "", "he", "HE", "hebrew"},
+            {"hin", "", "hi", "HI", "hindi"}, {"ind", "", "id", "ID", "indonesian"}, {"chi", "zho", "zh", "ZH", "chinese"},
+            {"jpn", "", "ja", "JA", "japanese"}, {"kor", "", "ko", "KO", "korean"}, {"dut", "nld", "nl", "NL", "dutch"},
+            {"pol", "", "pl", "PL", "polish"}, {"swe", "", "sv", "SV", "swedish"}, {"ell", "gre", "el", "EL", "greek"},
+            {"rum", "ron", "ro", "RO", "romanian"}, {"hun", "", "hu", "HU", "hungarian"}, {"cze", "ces", "cs", "CS", "czech"},
+            {"ukr", "", "uk", "UK", "ukrainian"}, {"vie", "", "vi", "VI", "vietnamese"}, {"tha", "", "th", "TH", "thai"},
+            {"ben", "", "bn", "BN", "bengali"}, {"urd", "", "ur", "UR", "urdu"}, {"bul", "", "bg", "BG", "bulgarian"},
+            {"srp", "", "sr", "SR", "serbian"}, {"hrv", "", "hr", "HR", "croatian"}, {"nor", "", "no", "NO", "norwegian"},
+            {"dan", "", "da", "DA", "danish"}, {"fin", "", "fi", "FI", "finnish"}, {"kur", "", "ku", "KU", "kurdish"},
+    };
+
+    /** Any spelling of a language (ara, ar, AR, Arabic, BR_PT...) as the three-letter code; null when unknown. */
+    static String canonLang(String raw) {
+        if (raw == null) return null;
+        String l = raw.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+        if (l.isEmpty()) return null;
+        if (l.equals("pt_br") || l.equals("br_pt") || l.startsWith("portuguese (br") || l.equals("brazilian portuguese")) return "pob";
+        for (String[] row : LANGS) {
+            if (l.equals(row[0]) || l.equals(row[1]) || l.equals(row[2]) || l.equals(row[3].toLowerCase(Locale.ROOT)) || l.equals(row[4])) return row[0];
+        }
+        return l.matches("[a-z]{3}") ? l : null;
+    }
+
+    static String subdlCode(String iso3) {
+        for (String[] row : LANGS) if (row[0].equals(iso3)) return row[3];
+        return null;
+    }
+
+    /** Character set old subtitle files in that language were usually saved in. */
+    static String legacyCharset(String iso3) {
+        if (iso3 == null) return "windows-1252";
+        switch (iso3) {
+            case "ara": case "per": case "urd": case "kur": return "windows-1256";
+            case "heb": return "windows-1255";
+            case "rus": case "ukr": case "bul": case "srp": return "windows-1251";
+            case "tur": return "windows-1254";
+            case "ell": return "windows-1253";
+            case "chi": return "GBK";
+            case "jpn": return "Shift_JIS";
+            case "kor": return "EUC-KR";
+            case "pol": case "cze": case "hun": case "rum": case "hrv": return "windows-1250";
+            case "tha": return "windows-874";
+            case "vie": return "windows-1258";
+            default: return "windows-1252";
+        }
     }
 
     public static int getMaxTorrents(Context c) { return prefs(c).getInt("max_torrents", 15); }
@@ -514,6 +634,7 @@ public final class StremioBridge {
         String[] seg = rest.split("/");
         if (seg.length >= 2 && seg[0].equals("play")) return play(c, seg[1]);
         if (seg.length >= 2 && seg[0].equals("jf")) return jf(c, seg, q >= 0 ? req.path.substring(q + 1) : "");
+        if (seg.length == 3 && seg[0].equals("sub") && seg[1].equals("subdl")) return subdlFile(seg[2], q >= 0 ? req.path.substring(q + 1) : "");
         if (seg.length < 3) return Resp.text(404, "Not found");
         String resource = seg[0];
         String type = seg[1];
@@ -629,18 +750,78 @@ public final class StremioBridge {
             catalogs.put(catalogDef("series", "jellyarr-popular", "Jellyarr Popular", GENRES_SERIES, true));
             catalogs.put(catalogDef("movie", "jellyarr-featured", "Jellyarr Featured", GENRES_MOVIE, false));
             catalogs.put(catalogDef("series", "jellyarr-featured", "Jellyarr Featured", GENRES_SERIES, false));
+            int year = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
+            String[] years = new String[12];
+            for (int i = 0; i < years.length; i++) years[i] = String.valueOf(year - i);
+            catalogs.put(catalogDef("movie", "jellyarr-new", "Jellyarr New", years, false, true));
+            catalogs.put(catalogDef("series", "jellyarr-new", "Jellyarr New", years, false, true));
+            addExternalCatalogs(c, catalogs);
         }
         m.put("catalogs", catalogs);
         m.put("behaviorHints", new JSONObject().put("configurable", false).put("configurationRequired", false));
         return m;
     }
 
+    /** Lists of the user's other catalog addons, as extra catalogs here (ids "x<n>-<their id>"). */
+    private void addExternalCatalogs(Context c, JSONArray catalogs) {
+        List<String> bases = addonBases(getCatAddons(c));
+        List<Future<JSONObject>> fs = new ArrayList<>();
+        for (String b : bases) fs.add(fetchPool.submit(() -> fetchJson(b + "/manifest.json", 8000, META_TTL_MS)));
+        for (int n = 0; n < fs.size(); n++) {
+            try {
+                JSONObject em = fs.get(n).get(10, TimeUnit.SECONDS);
+                JSONArray cs = em == null ? null : em.optJSONArray("catalogs");
+                if (cs == null) continue;
+                String addonName = em.optString("name", "");
+                for (int i = 0; i < cs.length(); i++) {
+                    JSONObject cat = cs.optJSONObject(i);
+                    if (cat == null) continue;
+                    String type = cat.optString("type");
+                    if (!type.equals("movie") && !type.equals("series")) continue;
+                    JSONArray extra = new JSONArray();
+                    boolean usable = true;
+                    JSONArray ex = cat.optJSONArray("extra");
+                    if (ex != null) {
+                        for (int k = 0; k < ex.length(); k++) {
+                            JSONObject e = ex.optJSONObject(k);
+                            if (e == null) continue;
+                            String en = e.optString("name");
+                            boolean allowed = en.equals("genre") || en.equals("search") || en.equals("skip");
+                            if (!allowed) { if (e.optBoolean("isRequired")) usable = false; continue; }
+                            extra.put(e);
+                        }
+                    } else {
+                        JSONArray supported = cat.optJSONArray("extraSupported");
+                        if (supported != null) {
+                            for (int k = 0; k < supported.length(); k++) {
+                                String en = supported.optString(k);
+                                if (en.equals("genre") || en.equals("search") || en.equals("skip")) extra.put(new JSONObject().put("name", en));
+                            }
+                        }
+                        JSONArray required = cat.optJSONArray("extraRequired");
+                        if (required != null && required.length() > 0) usable = false;
+                    }
+                    if (!usable) continue;
+                    String nm = cat.optString("name", cat.optString("id"));
+                    if (!addonName.isEmpty() && !nm.toLowerCase(Locale.ROOT).contains(addonName.toLowerCase(Locale.ROOT))) nm = nm + " · " + addonName;
+                    catalogs.put(new JSONObject().put("type", type).put("id", "x" + n + "-" + cat.optString("id")).put("name", nm).put("extra", extra));
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "catalog addon " + n + ": " + t.getMessage());
+            }
+        }
+    }
+
     private static JSONObject catalogDef(String type, String id, String name, String[] genres, boolean search) throws Exception {
+        return catalogDef(type, id, name, genres, search, false);
+    }
+
+    private static JSONObject catalogDef(String type, String id, String name, String[] genres, boolean search, boolean genreRequired) throws Exception {
         JSONArray extra = new JSONArray();
         if (genres != null) {
             JSONArray opts = new JSONArray();
             for (String g : genres) opts.put(g);
-            extra.put(new JSONObject().put("name", "genre").put("isRequired", false).put("options", opts));
+            extra.put(new JSONObject().put("name", "genre").put("isRequired", genreRequired).put("options", opts));
         }
         if (search) extra.put(new JSONObject().put("name", "search").put("isRequired", false));
         extra.put(new JSONObject().put("name", "skip").put("isRequired", false));
@@ -726,9 +907,17 @@ public final class StremioBridge {
 
     private JSONObject catalog(Context c, String type, String id, String extra, String extraRaw, String self) throws Exception {
         JSONArray metas = new JSONArray();
-        if ("jellyarr-popular".equals(id) || "jellyarr-featured".equals(id)) {
+        if ("jellyarr-popular".equals(id) || "jellyarr-featured".equals(id) || "jellyarr-new".equals(id)) {
             if (!isCatalogsEnabled(c) || !("movie".equals(type) || "series".equals(type))) return new JSONObject().put("metas", metas);
-            return proxyCatalog(c, type, "jellyarr-popular".equals(id) ? "top" : "imdbRating", extraRaw);
+            String upstream = "jellyarr-popular".equals(id) ? "top" : "jellyarr-featured".equals(id) ? "imdbRating" : "year";
+            return proxyCatalog(c, CINEMETA, type, upstream, extraRaw);
+        }
+        Matcher ext = EXTERNAL_CATALOG.matcher(id);
+        if (ext.matches() && isCatalogsEnabled(c) && ("movie".equals(type) || "series".equals(type))) {
+            List<String> bases = addonBases(getCatAddons(c));
+            int n = parseInt(ext.group(1));
+            if (n >= 0 && n < bases.size()) return proxyCatalog(c, bases.get(n), type, encPath(ext.group(2)), extraRaw);
+            return new JSONObject().put("metas", metas);
         }
         String jfType;
         if ("jellyarr-movies".equals(id) && "movie".equals(type)) jfType = "Movie";
@@ -800,8 +989,10 @@ public final class StremioBridge {
     }
 
     /** Cinemeta's Popular / Featured catalogs (genre, search and paging pass through), flagged when already local. */
-    private JSONObject proxyCatalog(Context c, String type, String upstream, String extraRaw) throws Exception {
-        String url = CINEMETA + "/catalog/" + type + "/" + upstream + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
+    private static final Pattern EXTERNAL_CATALOG = Pattern.compile("^x(\\d)-(.+)$");
+
+    private JSONObject proxyCatalog(Context c, String base, String type, String upstream, String extraRaw) throws Exception {
+        String url = base + "/catalog/" + type + "/" + upstream + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
         JSONObject d = fetchJson(url, 15000, CATALOG_TTL_MS);
         JSONArray out = new JSONArray();
         JSONArray metas = d == null ? null : d.optJSONArray("metas");
@@ -909,8 +1100,23 @@ public final class StremioBridge {
     }
 
     private static final Pattern STREMIO_ID = Pattern.compile("^tt\\d+(:\\d+:\\d+)?$");
+    private final ExecutorService fetchPool = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "Jellyarr-Bridge-Fetch");
+        t.setDaemon(true);
+        return t;
+    });
 
-    /** Jellyfin's own subtitle files for the item, then OpenSubtitles in the configured languages. */
+    /** One subtitle candidate from any source. */
+    private static final class Sub {
+        String id, url, lang, name;
+        int score;
+        int source; // 0 SubDL, 1 OpenSubtitles, 2 other addons
+    }
+
+    /**
+     * Jellyfin's own subtitle files, then SubDL, OpenSubtitles and any extra addons asked in parallel, in the
+     * configured languages; within a language the ones that look like the playing file come first.
+     */
     private JSONObject subtitles(Context c, String type, String id, String extraRaw, String self) throws Exception {
         JSONArray out = new JSONArray();
         if (!isSubtitlesEnabled(c)) return new JSONObject().put("subtitles", out);
@@ -920,37 +1126,255 @@ public final class StremioBridge {
         } catch (Throwable t) {
             Log.w(TAG, "local subtitles: " + t.getMessage());
         }
+        if (!STREMIO_ID.matcher(id).matches() || !("movie".equals(type) || "series".equals(type))) {
+            return new JSONObject().put("subtitles", out);
+        }
 
-        if (STREMIO_ID.matcher(id).matches() && ("movie".equals(type) || "series".equals(type))) {
-            String url = OPENSUBS + "/subtitles/" + type + "/" + id + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
-            JSONObject d = fetchJson(url, 20000, SUBS_TTL_MS);
-            JSONArray subs = d == null ? null : d.optJSONArray("subtitles");
-            if (subs != null) {
-                String langs = getSubtitleLangs(c);
-                List<String> order = new ArrayList<>();
-                for (String l : langs.split(",")) if (!l.trim().isEmpty()) order.add(l.trim());
-                if (order.isEmpty()) {
-                    addSubs(out, subs, null, 40);
-                } else {
-                    for (String l : order) addSubs(out, subs, l, 8);
+        final List<String> wanted = new ArrayList<>();
+        for (String l : getSubtitleLangs(c).split(",")) {
+            String canon = canonLang(l);
+            if (canon != null && !wanted.contains(canon)) wanted.add(canon);
+        }
+        final String filename = parseExtra(dec(extraRaw)).get("filename");
+        final String key = getSubdlKey(c);
+        final String[] p = id.split(":");
+        final boolean series = "series".equals(type) && p.length >= 3;
+        final int season = series ? parseInt(p[1]) : -1;
+        final int episode = series ? parseInt(p[2]) : -1;
+
+        List<Callable<List<Sub>>> jobs = new ArrayList<>();
+        jobs.add(() -> addonSubs(OPENSUBS, type, id, extraRaw, 1, "os-"));
+        if (!key.isEmpty()) jobs.add(() -> subdlSubs(key, p[0], series, season, episode, wanted, self));
+        int n = 0;
+        for (String base : addonBases(getSubAddons(c))) {
+            final String tag = "x" + (n++) + "-";
+            jobs.add(() -> addonSubs(base, type, id, extraRaw, 2, tag));
+        }
+        List<Future<List<Sub>>> futures = new ArrayList<>();
+        for (Callable<List<Sub>> j : jobs) futures.add(fetchPool.submit(j));
+        List<Sub> all = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + 25000;
+        for (Future<List<Sub>> f : futures) {
+            try {
+                all.addAll(f.get(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS));
+            } catch (Throwable t) {
+                f.cancel(true);
+                Log.w(TAG, "subtitle source: " + t.getClass().getSimpleName() + " " + t.getMessage());
+            }
+        }
+
+        Set<String> seen = new HashSet<>();
+        List<Sub> unique = new ArrayList<>();
+        for (Sub s : all) {
+            if (s.lang == null || s.url == null || !seen.add(s.url)) continue;
+            s.score = similarity(s.name, filename);
+            unique.add(s);
+        }
+        Collections.sort(unique, (x, y) -> x.score != y.score ? Integer.compare(y.score, x.score) : Integer.compare(x.source, y.source));
+        if (wanted.isEmpty()) {
+            for (int i = 0; i < unique.size() && i < 40; i++) put(out, unique.get(i));
+        } else {
+            for (String l : wanted) {
+                int k = 0;
+                for (Sub s : unique) {
+                    if (k >= MAX_SUBS_PER_LANG) break;
+                    if (l.equals(s.lang)) { put(out, s); k++; }
                 }
             }
         }
         return new JSONObject().put("subtitles", out);
     }
 
-    private static void addSubs(JSONArray out, JSONArray subs, String lang, int max) {
-        int n = 0;
-        for (int i = 0; i < subs.length() && n < max; i++) {
-            JSONObject s = subs.optJSONObject(i);
-            if (s == null) continue;
-            String url = s.optString("url", "");
-            String l = s.optString("lang", "");
-            if (url.isEmpty() || (lang != null && !lang.equalsIgnoreCase(l))) continue;
+    private static void put(JSONArray out, Sub s) {
+        try {
+            out.put(new JSONObject().put("id", s.id).put("url", s.url).put("lang", s.lang));
+        } catch (Throwable ignored) {}
+    }
+
+    /** How many words the release name shares with the playing file, plus a bonus for the same release group. */
+    static int similarity(String release, String filename) {
+        if (release == null || filename == null || release.isEmpty() || filename.isEmpty()) return 0;
+        String[] a = release.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
+        String[] b = filename.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
+        Set<String> inFile = new HashSet<>();
+        for (String t : b) if (t.length() >= 2) inFile.add(t);
+        int score = 0;
+        Set<String> counted = new HashSet<>();
+        for (String t : a) if (t.length() >= 2 && inFile.contains(t) && counted.add(t)) score++;
+        String lastA = lastToken(a), lastB = lastToken(b);
+        if (!lastA.isEmpty() && lastA.equals(lastB) && lastA.length() >= 3) score += 3;
+        return score;
+    }
+
+    private static String lastToken(String[] t) {
+        for (int i = t.length - 1; i >= 0; i--) {
+            if (t[i].length() >= 2 && !t[i].equals("srt") && !t[i].equals("mkv") && !t[i].equals("mp4")) return t[i];
+        }
+        return "";
+    }
+
+    /** Any Stremio subtitle addon (OpenSubtitles V3 is one): its /subtitles answer, with languages normalised. */
+    private List<Sub> addonSubs(String base, String type, String id, String extraRaw, int source, String tag) {
+        List<Sub> out = new ArrayList<>();
+        String url = base + "/subtitles/" + type + "/" + id + (extraRaw.isEmpty() ? "" : "/" + extraRaw) + ".json";
+        JSONObject d = fetchJson(url, 20000, SUBS_TTL_MS);
+        JSONArray arr = d == null ? null : d.optJSONArray("subtitles");
+        if (arr == null) return out;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o == null) continue;
+            String u = o.optString("url", "");
+            if (!u.startsWith("http://") && !u.startsWith("https://")) continue;
+            Sub s = new Sub();
+            s.id = tag + o.optString("id", String.valueOf(i));
+            s.url = u;
+            s.lang = canonLang(o.optString("lang", ""));
+            s.name = o.optString("subtitleFileName", o.optString("movieReleaseName", o.optString("title", "")));
+            s.source = source;
+            out.add(s);
+        }
+        return out;
+    }
+
+    private static final Pattern SUBDL_PATH = Pattern.compile("^/subtitle/(\\d{1,12}-\\d{1,12})\\.zip$");
+
+    /** SubDL searched directly (API key from the user); each result is served by {@link #subdlFile}. */
+    private List<Sub> subdlSubs(String key, String imdb, boolean series, int season, int episode, List<String> wanted, String self) {
+        List<Sub> out = new ArrayList<>();
+        StringBuilder codes = new StringBuilder();
+        for (String w : wanted) {
+            String code = subdlCode(w);
+            if (code == null) continue;
+            if (codes.length() > 0) codes.append(',');
+            codes.append(code);
+        }
+        if (!wanted.isEmpty() && codes.length() == 0) return out;
+        StringBuilder q = new StringBuilder(subdlApi).append("?api_key=").append(enc(key))
+                .append("&imdb_id=").append(imdb).append("&subs_per_page=30&client=jellyarr");
+        if (codes.length() > 0) q.append("&languages=").append(codes);
+        if (series) q.append("&type=tv&season_number=").append(season).append("&episode_number=").append(episode);
+        else q.append("&type=movie");
+        JSONObject d = fetchJson(q.toString(), 20000, SUBS_TTL_MS);
+        JSONArray arr = d == null || !d.optBoolean("status", false) ? null : d.optJSONArray("subtitles");
+        if (arr == null) return out;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o == null) continue;
+            Matcher m = SUBDL_PATH.matcher(o.optString("url", ""));
+            String lang = canonLang(o.optString("language", o.optString("lang", "")));
+            if (!m.matches() || lang == null) continue;
+            Sub s = new Sub();
+            s.id = "subdl-" + m.group(1);
+            s.url = self + "/sub/subdl/" + m.group(1) + ".srt?l=" + lang + (series ? "&s=" + season + "&e=" + episode : "");
+            s.lang = lang;
+            s.name = o.optString("release_name", o.optString("name", ""));
+            s.source = 0;
+            out.add(s);
+        }
+        return out;
+    }
+
+    private final Map<String, byte[]> srtCache = Collections.synchronizedMap(
+            new LinkedHashMap<String, byte[]>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, byte[]> e) {
+                    return size() > 60;
+                }
+            });
+
+    private static final Pattern SUBDL_FILE = Pattern.compile("^(\\d{1,12}-\\d{1,12})\\.srt$");
+
+    /** Downloads a SubDL zip, picks the right .srt (the episode inside a pack) and serves it as UTF-8. */
+    private Resp subdlFile(String name, String query) {
+        Matcher m = SUBDL_FILE.matcher(name);
+        if (!m.matches()) return Resp.text(404, "Not found");
+        Map<String, String> q = parseExtra(query);
+        String lang = q.getOrDefault("l", "");
+        if (!lang.matches("[a-z]{3}")) lang = "";
+        int season = q.containsKey("s") ? parseInt(q.get("s")) : -1;
+        int episode = q.containsKey("e") ? parseInt(q.get("e")) : -1;
+        String cacheKey = m.group(1) + "|" + lang + "|" + season + "|" + episode;
+        byte[] body = srtCache.get(cacheKey);
+        if (body == null) {
             try {
-                out.put(new JSONObject().put("id", "os-" + s.optString("id", String.valueOf(i))).put("url", url).put("lang", l));
-                n++;
-            } catch (Throwable ignored) {}
+                HttpURLConnection conn = (HttpURLConnection) new URL(subdlDl + "/subtitle/" + m.group(1) + ".zip").openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(30000);
+                conn.setRequestProperty("User-Agent", "Jellyarr-Bridge/1.2");
+                if (conn.getResponseCode() != 200) return Resp.text(502, "SubDL did not return the file.");
+                byte[] zip;
+                try (InputStream in = conn.getInputStream()) {
+                    zip = readAll(in, 6 * 1024 * 1024);
+                } finally {
+                    conn.disconnect();
+                }
+                String text = pickSrt(zip, lang.isEmpty() ? null : lang, season, episode);
+                if (text == null) return Resp.text(404, "No matching subtitle file in this download.");
+                body = text.getBytes(StandardCharsets.UTF_8);
+                srtCache.put(cacheKey, body);
+            } catch (Throwable t) {
+                Log.w(TAG, "subdl download: " + t.getMessage());
+                return Resp.text(502, "Could not download the subtitle.");
+            }
+        }
+        Resp r = new Resp();
+        r.type = "application/x-subrip; charset=utf-8";
+        r.body = body;
+        r.maxAge = 3600;
+        return r;
+    }
+
+    /** The subtitle text inside a zip: the episode's file for a series, the main one for a movie; null when unsure. */
+    static String pickSrt(byte[] zip, String lang, int season, int episode) throws Exception {
+        List<String> names = new ArrayList<>();
+        List<byte[]> data = new ArrayList<>();
+        try (ZipInputStream zin = new ZipInputStream(new java.io.ByteArrayInputStream(zip))) {
+            ZipEntry e;
+            while ((e = zin.getNextEntry()) != null && names.size() < 400) {
+                if (e.isDirectory() || !e.getName().toLowerCase(Locale.ROOT).endsWith(".srt")) continue;
+                ByteArrayOutputStream b = new ByteArrayOutputStream();
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = zin.read(buf)) != -1) {
+                    b.write(buf, 0, n);
+                    if (b.size() > 3 * 1024 * 1024) break;
+                }
+                names.add(e.getName());
+                data.add(b.toByteArray());
+            }
+        }
+        if (names.isEmpty()) return null;
+        int pick = -1;
+        if (season >= 0 && episode >= 0) {
+            for (int i = 0; i < names.size(); i++) {
+                if (fileMatchesEpisode(names.get(i), season, episode) && (pick < 0 || data.get(i).length > data.get(pick).length)) pick = i;
+            }
+            if (pick < 0 && names.size() == 1) pick = 0; // single file: the search already asked for this episode
+        } else {
+            for (int i = 0; i < names.size(); i++) {
+                String low = names.get(i).toLowerCase(Locale.ROOT);
+                if (low.contains("commentary") || low.contains("forced")) continue;
+                if (pick < 0 || data.get(i).length > data.get(pick).length) pick = i;
+            }
+            if (pick < 0) pick = 0;
+        }
+        return pick < 0 ? null : decodeSubtitle(data.get(pick), lang);
+    }
+
+    /** UTF-8 when the bytes are valid UTF-8, otherwise the legacy character set of the language. */
+    static String decodeSubtitle(byte[] b, String lang) {
+        int off = (b.length >= 3 && (b[0] & 0xFF) == 0xEF && (b[1] & 0xFF) == 0xBB && (b[2] & 0xFF) == 0xBF) ? 3 : 0;
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(b, off, b.length - off)).toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            try {
+                return new String(b, off, b.length - off, java.nio.charset.Charset.forName(legacyCharset(lang)));
+            } catch (Throwable t) {
+                return new String(b, off, b.length - off, StandardCharsets.ISO_8859_1);
+            }
         }
     }
 
@@ -1173,6 +1597,11 @@ public final class StremioBridge {
         return d == null ? null : d.optJSONObject("meta");
     }
 
+    private static String redact(String url) {
+        int q = url.indexOf('?');
+        return q < 0 ? url : url.substring(0, q) + "?...";
+    }
+
     /** GET a JSON document (redirects followed), cached for {@code ttlMs}; null when unreachable. */
     private JSONObject fetchJson(String url, int readTimeoutMs, long ttlMs) {
         long now = System.currentTimeMillis();
@@ -1186,7 +1615,7 @@ public final class StremioBridge {
             conn.setRequestProperty("Accept", "application/json");
             int code = conn.getResponseCode();
             if (code != 200) {
-                Log.w(TAG, "HTTP " + code + " for " + url);
+                Log.w(TAG, "HTTP " + code + " for " + redact(url));
                 conn.disconnect();
                 return hit != null ? hit.json : null;
             }
@@ -1198,7 +1627,7 @@ public final class StremioBridge {
                 conn.disconnect();
             }
         } catch (Throwable t) {
-            Log.w(TAG, "fetch " + url + ": " + t.getMessage());
+            Log.w(TAG, "fetch " + redact(url) + ": " + t.getMessage());
             return hit != null ? hit.json : null;
         }
     }
