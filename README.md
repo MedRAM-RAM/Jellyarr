@@ -51,6 +51,9 @@ All services listen on the phone and on your local network only.
   app that takes Stremio addons, and you get your Jellyfin library with direct play, Popular and Featured
   catalogs with posters and descriptions (genres, search, a 📁 badge on what you already own), torrents from
   Prowlarr streamed through TorrServer, and subtitles from Jellyfin and OpenSubtitles in the languages you pick.
+  Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
+  never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use
+  it from apps that are not on your home network, such as a hosted AIOStreams.
 - **Automation.** Transmission auto-cleanup and auto-recheck, automatic missing-episode search, Wi-Fi-only mode.
 - **Updates in the app.** Stable and beta channels, background download, install from the notification.
 - **Backup & restore** of every service configuration and database.

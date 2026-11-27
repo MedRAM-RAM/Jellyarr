@@ -10687,8 +10687,14 @@ public final class JellyarrActivity extends AppCompatActivity
         urlBtns.setPadding(0, dp(6), 0, 0);
         Button openStremio = UiKit.tonal(this, buttonLabel("OPEN IN STREMIO"), v -> {
             String url = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+            if (!url.startsWith("https://")) {
+                // Stremio's deep link installs over HTTPS only: for a home-network address, copy it to paste in Stremio.
+                copyUrlToClipboard("Jellyarr addon URL", url);
+                Toast.makeText(ctx, I18n.tr("URL copied. In Stremio open Addons and paste it."), Toast.LENGTH_LONG).show();
+                return;
+            }
             try {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.replaceFirst("^http://", "stremio://"))));
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.replaceFirst("^https://", "stremio://"))));
             } catch (Throwable t) {
                 Toast.makeText(ctx, I18n.tr("Stremio is not installed on this device."), Toast.LENGTH_SHORT).show();
             }
@@ -10703,6 +10709,52 @@ public final class JellyarrActivity extends AppCompatActivity
         urlBtns.addView(openStremio, ob);
         urlBtns.addView(newKey, new LinearLayout.LayoutParams(0, dp(40), 1.0f));
         card.addView(urlBtns);
+
+        // Public address: one HTTPS address (tunnel) that reaches port 7070; everything is served through it.
+        LinearLayout pubRow = UiKit.row(this);
+        pubRow.setGravity(Gravity.CENTER_VERTICAL);
+        pubRow.setPadding(0, dp(12), 0, dp(4));
+        pubRow.addView(UiKit.text(this, I18n.tr("Public address"), 12.5f, AppTheme.text(), UiKit.MEDIUM),
+                new LinearLayout.LayoutParams(-2, -2));
+        final android.widget.EditText pubInput = new android.widget.EditText(this);
+        pubInput.setText(com.jellyarr.app.services.StremioBridge.getPublicUrl(this));
+        pubInput.setHint("https://jellyarr.example.com");
+        pubInput.setTextColor(AppTheme.text());
+        pubInput.setTextSize(12.5f);
+        pubInput.setSingleLine(true);
+        pubInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        pubInput.setTextDirection(View.TEXT_DIRECTION_LTR);
+        LinearLayout.LayoutParams pubLp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        pubLp.setMarginStart(dp(8));
+        pubRow.addView(pubInput, pubLp);
+        Button pubSave = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        pubSave.setTextSize(10f);
+        pubSave.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams pubBtnLp = new LinearLayout.LayoutParams(-2, dp(32));
+        pubBtnLp.setMarginStart(dp(8));
+        pubRow.addView(pubSave, pubBtnLp);
+        final Runnable pubDirty = UiStyle.bindDirty(pubSave, pubInput,
+                () -> com.jellyarr.app.services.StremioBridge.getPublicUrl(ctx));
+        pubSave.setOnClickListener(v -> {
+            if (!com.jellyarr.app.services.StremioBridge.setPublicUrl(ctx, pubInput.getText().toString())) {
+                Toast.makeText(ctx, I18n.tr("Enter a full address such as https://jellyarr.example.com"), Toast.LENGTH_LONG).show();
+                return;
+            }
+            pubInput.setText(com.jellyarr.app.services.StremioBridge.getPublicUrl(ctx));
+            pubDirty.run();
+            if (bridgeRefresh != null) bridgeRefresh.run();
+            Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
+        });
+        card.addView(pubRow);
+        TextView pubHint = UiKit.caption(this, I18n.tr(
+                "Optional. An HTTPS address that reaches port " + com.jellyarr.app.services.StremioBridge.PORT
+                + " on this phone (Cloudflare Tunnel, Tailscale Funnel...). Needed when the app that uses the addon is not on your home network, for example AIOStreams hosted online. Videos, subtitles, posters and torrents are all served through this one address."));
+        pubHint.setPadding(0, 0, 0, dp(4));
+        card.addView(pubHint);
+        TextView pubWarn = UiKit.caption(this, I18n.tr("Anyone who has the addon URL can watch your library, so keep it private. NEW KEY cancels the old URL."));
+        pubWarn.setTextColor(AppTheme.danger());
+        pubWarn.setPadding(0, 0, 0, dp(4));
+        card.addView(pubWarn);
 
         card.addView(createSettingsDivider());
 
@@ -10774,7 +10826,7 @@ public final class JellyarrActivity extends AppCompatActivity
         TextView how = UiKit.caption(this, I18n.tr(
                 "1. In Stremio open Addons, tap Add addon and paste the addon URL above (or tap OPEN IN STREMIO). Nothing else is needed.\n"
                 + "2. You get your Jellyfin library, Popular and Featured lists, torrents from Prowlarr and subtitles in the languages above.\n"
-                + "3. Using AIOStreams? Its server fetches this addon itself, so it can only reach a home-network address if it runs on your own network."));
+                + "3. Using AIOStreams hosted online? Set the public address above first: its server fetches this addon itself and cannot reach a home-network address."));
         how.setPadding(0, dp(2), 0, dp(4));
         card.addView(how);
 
@@ -10796,8 +10848,12 @@ public final class JellyarrActivity extends AppCompatActivity
                 status.setTextColor(AppTheme.danger());
             }
             urlBox.removeAllViews();
-            String lan = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+            String lan = com.jellyarr.app.services.StremioBridge.getLanManifestUrl(ctx);
             String local = com.jellyarr.app.services.StremioBridge.getLocalManifestUrl(ctx);
+            if (!com.jellyarr.app.services.StremioBridge.getPublicUrl(ctx).isEmpty()) {
+                String pub = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+                urlBox.addView(detailCopyRow(I18n.tr("Public"), pub, true, "Jellyarr addon URL", pub));
+            }
             urlBox.addView(detailCopyRow("LAN", lan, true, "Jellyarr addon URL", lan));
             if (!lan.equals(local)) {
                 urlBox.addView(detailCopyRow(I18n.tr("This phone"), local, true, "Jellyarr addon URL", local));

@@ -198,8 +198,34 @@ public final class StremioBridge {
         getInstance().tokens.clear();
     }
 
-    /** The manifest URL to paste into AIOStreams / Stremio (LAN address when there is one). */
+    /** Optional public base address (e.g. https://jellyarr.example.com) that reaches this phone's port 7070. */
+    public static String getPublicUrl(Context c) { return prefs(c).getString("public_url", ""); }
+
+    /** Saves the public address; returns false (and saves nothing) when it is not a valid http(s) address. */
+    public static boolean setPublicUrl(Context c, String url) {
+        String n = normalizePublicUrl(url);
+        if (n == null) return false;
+        prefs(c).edit().putString("public_url", n).apply();
+        return true;
+    }
+
+    /** "" for empty input, the address without trailing slashes or path-less noise, or null when invalid. */
+    static String normalizePublicUrl(String raw) {
+        String u = raw == null ? "" : raw.trim();
+        if (u.isEmpty()) return "";
+        while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+        if (!u.matches("(?i)https?://[A-Za-z0-9.\\-]+(:\\d{1,5})?(/[A-Za-z0-9._~\\-/]*)?")) return null;
+        return u;
+    }
+
+    /** The manifest URL to paste into an app: the public address when set, else the LAN one. */
     public static String getManifestUrl(Context c) {
+        String pub = getPublicUrl(c);
+        if (!pub.isEmpty()) return pub + "/" + getKey(c) + "/manifest.json";
+        return getLanManifestUrl(c);
+    }
+
+    public static String getLanManifestUrl(Context c) {
         String ip = NetworkUtils.getRawLanIp();
         if (ip == null || ip.isEmpty()) ip = "127.0.0.1";
         return "http://" + ip + ":" + PORT + "/" + getKey(c) + "/manifest.json";
@@ -222,7 +248,7 @@ public final class StremioBridge {
             ss.setReuseAddress(true);
             ss.bind(new InetSocketAddress(PORT), 32);
             server = ss;
-            pool = Executors.newFixedThreadPool(8, r -> {
+            pool = Executors.newFixedThreadPool(32, r -> {
                 Thread t = new Thread(r, "Jellyarr-Bridge");
                 t.setDaemon(true);
                 return t;
@@ -276,6 +302,7 @@ public final class StremioBridge {
         String method;
         String path;
         String host;
+        String range;
     }
 
     private static final class Resp {
@@ -284,6 +311,17 @@ public final class StremioBridge {
         byte[] body = new byte[0];
         String location;
         int maxAge = 0;
+        /** When set, the body is streamed from this local URL (Range passed through) instead of {@link #body}. */
+        String proxyUrl;
+        Map<String, String> proxyHeaders;
+
+        static Resp proxy(String url, Map<String, String> headers, int maxAge) {
+            Resp r = new Resp();
+            r.proxyUrl = url;
+            r.proxyHeaders = headers;
+            r.maxAge = maxAge;
+            return r;
+        }
 
         static Resp json(Object o, int maxAge) {
             Resp r = new Resp();
@@ -328,6 +366,11 @@ public final class StremioBridge {
                     resp = Resp.text(500, "Bridge error: " + t.getMessage());
                 }
             }
+            if (resp.proxyUrl != null) {
+                sock.setSoTimeout(0);
+                pipe(sock.getOutputStream(), req, resp);
+                return;
+            }
             write(sock.getOutputStream(), resp, "HEAD".equals(req.method));
         } catch (Throwable t) {
             Log.d(TAG, "connection: " + t.getMessage());
@@ -346,7 +389,10 @@ public final class StremioBridge {
         int n = 0;
         while ((h = readLine(in)) != null && !h.isEmpty() && n++ < 100) {
             int c = h.indexOf(':');
-            if (c > 0 && h.substring(0, c).trim().equalsIgnoreCase("host")) r.host = h.substring(c + 1).trim();
+            if (c <= 0) continue;
+            String name = h.substring(0, c).trim();
+            if (name.equalsIgnoreCase("host")) r.host = h.substring(c + 1).trim();
+            else if (name.equalsIgnoreCase("range")) r.range = h.substring(c + 1).trim();
         }
         return r;
     }
@@ -379,11 +425,64 @@ public final class StremioBridge {
         out.flush();
     }
 
+    private static final String[] PASS_HEADERS = {"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"};
+
+    /** Streams an upstream response (Jellyfin, TorrServer) to the client, passing Range through for seeking. */
+    private void pipe(OutputStream out, Req req, Resp r) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(r.proxyUrl).openConnection();
+        try {
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(120000);
+            conn.setRequestProperty("User-Agent", "Jellyarr-Bridge/1.1");
+            if (req.range != null) conn.setRequestProperty("Range", req.range);
+            if (r.proxyHeaders != null) {
+                for (Map.Entry<String, String> e : r.proxyHeaders.entrySet()) conn.setRequestProperty(e.getKey(), e.getValue());
+            }
+            int code;
+            try {
+                code = conn.getResponseCode();
+            } catch (Throwable t) {
+                Log.w(TAG, "upstream " + t.getMessage());
+                write(out, Resp.text(502, "The source did not answer."), "HEAD".equals(req.method));
+                return;
+            }
+            InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            StringBuilder sb = new StringBuilder();
+            sb.append("HTTP/1.1 ").append(code).append(' ').append(reason(code)).append("\r\n");
+            boolean ranges = false;
+            for (String h : PASS_HEADERS) {
+                String v = conn.getHeaderField(h);
+                if (v == null) continue;
+                if (h.equals("Accept-Ranges")) ranges = true;
+                sb.append(h).append(": ").append(v).append("\r\n");
+            }
+            if (!ranges && (code == 200 || code == 206)) sb.append("Accept-Ranges: bytes\r\n");
+            sb.append("Access-Control-Allow-Origin: *\r\n");
+            sb.append("Access-Control-Allow-Headers: *\r\n");
+            sb.append("Cache-Control: ").append(r.maxAge > 0 ? "max-age=" + r.maxAge : "no-store").append("\r\n");
+            sb.append("Connection: close\r\n\r\n");
+            out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            if ("HEAD".equals(req.method) || in == null) return;
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+            out.flush();
+        } finally {
+            conn.disconnect();
+        }
+    }
+
     private static String reason(int code) {
         switch (code) {
             case 200: return "OK";
             case 204: return "No Content";
+            case 206: return "Partial Content";
             case 302: return "Found";
+            case 401: return "Unauthorized";
+            case 403: return "Forbidden";
+            case 416: return "Range Not Satisfiable";
             case 404: return "Not Found";
             case 405: return "Method Not Allowed";
             case 502: return "Bad Gateway";
@@ -406,14 +505,15 @@ public final class StremioBridge {
         String prefix = "/" + key + "/";
         if (!path.startsWith(prefix)) return Resp.text(404, "Not found");
         String rest = path.substring(prefix.length());
-        String host = publicHost(req.host);
-        String self = "http://" + host + ":" + PORT + "/" + key;
+        String pub = getPublicUrl(c);
+        String self = (pub.isEmpty() ? "http://" + publicHost(req.host) + ":" + PORT : pub) + "/" + key;
 
         if (rest.equals("manifest.json")) return Resp.json(manifest(c), 0);
         if (rest.isEmpty() || rest.equals("configure")) return Resp.text(200, "Jellyarr Bridge: add " + self + "/manifest.json to AIOStreams or Stremio.");
 
         String[] seg = rest.split("/");
-        if (seg.length >= 2 && seg[0].equals("play")) return play(c, seg[1], host);
+        if (seg.length >= 2 && seg[0].equals("play")) return play(c, seg[1]);
+        if (seg.length >= 2 && seg[0].equals("jf")) return jf(c, seg, q >= 0 ? req.path.substring(q + 1) : "");
         if (seg.length < 3) return Resp.text(404, "Not found");
         String resource = seg[0];
         String type = seg[1];
@@ -422,11 +522,58 @@ public final class StremioBridge {
         String extra = dec(extraRaw);
 
         switch (resource) {
-            case "catalog": return Resp.json(catalog(c, type, id, extra, extraRaw, host), 60);
-            case "meta": return Resp.json(meta(c, type, id, host), 60);
-            case "stream": return Resp.json(streams(c, type, id, host, self), 0);
-            case "subtitles": return Resp.json(subtitles(c, type, id, extraRaw, host), 0);
+            case "catalog": return Resp.json(catalog(c, type, id, extra, extraRaw, self), 60);
+            case "meta": return Resp.json(meta(c, type, id, self), 60);
+            case "stream": return Resp.json(streams(c, type, id, self), 0);
+            case "subtitles": return Resp.json(subtitles(c, type, id, extraRaw, self), 0);
             default: return Resp.text(404, "Not found");
+        }
+    }
+
+    private static final Pattern SAFE_ID = Pattern.compile("[A-Za-z0-9_\\-]{1,64}");
+    private static final Pattern SUB_FILE = Pattern.compile("^(\\d{1,3})\\.(srt|vtt|ass)$");
+    private static final Pattern MAX_H = Pattern.compile("(?:^|&)maxHeight=(\\d{2,4})(?:&|$)");
+
+    /**
+     * Jellyfin through the bridge: video, subtitle and image routes only, authenticated here so the token
+     * never appears in a URL and port 8096 never has to be reachable from outside.
+     */
+    private Resp jf(Context c, String[] seg, String query) throws Exception {
+        if (seg.length < 4) return Resp.text(404, "Not found");
+        String token;
+        try {
+            token = jfToken(c);
+        } catch (Throwable t) {
+            return Resp.text(503, "Jellyfin is not available.");
+        }
+        Map<String, String> h = new HashMap<>();
+        h.put("X-Emby-Token", token);
+        String item = seg[2];
+        if (!SAFE_ID.matcher(item).matches()) return Resp.text(404, "Not found");
+        switch (seg[1]) {
+            case "video": {
+                String ms = dec(seg[3]);
+                if (seg.length != 4 || !SAFE_ID.matcher(ms).matches()) return Resp.text(404, "Not found");
+                return Resp.proxy(JF + "/Videos/" + item + "/stream?static=true&MediaSourceId=" + enc(ms), h, 0);
+            }
+            case "sub": {
+                if (seg.length != 5) return Resp.text(404, "Not found");
+                String ms = dec(seg[3]);
+                Matcher m = SUB_FILE.matcher(seg[4]);
+                if (!SAFE_ID.matcher(ms).matches() || !m.matches()) return Resp.text(404, "Not found");
+                return Resp.proxy(JF + "/Videos/" + item + "/" + ms + "/Subtitles/" + m.group(1) + "/0/Stream." + m.group(2), h, 0);
+            }
+            case "img": {
+                String kind = seg[3];
+                if (seg.length != 4 || !(kind.equals("Primary") || kind.equals("Backdrop") || kind.equals("Logo") || kind.equals("Thumb"))) {
+                    return Resp.text(404, "Not found");
+                }
+                Matcher mh = MAX_H.matcher(query);
+                String maxH = mh.find() ? mh.group(1) : "450";
+                return Resp.proxy(JF + "/Items/" + item + "/Images/" + kind + "?maxHeight=" + maxH + "&quality=90", h, 86400);
+            }
+            default:
+                return Resp.text(404, "Not found");
         }
     }
 
@@ -573,11 +720,11 @@ public final class StremioBridge {
         return v.startsWith("tt") ? v : null;
     }
 
-    private static String jfImage(String host, String itemId, String kind, int maxH) {
-        return "http://" + host + ":8096/Items/" + itemId + "/Images/" + kind + "?maxHeight=" + maxH + "&quality=90";
+    private static String jfImage(String self, String itemId, String kind, int maxH) {
+        return self + "/jf/img/" + itemId + "/" + kind + "?maxHeight=" + maxH;
     }
 
-    private JSONObject catalog(Context c, String type, String id, String extra, String extraRaw, String host) throws Exception {
+    private JSONObject catalog(Context c, String type, String id, String extra, String extraRaw, String self) throws Exception {
         JSONArray metas = new JSONArray();
         if ("jellyarr-popular".equals(id) || "jellyarr-featured".equals(id)) {
             if (!isCatalogsEnabled(c) || !("movie".equals(type) || "series".equals(type))) return new JSONObject().put("metas", metas);
@@ -604,7 +751,7 @@ public final class StremioBridge {
         JSONObject res = new JSONObject(jfGet(c, q.toString()));
         JSONArray items = res.optJSONArray("Items");
         if (items != null) {
-            for (int i = 0; i < items.length(); i++) metas.put(preview(items.getJSONObject(i), type, host));
+            for (int i = 0; i < items.length(); i++) metas.put(preview(items.getJSONObject(i), type, self));
         }
         return new JSONObject().put("metas", metas);
     }
@@ -619,15 +766,15 @@ public final class StremioBridge {
         return m;
     }
 
-    private JSONObject preview(JSONObject it, String type, String host) throws Exception {
+    private JSONObject preview(JSONObject it, String type, String self) throws Exception {
         String itemId = it.optString("Id");
         String imdb = imdbOf(it);
         JSONObject m = new JSONObject();
         m.put("id", imdb != null ? imdb : "jellyarr:" + itemId);
         m.put("type", type);
         m.put("name", it.optString("Name"));
-        m.put("poster", jfImage(host, itemId, "Primary", 450));
-        m.put("background", jfImage(host, itemId, "Backdrop", 720));
+        m.put("poster", jfImage(self, itemId, "Primary", 450));
+        m.put("background", jfImage(self, itemId, "Backdrop", 720));
         int year = it.optInt("ProductionYear", 0);
         if (year > 0) m.put("releaseInfo", String.valueOf(year));
         String ov = it.optString("Overview", "");
@@ -678,7 +825,7 @@ public final class StremioBridge {
         return new JSONObject().put("metas", out);
     }
 
-    private JSONObject meta(Context c, String type, String id, String host) throws Exception {
+    private JSONObject meta(Context c, String type, String id, String self) throws Exception {
         if (id.startsWith("tt")) {
             String imdb = id.split(":")[0];
             JSONObject cm = cinemeta(type, imdb);
@@ -693,7 +840,7 @@ public final class StremioBridge {
         String itemId = id.substring("jellyarr:".length());
         String uid = userId(c);
         JSONObject it = new JSONObject(jfGet(c, "/Users/" + uid + "/Items/" + enc(itemId)));
-        JSONObject m = preview(it, type, host);
+        JSONObject m = preview(it, type, self);
         m.put("id", id);
         if ("Series".equals(it.optString("Type"))) {
             JSONObject eps = new JSONObject(jfGet(c, "/Shows/" + enc(itemId) + "/Episodes?userId=" + uid + "&Fields=Overview,PremiereDate"));
@@ -709,7 +856,7 @@ public final class StremioBridge {
                     v.put("episode", e.optInt("IndexNumber", 0));
                     String rel = e.optString("PremiereDate", "");
                     v.put("released", rel.isEmpty() ? "1970-01-01T00:00:00.000Z" : rel);
-                    v.put("thumbnail", jfImage(host, e.optString("Id"), "Primary", 300));
+                    v.put("thumbnail", jfImage(self, e.optString("Id"), "Primary", 300));
                     String ov = e.optString("Overview", "");
                     if (!ov.isEmpty()) v.put("overview", ov);
                     videos.put(v);
@@ -722,10 +869,10 @@ public final class StremioBridge {
 
     // ------------------------------------------------------------------ streams
 
-    private JSONObject streams(Context c, String type, String id, String host, String self) throws Exception {
+    private JSONObject streams(Context c, String type, String id, String self) throws Exception {
         JSONArray out = new JSONArray();
         if (id.startsWith("jellyarr:")) {
-            safeAddLocal(c, out, id.substring("jellyarr:".length()), host);
+            safeAddLocal(c, out, id.substring("jellyarr:".length()), self);
             return new JSONObject().put("streams", out);
         }
         String[] p = id.split(":");
@@ -740,9 +887,9 @@ public final class StremioBridge {
                 for (String itemId : ids) {
                     if ("series".equals(type) && season >= 0) {
                         String ep = findEpisode(c, itemId, season, episode);
-                        if (ep != null) safeAddLocal(c, out, ep, host);
+                        if (ep != null) safeAddLocal(c, out, ep, self);
                     } else {
-                        safeAddLocal(c, out, itemId, host);
+                        safeAddLocal(c, out, itemId, self);
                     }
                 }
             }
@@ -753,7 +900,7 @@ public final class StremioBridge {
         // Torrents through Prowlarr + TorrServer
         if (isTorrentsEnabled(c)) {
             try {
-                addTorrents(c, out, type, imdb, season, episode, host, self);
+                addTorrents(c, out, type, imdb, season, episode, self);
             } catch (Throwable t) {
                 Log.w(TAG, "torrent streams: " + t.getMessage());
             }
@@ -764,12 +911,12 @@ public final class StremioBridge {
     private static final Pattern STREMIO_ID = Pattern.compile("^tt\\d+(:\\d+:\\d+)?$");
 
     /** Jellyfin's own subtitle files for the item, then OpenSubtitles in the configured languages. */
-    private JSONObject subtitles(Context c, String type, String id, String extraRaw, String host) throws Exception {
+    private JSONObject subtitles(Context c, String type, String id, String extraRaw, String self) throws Exception {
         JSONArray out = new JSONArray();
         if (!isSubtitlesEnabled(c)) return new JSONObject().put("subtitles", out);
 
         try {
-            addLocalSubtitles(c, out, type, id, host);
+            addLocalSubtitles(c, out, type, id, self);
         } catch (Throwable t) {
             Log.w(TAG, "local subtitles: " + t.getMessage());
         }
@@ -807,7 +954,7 @@ public final class StremioBridge {
         }
     }
 
-    private void addLocalSubtitles(Context c, JSONArray out, String type, String id, String host) throws Exception {
+    private void addLocalSubtitles(Context c, JSONArray out, String type, String id, String self) throws Exception {
         List<String> itemIds = new ArrayList<>();
         if (id.startsWith("jellyarr:")) {
             itemIds.add(id.substring("jellyarr:".length()));
@@ -826,21 +973,19 @@ public final class StremioBridge {
                 }
             }
         }
-        String token = jfToken(c);
-        String base = "http://" + host + ":8096";
         for (String itemId : itemIds) {
             JSONObject it = new JSONObject(jfGet(c, "/Users/" + userId(c) + "/Items/" + enc(itemId)));
             JSONArray sources = it.optJSONArray("MediaSources");
             if (sources == null) continue;
             for (int i = 0; i < sources.length(); i++) {
                 JSONObject ms = sources.getJSONObject(i);
-                collectExternalSubs(ms, itemId, ms.optString("Id", itemId), base, token, out);
+                collectExternalSubs(ms, itemId, ms.optString("Id", itemId), self, out);
             }
         }
     }
 
     /** External (sidecar) subtitle streams of a Jellyfin media source, as Stremio subtitle objects. */
-    private static void collectExternalSubs(JSONObject ms, String itemId, String msId, String base, String token,
+    private static void collectExternalSubs(JSONObject ms, String itemId, String msId, String self,
                                             JSONArray subs) throws Exception {
         JSONArray streamsArr = ms.optJSONArray("MediaStreams");
         if (streamsArr == null) return;
@@ -853,7 +998,7 @@ public final class StremioBridge {
             String fmt = codec.contains("ass") || codec.contains("ssa") ? "ass" : codec.contains("vtt") ? "vtt" : "srt";
             subs.put(new JSONObject()
                     .put("id", "jellyfin-" + msId + "-" + idx)
-                    .put("url", base + "/Videos/" + itemId + "/" + msId + "/Subtitles/" + idx + "/0/Stream." + fmt + "?api_key=" + token)
+                    .put("url", self + "/jf/sub/" + itemId + "/" + enc(msId) + "/" + idx + "." + fmt)
                     .put("lang", st.optString("Language", "und")));
         }
     }
@@ -872,20 +1017,18 @@ public final class StremioBridge {
         return null;
     }
 
-    private void safeAddLocal(Context c, JSONArray out, String itemId, String host) {
+    private void safeAddLocal(Context c, JSONArray out, String itemId, String self) {
         try {
-            addLocal(c, out, itemId, host);
+            addLocal(c, out, itemId, self);
         } catch (Throwable t) {
             Log.w(TAG, "local item " + itemId + ": " + t.getMessage());
         }
     }
 
-    private void addLocal(Context c, JSONArray out, String itemId, String host) throws Exception {
-        String token = jfToken(c);
+    private void addLocal(Context c, JSONArray out, String itemId, String self) throws Exception {
         JSONObject it = new JSONObject(jfGet(c, "/Users/" + userId(c) + "/Items/" + enc(itemId)));
         JSONArray sources = it.optJSONArray("MediaSources");
         if (sources == null) return;
-        String base = "http://" + host + ":8096";
         for (int i = 0; i < sources.length(); i++) {
             JSONObject ms = sources.getJSONObject(i);
             String msId = ms.optString("Id", itemId);
@@ -902,8 +1045,8 @@ public final class StremioBridge {
                     if ("Video".equals(t) && res.isEmpty()) res = resolutionLabel(st.optInt("Width", 0), st.optInt("Height", 0));
                 }
             }
-            collectExternalSubs(ms, itemId, msId, base, token, subs);
-            String url = base + "/Videos/" + itemId + "/stream?static=true&MediaSourceId=" + enc(msId) + "&api_key=" + token;
+            collectExternalSubs(ms, itemId, msId, self, subs);
+            String url = self + "/jf/video/" + itemId + "/" + enc(msId);
             JSONObject s = new JSONObject();
             s.put("name", "Jellyarr\n📁 " + (res.isEmpty() ? "Local" : res));
             String desc = "🏠 Jellyfin library\n📄 " + file + (size > 0 ? "\n💾 " + human(size) : "");
@@ -921,7 +1064,7 @@ public final class StremioBridge {
     }
 
     private void addTorrents(Context c, JSONArray out, String type, String imdb, int season, int episode,
-                             String host, String self) throws Exception {
+                             String self) throws Exception {
         MediaServiceManager mgr = MediaServiceManager.getInstance(c);
         if (mgr == null || !mgr.isServiceRunning("prowlarr")) return;
         String key = mgr.getServiceApiKey("prowlarr");
@@ -1131,7 +1274,7 @@ public final class StremioBridge {
 
     private static final Pattern VIDEO_EXT = Pattern.compile("(?i)\\.(mkv|mp4|m4v|avi|mov|wmv|ts|m2ts|webm|mpg|mpeg|flv)$");
 
-    private Resp play(Context c, String tokenId, String host) throws Exception {
+    private Resp play(Context c, String tokenId) throws Exception {
         TorrentRef ref = tokens.get(tokenId);
         if (ref == null) return Resp.text(404, "This link expired. Open the title again to refresh the list.");
         MediaServiceManager mgr = MediaServiceManager.getInstance(c);
@@ -1172,9 +1315,9 @@ public final class StremioBridge {
             ref.resolvedIndex = bestId;
             ref.resolvedName = bestPath.substring(bestPath.lastIndexOf('/') + 1);
         }
-        String to = "http://" + host + ":" + TORRSERVER_PORT + "/stream/" + encPath(ref.resolvedName)
+        String to = TORRSERVER + "/stream/" + encPath(ref.resolvedName)
                 + "?link=" + ref.resolvedHash + "&index=" + ref.resolvedIndex + "&play";
-        return Resp.redirect(to);
+        return Resp.proxy(to, null, 0);
     }
 
     /** A magnet for the release: Prowlarr's infohash, its magnet, or the .torrent it serves. */
