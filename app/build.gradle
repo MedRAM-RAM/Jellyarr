@@ -46,8 +46,8 @@ android {
         applicationId "com.jellyarr.app"
         minSdkVersion project.properties.minSdkVersion.toInteger()
         targetSdkVersion project.properties.targetSdkVersion.toInteger()
-        versionCode 103020
-        versionName "3.0.2"
+        versionCode 103100
+        versionName "3.1.0"
 
         if (project.hasProperty("appVersionCode")) {
             versionCode project.property("appVersionCode").toInteger()

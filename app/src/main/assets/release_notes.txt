@@ -1,4 +1,7 @@
-What's new in 3.0.2 (stable)
+What's new in 3.1.0 (beta)
+- SETUP PRESETS (Media tab): pick 10 popular public indexers (Cloudflare-protected ones use the built-in solver) and Radarr/Sonarr quality profiles with size limits (Saver 720p, Balanced 1080p, High 4K) plus smart filters.
+
+From 3.0.2:
 - Backups now include the Jellyfin libraries (root folder), plugins and artwork. Before, only jellyfin.db was saved, so a restored Jellyfin had no libraries and looked empty. Make a NEW backup to get them.
 - Restore waits until every service has really stopped before writing, removes stale database journals, then restarts Jellyarr so the restored settings and account are used. After a restore every service is checked again with the account.
 - Sign-in: opening Sonarr, Radarr or Prowlarr inside the app signs in with the unified account, and the Jellyfin web screen fills in and submits its login form for you.
@@ -6,4 +9,3 @@ What's new in 3.0.2 (stable)
 - Service screens from the side menu (Library, Sonarr, Radarr, Transmission, Prowlarr) show "Not installed, tap to install" or "Not running, tap to start" instead of empty settings, and open by themselves once the service is ready.
 - Settings: tapping Settings in the bottom bar inside a section scrolls to the top; tapping it again goes back to the list.
 - Backups no longer include the Sonarr / Radarr / Prowlarr log databases (tens of MB each).
-- New SETUP PRESETS (Media tab): pick 10 popular public indexers (Cloudflare-protected ones use the built-in solver) and Radarr/Sonarr quality profiles with size limits (Saver 720p, Balanced 1080p, High 4K) plus smart filters.
