@@ -1,5 +1,8 @@
 What's new in 3.1.0 (beta)
 - SETUP PRESETS (Media tab): pick 10 popular public indexers (Cloudflare-protected ones use the built-in solver) and Radarr/Sonarr quality profiles with size limits (Saver 720p, Balanced 1080p, High 4K) plus smart filters.
+- Stremio addon (port 7070): Jellyfin and Prowlarr streams through TorrServer for AIOStreams, with catalogs, subtitles and home-network-only links.
+- Subtitles: automatic timing sync and checking of the best subtitles per language (Stremio and Nuvio), with new options in Settings.
+- Cloudflare Tunnel can run inside the app.
 
 From 3.0.2:
 - Backups now include the Jellyfin libraries (root folder), plugins and artwork. Before, only jellyfin.db was saved, so a restored Jellyfin had no libraries and looked empty. Make a NEW backup to get them.

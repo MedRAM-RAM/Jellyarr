@@ -28,6 +28,9 @@ companion services that find, download and organize your media, and wires them t
 | **Radarr** | `7878` | Movies: monitoring, search, import and renaming |
 | **Prowlarr** | `9696` | Indexer manager, synced to Sonarr and Radarr |
 | **Transmission** | `9091` | BitTorrent download client |
+| **TorrServer** *(optional)* | `8090` | Streams torrents over HTTP while they download |
+| **Jellyarr addon** *(optional)* | `7070` | Stremio addon for AIOStreams and Stremio (built into the app) |
+| **Cloudflare Tunnel** *(optional)* | `20244` | Runs `cloudflared` inside the app to give the addon a public HTTPS address |
 
 All services listen on the phone and on your local network only.
 
@@ -49,6 +52,26 @@ All services listen on the phone and on your local network only.
   updated automatically.
 - **File management.** Radarr and Sonarr naming and import options in one place, *Organize* (rename every file to
   the current format) and import from a folder with Move or Copy.
+- **Stremio addon.** Built into the app (Settings › Stremio & AIOStreams). Add its URL to Stremio, or to any
+  app that takes Stremio addons, and you get your Jellyfin library with direct play, Popular and Featured
+  catalogs (Popular, Featured, New by year; genres, search, a 📁 badge on what you already own, plus any other
+  Stremio catalog addon you add), torrents from Prowlarr streamed through TorrServer, and subtitles from Jellyfin,
+  SubDL, Wyzie, SubSource, OpenSubtitles.com (your own keys), OpenSubtitles V3 and any other Stremio subtitle addon
+  (shown in turn so no source fills the list), in the languages you pick,
+  with the ones that match the playing file first (old Arabic/Hebrew/Cyrillic files are converted to UTF-8).
+  **Automatic subtitle sync:** the best subtitles of each language are downloaded while the list is built and checked
+  (really the right script, then timing against something known to fit the video: a subtitle that matched the file's
+  hash, a text track of the library file, or a subtitle shipped inside the torrent). A clearly out-of-sync subtitle is
+  shifted (offset, 23.976/24/25/30 fps conversions, one cut point) and anything doubtful is left untouched. Each
+  subtitle's `title` (shown by Nuvio and other players) says the source, the fit percentage and what was done.
+  Options: subtitles per language, how many to check, time limit, minimum fit, apply/check-only/off, hearing-impaired
+  handling, per-source switches. Works with Stremio and Nuvio.
+  Everything (video, subtitles, posters, torrents) is served through the addon's single port, and Jellyfin's key
+  never appears in a URL. Set an optional public HTTPS address (Cloudflare Tunnel, Tailscale Funnel...) to use
+  it from apps that are not on your home network, such as a hosted AIOStreams. With a public address set, local
+  files also get a 🏠 LAN entry that streams over the home network instead of looping through the internet. The app can run the Cloudflare
+  Tunnel itself: paste your tunnel token in the same settings page. `cloudflared` is built in CI from the upstream
+  source plus a small DNS patch for Android (`ci/cloudflared`) and shipped inside the APK.
 - **Automation.** Transmission auto-cleanup and auto-recheck, automatic missing-episode search, Wi-Fi-only mode.
 - **Updates in the app.** Stable and beta channels, background download, install from the notification.
 - **Backup & restore** of every service configuration and database.

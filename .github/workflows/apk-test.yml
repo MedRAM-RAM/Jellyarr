@@ -1,8 +1,7 @@
 name: Test Build APK (no publish)
 
 on:
-  push:
-    branches: [ 'ccr-*', 'claude/**' ]
+  # Pushes are built (and published as a pre-release) by apk.yml; this one is for manual test builds only.
   workflow_dispatch:
 
 permissions:
@@ -57,6 +56,9 @@ jobs:
           patchelf --remove-needed libgssapi_krb5.so.2 --remove-rpath "$SO"
           readelf -d "$SO" | grep -E 'NEEDED|RPATH|RUNPATH' || true
           sha256sum "$SO"
+
+      - name: Build cloudflared (Android DNS patch)
+        uses: ./.github/actions/build-cloudflared
 
       - name: Download Termux bootstraps
         run: |

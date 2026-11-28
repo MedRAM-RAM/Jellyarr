@@ -125,6 +125,9 @@ jobs:
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
 
+      - name: Build cloudflared (Android DNS patch)
+        uses: ./.github/actions/build-cloudflared
+
       - name: Download Termux Bootstraps
         run: ./gradlew downloadBootstraps
 
@@ -162,6 +165,9 @@ jobs:
 
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
+
+      - name: Build cloudflared (Android DNS patch)
+        uses: ./.github/actions/build-cloudflared
 
       - name: Download Termux Bootstraps
         run: ./gradlew downloadBootstraps

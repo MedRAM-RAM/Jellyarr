@@ -8167,6 +8167,101 @@ public final class JellyarrActivity extends AppCompatActivity
         cacheDeb.delete();
     }
 
+    /** cloudflared is built in CI (with the Android DNS patch) and ships inside the APK; it goes to $PREFIX/bin/cloudflared. */
+    private void installCloudflared(ManagedService svc, File prefix) throws Exception {
+        File bin = new File(prefix, "bin");
+        if (!bin.exists()) bin.mkdirs();
+        File target = new File(bin, "cloudflared");
+        File tmp = new File(getCacheDir(), "cloudflared.install");
+        try (java.io.InputStream in = getAssets().open(com.jellyarr.app.services.CloudflareTunnel.ASSET_NAME);
+             java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        } catch (java.io.FileNotFoundException e) {
+            tmp.delete();
+            throw new Exception("This build does not include the Cloudflare Tunnel. Install the APK built by CI.");
+        }
+        try (FileInputStream fis = new FileInputStream(tmp)) {
+            byte[] magic = new byte[4];
+            if (fis.read(magic) != 4 || magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+                tmp.delete();
+                throw new Exception("The bundled cloudflared is not an executable");
+            }
+        }
+        if (target.exists()) target.delete();
+        if (!tmp.renameTo(target)) {
+            BackupRestoreManager.copyFile(tmp, target);
+            tmp.delete();
+        }
+        target.setExecutable(true, false);
+        try { android.system.Os.chmod(target.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
+        File cfg = new File(TermuxConstants.TERMUX_HOME_DIR, ".config/cloudflared");
+        if (!cfg.exists()) cfg.mkdirs();
+        svc.reconcileInstalledState();
+    }
+
+    /** TorrServer ships one static ARM64 Android binary per release; it goes to $PREFIX/bin/torrserver. */
+    private static final String[] TORRSERVER_URLS = {
+            "https://github.com/YouROK/TorrServer/releases/latest/download/TorrServer-android-arm64",
+            "https://github.com/YouROK/TorrServer/releases/download/MatriX.152/TorrServer-android-arm64"
+    };
+
+    private void installTorrServer(ManagedService svc, File prefix, OledProgressDialog progress) throws Exception {
+        File bin = new File(prefix, "bin");
+        if (!bin.exists()) bin.mkdirs();
+        File target = new File(bin, "torrserver");
+        File tmp = new File(getCacheDir(), "torrserver.download");
+        final String step = "Downloading TorrServer...";
+        DownloadProgressCallback cb = new DownloadProgressCallback() {
+            @Override
+            public void onProgress(long current, long total, double speedKbps) {
+                if (progress != null) runOnUiThread(() -> progress.updateDownloadProgress(step, current, total, speedKbps));
+            }
+            @Override
+            public boolean isCancelled() {
+                return progress != null && progress.isCancelled();
+            }
+        };
+        Exception last = null;
+        boolean ok = false;
+        for (String url : TORRSERVER_URLS) {
+            if (progress != null && progress.isCancelled()) throw new InterruptedException("Installation cancelled");
+            try {
+                if (tmp.exists()) tmp.delete();
+                downloadWithRedirects(url, tmp, cb);
+                if (tmp.length() > 5L * 1024 * 1024) { ok = true; break; }
+                last = new Exception("Downloaded file is too small (" + tmp.length() + " bytes)");
+            } catch (Exception e) {
+                if (progress != null && progress.isCancelled()) throw e;
+                last = e;
+                Log.w(TAG, "TorrServer download failed from " + url + ": " + e.getMessage());
+            }
+        }
+        if (!ok) {
+            if (tmp.exists()) tmp.delete();
+            throw last != null ? last : new Exception("TorrServer download failed");
+        }
+        // ELF check: refuse an HTML error page saved as the binary
+        try (FileInputStream fis = new FileInputStream(tmp)) {
+            byte[] magic = new byte[4];
+            if (fis.read(magic) != 4 || magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+                tmp.delete();
+                throw new Exception("Downloaded TorrServer is not an ARM64 executable");
+            }
+        }
+        if (target.exists()) target.delete();
+        if (!tmp.renameTo(target)) {
+            BackupRestoreManager.copyFile(tmp, target);
+            tmp.delete();
+        }
+        target.setExecutable(true, false);
+        try { android.system.Os.chmod(target.getAbsolutePath(), 0755); } catch (Throwable ignored) {}
+        File cfg = new File(TermuxConstants.TERMUX_HOME_DIR, ".config/torrserver");
+        if (!cfg.exists()) cfg.mkdirs();
+        svc.reconcileInstalledState();
+    }
+
     private void performServiceInstallSync(ManagedService svc, OledProgressDialog progress) throws Exception {
         if (progress != null && progress.isCancelled()) {
             throw new InterruptedException("Installation cancelled");
@@ -8199,6 +8294,15 @@ public final class JellyarrActivity extends AppCompatActivity
             MediaServiceManager.getInstance(this).ensureServiceConfigSanitized("transmission");
             MediaServiceManager.getInstance(this).autoWireStack(null);
             svc.reconcileInstalledState();
+            return;
+        }
+
+        if ("torrserver".equalsIgnoreCase(id)) {
+            installTorrServer(svc, prefix, progress);
+            return;
+        }
+        if (com.jellyarr.app.services.CloudflareTunnel.SERVICE_ID.equalsIgnoreCase(id)) {
+            installCloudflared(svc, prefix);
             return;
         }
 
@@ -9315,6 +9419,7 @@ public final class JellyarrActivity extends AppCompatActivity
         addSettingsMenuRow("Automation", "Transmission cleanup, auto-recheck, Wi-Fi only", buildAutomationSection());
         addSettingsMenuRow("Companion services", "Install or uninstall Radarr, Sonarr, Prowlarr and Transmission", buildCompanionServicesSection());
         addSettingsMenuRow("Playback & Streaming", "Codecs and transcoding", buildStreamingSection());
+        addSettingsMenuRow("Stremio & AIOStreams", "Jellyfin library and Prowlarr torrents as a Stremio addon", buildStremioBridgeSection());
 
         addSettingsGroupHeader("DEVICE & SECURITY");
         addSettingsMenuRow("Storage", "Jellyarr footprint and disk usage", buildStorageSection());
@@ -9457,6 +9562,7 @@ public final class JellyarrActivity extends AppCompatActivity
             if ("Permissions & Health".equals(name)) refreshPermissionsUI();
             else if ("Security & Identity".equals(name)) refreshSecurityUsersUI();
             else if ("Backup & Restore".equals(name)) updateBackupStatusUI();
+            else if ("Stremio & AIOStreams".equals(name) && bridgeRefresh != null) bridgeRefresh.run();
         } catch (Throwable ignored) {}
         settingsMenu.getParent();
         ((View) settingsMenu.getParent()).setVisibility(View.GONE);
@@ -10649,6 +10755,545 @@ public final class JellyarrActivity extends AppCompatActivity
         section.addView(card);
         refreshCompanionButtons();
         return section;
+    }
+
+    private Runnable bridgeRefresh;
+
+    /** A titled text field with SAVE (optionally multi-line or masked); {@code saver} returns false for invalid input. */
+    private void addBridgeTextSetting(LinearLayout card, String title, String hint,
+                                      final java.util.function.Supplier<String> getter,
+                                      final java.util.function.Predicate<String> saver,
+                                      boolean multiline, boolean secret, final String savedToast) {
+        final android.content.Context ctx = this;
+        TextView t = UiKit.text(this, I18n.tr(title), 12.5f, AppTheme.text(), UiKit.MEDIUM);
+        t.setPadding(0, dp(12), 0, dp(2));
+        card.addView(t);
+        final android.widget.EditText input = new android.widget.EditText(this);
+        input.setText(getter.get());
+        input.setTextColor(AppTheme.text());
+        input.setTextSize(12.5f);
+        input.setTextDirection(View.TEXT_DIRECTION_LTR);
+        if (multiline) {
+            input.setSingleLine(false);
+            input.setMinLines(3);
+            input.setGravity(Gravity.TOP | Gravity.START);
+            input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                    | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        } else {
+            input.setSingleLine(true);
+            input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                    | (secret ? android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD : 0));
+        }
+        card.addView(input, new LinearLayout.LayoutParams(-1, -2));
+        Button save = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        save.setTextSize(10f);
+        save.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(32));
+        lp.gravity = Gravity.END;
+        lp.topMargin = dp(4);
+        card.addView(save, lp);
+        final Runnable dirty = UiStyle.bindDirty(save, input, () -> getter.get());
+        save.setOnClickListener(v -> {
+            if (!saver.test(input.getText().toString())) {
+                Toast.makeText(ctx, I18n.tr("Invalid value. Check the address or key and try again."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            input.setText(getter.get());
+            dirty.run();
+            Toast.makeText(ctx, I18n.tr(savedToast), Toast.LENGTH_LONG).show();
+        });
+        TextView h = UiKit.caption(this, I18n.tr(hint));
+        h.setPadding(0, dp(2), 0, dp(4));
+        card.addView(h);
+    }
+
+    /** Settings > Stremio & AIOStreams: the in-app Stremio addon (StremioBridge) and TorrServer. */
+    private View buildStremioBridgeSection() {
+        final android.content.Context ctx = this;
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+        section.addView(createSettingsSectionHeader("STREMIO & AIOSTREAMS"));
+
+        LinearLayout card = createSettingsSectionCard();
+        card.addView(settingsSwitchRow("Jellyarr addon",
+                "A Stremio addon served by Jellyarr on port " + com.jellyarr.app.services.StremioBridge.PORT
+                        + ": your Jellyfin movies and series, and Prowlarr torrents, for AIOStreams and Stremio on your network.",
+                com.jellyarr.app.services.StremioBridge.isEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setEnabled(ctx, checked);
+                    if (bridgeRefresh != null) bridgeRefresh.run();
+                }));
+
+        final TextView status = UiKit.caption(this, "");
+        status.setPadding(0, dp(2), 0, dp(6));
+        card.addView(status);
+
+        card.addView(UiKit.overline(this, I18n.tr("Addon URL")));
+        final LinearLayout urlBox = UiKit.column(this);
+        card.addView(urlBox);
+
+        LinearLayout urlBtns = new LinearLayout(this);
+        urlBtns.setOrientation(LinearLayout.HORIZONTAL);
+        urlBtns.setPadding(0, dp(6), 0, 0);
+        Button openStremio = UiKit.tonal(this, buttonLabel("OPEN IN STREMIO"), v -> {
+            String url = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+            if (!url.startsWith("https://")) {
+                // Stremio's deep link installs over HTTPS only: for a home-network address, copy it to paste in Stremio.
+                copyUrlToClipboard("Jellyarr addon URL", url);
+                Toast.makeText(ctx, I18n.tr("URL copied. In Stremio open Addons and paste it."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.replaceFirst("^https://", "stremio://"))));
+            } catch (Throwable t) {
+                Toast.makeText(ctx, I18n.tr("Stremio is not installed on this device."), Toast.LENGTH_SHORT).show();
+            }
+        });
+        Button newKey = UiKit.outline(this, buttonLabel("NEW KEY"), v -> {
+            com.jellyarr.app.services.StremioBridge.regenerateKey(ctx);
+            if (bridgeRefresh != null) bridgeRefresh.run();
+            Toast.makeText(ctx, I18n.tr("New addon URL created. Add it again in AIOStreams or Stremio."), Toast.LENGTH_LONG).show();
+        });
+        LinearLayout.LayoutParams ob = new LinearLayout.LayoutParams(0, dp(40), 1.0f);
+        ob.setMarginEnd(dp(6));
+        urlBtns.addView(openStremio, ob);
+        urlBtns.addView(newKey, new LinearLayout.LayoutParams(0, dp(40), 1.0f));
+        card.addView(urlBtns);
+
+        // Public address: one HTTPS address (tunnel) that reaches port 7070; everything is served through it.
+        LinearLayout pubRow = UiKit.row(this);
+        pubRow.setGravity(Gravity.CENTER_VERTICAL);
+        pubRow.setPadding(0, dp(12), 0, dp(4));
+        pubRow.addView(UiKit.text(this, I18n.tr("Public address"), 12.5f, AppTheme.text(), UiKit.MEDIUM),
+                new LinearLayout.LayoutParams(-2, -2));
+        final android.widget.EditText pubInput = new android.widget.EditText(this);
+        pubInput.setText(com.jellyarr.app.services.StremioBridge.getPublicUrl(this));
+        pubInput.setHint("https://jellyarr.example.com");
+        pubInput.setTextColor(AppTheme.text());
+        pubInput.setTextSize(12.5f);
+        pubInput.setSingleLine(true);
+        pubInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        pubInput.setTextDirection(View.TEXT_DIRECTION_LTR);
+        LinearLayout.LayoutParams pubLp = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        pubLp.setMarginStart(dp(8));
+        pubRow.addView(pubInput, pubLp);
+        Button pubSave = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        pubSave.setTextSize(10f);
+        pubSave.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams pubBtnLp = new LinearLayout.LayoutParams(-2, dp(32));
+        pubBtnLp.setMarginStart(dp(8));
+        pubRow.addView(pubSave, pubBtnLp);
+        final Runnable pubDirty = UiStyle.bindDirty(pubSave, pubInput,
+                () -> com.jellyarr.app.services.StremioBridge.getPublicUrl(ctx));
+        pubSave.setOnClickListener(v -> {
+            if (!com.jellyarr.app.services.StremioBridge.setPublicUrl(ctx, pubInput.getText().toString())) {
+                Toast.makeText(ctx, I18n.tr("Enter a full address such as https://jellyarr.example.com"), Toast.LENGTH_LONG).show();
+                return;
+            }
+            pubInput.setText(com.jellyarr.app.services.StremioBridge.getPublicUrl(ctx));
+            pubDirty.run();
+            if (bridgeRefresh != null) bridgeRefresh.run();
+            Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
+        });
+        card.addView(pubRow);
+        TextView pubHint = UiKit.caption(this, I18n.tr(
+                "Optional. An HTTPS address that reaches port " + com.jellyarr.app.services.StremioBridge.PORT
+                + " on this phone (Cloudflare Tunnel, Tailscale Funnel...). Needed when the app that uses the addon is not on your home network, for example AIOStreams hosted online. Videos, subtitles, posters and torrents are all served through this one address."));
+        pubHint.setPadding(0, 0, 0, dp(4));
+        card.addView(pubHint);
+        TextView pubWarn = UiKit.caption(this, I18n.tr("Anyone who has the addon URL can watch your library, so keep it private. NEW KEY cancels the old URL."));
+        pubWarn.setTextColor(AppTheme.danger());
+        pubWarn.setPadding(0, 0, 0, dp(4));
+        card.addView(pubWarn);
+
+        // Where video, subtitles and posters come from when a public address is set.
+        final Button linksBtn = UiKit.outline(this, "", null);
+        final Runnable linksLabel = () -> {
+            String m = com.jellyarr.app.services.StremioBridge.getStreamLinks(ctx);
+            linksBtn.setText(buttonLabel(m.equals("lan") ? "STREAM LINKS: HOME NETWORK ONLY"
+                    : m.equals("public") ? "STREAM LINKS: PUBLIC ONLY" : "STREAM LINKS: BOTH"));
+        };
+        linksLabel.run();
+        linksBtn.setOnClickListener(v -> {
+            String m = com.jellyarr.app.services.StremioBridge.getStreamLinks(ctx);
+            com.jellyarr.app.services.StremioBridge.setStreamLinks(ctx, m.equals("both") ? "lan" : m.equals("lan") ? "public" : "both");
+            linksLabel.run();
+            Toast.makeText(ctx, I18n.tr("Saved."), Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams linksLp = new LinearLayout.LayoutParams(-1, dp(42));
+        linksLp.topMargin = dp(10);
+        card.addView(linksBtn, linksLp);
+        TextView linksHint = UiKit.caption(this, I18n.tr(
+                "Both: a home-network entry first and a public one. Home network only: video, subtitles and posters never use the tunnel, only the lists do (works at home only). Public only: everything through the public address."));
+        linksHint.setPadding(0, dp(4), 0, dp(4));
+        card.addView(linksHint);
+
+        // Cloudflare Tunnel run by the app itself (cloudflared), so the public address needs nothing else.
+        card.addView(createSettingsDivider());
+        card.addView(UiKit.text(this, I18n.tr("Cloudflare Tunnel"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView tunHint = UiKit.caption(this, I18n.tr(
+                "Jellyarr runs the tunnel itself. In the Cloudflare dashboard open Zero Trust > Networks > Tunnels, create a tunnel, add a public hostname with service HTTP and URL localhost:7070, then paste the tunnel token (or the whole install command) below."));
+        tunHint.setPadding(0, dp(2), 0, dp(6));
+        card.addView(tunHint);
+        LinearLayout tokRow = UiKit.row(this);
+        tokRow.setGravity(Gravity.CENTER_VERTICAL);
+        final android.widget.EditText tokInput = new android.widget.EditText(this);
+        tokInput.setText(com.jellyarr.app.services.CloudflareTunnel.getToken(this));
+        tokInput.setHint("eyJ...");
+        tokInput.setTextColor(AppTheme.text());
+        tokInput.setTextSize(12.5f);
+        tokInput.setSingleLine(true);
+        tokInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        tokInput.setTextDirection(View.TEXT_DIRECTION_LTR);
+        tokRow.addView(tokInput, new LinearLayout.LayoutParams(0, -2, 1.0f));
+        Button tokSave = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        tokSave.setTextSize(10f);
+        tokSave.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams tokLp = new LinearLayout.LayoutParams(-2, dp(32));
+        tokLp.setMarginStart(dp(8));
+        tokRow.addView(tokSave, tokLp);
+        final Runnable tokDirty = UiStyle.bindDirty(tokSave, tokInput,
+                () -> com.jellyarr.app.services.CloudflareTunnel.getToken(ctx));
+        tokSave.setOnClickListener(v -> {
+            if (!com.jellyarr.app.services.CloudflareTunnel.setToken(ctx, tokInput.getText().toString())) {
+                Toast.makeText(ctx, I18n.tr("This is not a Cloudflare tunnel token. Copy it from the tunnel page in the dashboard."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            tokInput.setText(com.jellyarr.app.services.CloudflareTunnel.getToken(ctx));
+            tokDirty.run();
+            if (bridgeRefresh != null) bridgeRefresh.run();
+            Toast.makeText(ctx, I18n.tr("Saved."), Toast.LENGTH_SHORT).show();
+        });
+        card.addView(tokRow);
+        final TextView tunStatus = UiKit.caption(this, "");
+        tunStatus.setPadding(0, dp(6), 0, dp(6));
+        card.addView(tunStatus);
+        final Button tunBtn = UiKit.primary(this, buttonLabel("INSTALL TUNNEL"), null);
+        card.addView(tunBtn, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        card.addView(createSettingsDivider());
+
+        card.addView(settingsSwitchRow("Torrents from Prowlarr",
+                "Searches your Prowlarr indexers for every title and plays the result through TorrServer while it downloads. Nothing is added to Transmission.",
+                com.jellyarr.app.services.StremioBridge.isTorrentsEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setTorrentsEnabled(ctx, checked);
+                    if (bridgeRefresh != null) bridgeRefresh.run();
+                }));
+        final TextView deps = UiKit.caption(this, "");
+        deps.setPadding(0, dp(2), 0, dp(6));
+        card.addView(deps);
+        final Button tsBtn = UiKit.primary(this, buttonLabel("INSTALL TORRSERVER"), null);
+        card.addView(tsBtn, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        card.addView(createSettingsDivider());
+
+        card.addView(settingsSwitchRow("Catalogs",
+                "Popular, Featured and New (by year) lists with posters, ratings and descriptions (from Cinemeta), with genres and search. Needs internet.",
+                com.jellyarr.app.services.StremioBridge.isCatalogsEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setCatalogsEnabled(ctx, checked);
+                    Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
+                }));
+        addBridgeTextSetting(card, "Extra catalog addons",
+                "One addon address per line (up to 5). Their lists are added here, so you browse everything from this one addon. Only titles with an IMDb id are kept.",
+                () -> com.jellyarr.app.services.StremioBridge.getCatAddons(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setCatAddons(ctx, text),
+                true, false, "Saved. Remove and add the addon again so your apps reload it.");
+        card.addView(settingsSwitchRow("Subtitles",
+                "Jellyfin's own subtitle files plus SubDL, OpenSubtitles and other addons in the languages below.",
+                com.jellyarr.app.services.StremioBridge.isSubtitlesEnabled(this),
+                (v, checked) -> {
+                    com.jellyarr.app.services.StremioBridge.setSubtitlesEnabled(ctx, checked);
+                    Toast.makeText(ctx, I18n.tr("Saved. Remove and add the addon again so your apps reload it."), Toast.LENGTH_LONG).show();
+                }));
+        LinearLayout langRow = UiKit.row(this);
+        langRow.setGravity(Gravity.CENTER_VERTICAL);
+        langRow.setPadding(0, dp(6), 0, dp(4));
+        langRow.addView(UiKit.text(this, I18n.tr("Subtitle languages"), 12.5f, AppTheme.text(), UiKit.MEDIUM),
+                new LinearLayout.LayoutParams(0, -2, 1.0f));
+        final android.widget.EditText langInput = new android.widget.EditText(this);
+        langInput.setText(com.jellyarr.app.services.StremioBridge.getSubtitleLangs(this));
+        langInput.setTextColor(AppTheme.text());
+        langInput.setTextSize(13f);
+        langInput.setGravity(Gravity.CENTER);
+        langInput.setSingleLine(true);
+        langInput.setHint("ara,eng");
+        langInput.setTextDirection(View.TEXT_DIRECTION_LTR);
+        langRow.addView(langInput, new LinearLayout.LayoutParams(dp(120), -2));
+        Button langSave = createPixelButton("SAVE", AppTheme.withAlpha(AppTheme.accent(), 25), AppTheme.accent());
+        langSave.setTextSize(10f);
+        langSave.setPadding(dp(10), 0, dp(10), 0);
+        LinearLayout.LayoutParams langLp = new LinearLayout.LayoutParams(-2, dp(32));
+        langLp.setMarginStart(dp(8));
+        langRow.addView(langSave, langLp);
+        final Runnable langDirty = UiStyle.bindDirty(langSave, langInput,
+                () -> com.jellyarr.app.services.StremioBridge.getSubtitleLangs(ctx));
+        langSave.setOnClickListener(v -> {
+            com.jellyarr.app.services.StremioBridge.setSubtitleLangs(ctx, langInput.getText().toString());
+            langInput.setText(com.jellyarr.app.services.StremioBridge.getSubtitleLangs(ctx));
+            langDirty.run();
+            Toast.makeText(ctx, I18n.tr("Saved."), Toast.LENGTH_SHORT).show();
+        });
+        card.addView(langRow);
+        TextView langHint = UiKit.caption(this, I18n.tr("Three-letter codes, in order: ara = Arabic, eng = English, fre = French. Leave empty for every language."));
+        langHint.setPadding(0, 0, 0, dp(4));
+        card.addView(langHint);
+        addBridgeTextSetting(card, "SubDL API key",
+                "Free key from subdl.com (Account > API). Jellyarr searches SubDL itself from this phone, so the key stays between you and SubDL.",
+                () -> com.jellyarr.app.services.StremioBridge.getSubdlKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setSubdlKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "Wyzie API key",
+                "Key from sub.wyzie.io. Wyzie gathers subtitles from several sources and serves them as UTF-8.",
+                () -> com.jellyarr.app.services.StremioBridge.getWyzieKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setWyzieKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "SubSource API key",
+                "Free key from subsource.net (your profile page).",
+                () -> com.jellyarr.app.services.StremioBridge.getSubsourceKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setSubsourceKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "OpenSubtitles.com API key",
+                "Key from opensubtitles.com. Each file counts against the key's daily download limit, so a file is downloaded once and kept.",
+                () -> com.jellyarr.app.services.StremioBridge.getOscomKey(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setOscomKey(ctx, text),
+                false, true, "Saved.");
+        addBridgeTextSetting(card, "Extra subtitle addons",
+                "One addon address per line (up to 5), for example SubSource, SubHero or OpenSubtitles V3+. Their results are merged and sorted with the others.",
+                () -> com.jellyarr.app.services.StremioBridge.getSubAddons(ctx),
+                text -> com.jellyarr.app.services.StremioBridge.setSubAddons(ctx, text),
+                true, false, "Saved.");
+
+        // ---- subtitle options: how many, how they are checked and synced, what their titles say
+        TextView optHead = UiKit.text(this, I18n.tr("Subtitle options"), 13.5f, AppTheme.text(), UiKit.BOLD);
+        optHead.setPadding(0, dp(14), 0, dp(2));
+        card.addView(optHead);
+        card.addView(UiKit.caption(this, I18n.tr("Each subtitle's title (shown by Nuvio and some players) says where it comes from, how well it fits the video and whether it was synced.")));
+        addBridgeTextSetting(card, "Subtitles per language",
+                "How many subtitles to offer for each language (1 to 40). Providers take turns, so one source cannot fill the list.",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubMax(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubMax(ctx, text),
+                false, false, "Saved.");
+        addBridgeTextSetting(card, "Check the best N per language",
+                "These are downloaded while the list is built and checked: the script must match the language and the timing is compared with the video (0 to 12; 0 turns checking off).",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubVerify(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubVerify(ctx, text),
+                false, false, "Saved.");
+        addBridgeTextSetting(card, "Checking time limit (seconds)",
+                "How long the list may wait for those checks (3 to 40). Slower ones are listed unchecked and finish in the background.",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubBudget(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubBudget(ctx, text),
+                false, false, "Saved.");
+        addBridgeTextSetting(card, "Hide checked subtitles below (%)",
+                "Subtitles that were checked and fit the video less than this are hidden (0 to 90; 0 hides nothing).",
+                () -> String.valueOf(com.jellyarr.app.services.StremioBridge.getSubMinAcc(ctx)),
+                text -> com.jellyarr.app.services.StremioBridge.setSubMinAcc(ctx, text),
+                false, false, "Saved.");
+
+        final Button syncBtn = UiKit.outline(this, "", null);
+        final Runnable syncLabel = () -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubSync(ctx);
+            syncBtn.setText(buttonLabel(m.equals("check") ? "AUTO SYNC: CHECK ONLY" : m.equals("off") ? "AUTO SYNC: OFF" : "AUTO SYNC: APPLY"));
+        };
+        syncLabel.run();
+        syncBtn.setOnClickListener(v -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubSync(ctx);
+            com.jellyarr.app.services.StremioBridge.setSubSync(ctx, m.equals("auto") ? "check" : m.equals("check") ? "off" : "auto");
+            syncLabel.run();
+        });
+        LinearLayout.LayoutParams syncLp = new LinearLayout.LayoutParams(-1, dp(42));
+        syncLp.topMargin = dp(10);
+        card.addView(syncBtn, syncLp);
+        TextView syncHint = UiKit.caption(this, I18n.tr("Apply: a subtitle that is clearly out of sync is shifted to fit (only when it can be compared with something known to fit the video: the library file, an exact file match or a subtitle inside the torrent). Check only: reported in the title but not changed. Off: never touched."));
+        syncHint.setPadding(0, dp(4), 0, dp(4));
+        card.addView(syncHint);
+
+        final Button hiBtn = UiKit.outline(this, "", null);
+        final Runnable hiLabel = () -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubHi(ctx);
+            hiBtn.setText(buttonLabel(m.equals("exclude") ? "HEARING-IMPAIRED: HIDE" : m.equals("prefer") ? "HEARING-IMPAIRED: PREFER" : "HEARING-IMPAIRED: ALLOW"));
+        };
+        hiLabel.run();
+        hiBtn.setOnClickListener(v -> {
+            String m = com.jellyarr.app.services.StremioBridge.getSubHi(ctx);
+            com.jellyarr.app.services.StremioBridge.setSubHi(ctx, m.equals("any") ? "exclude" : m.equals("exclude") ? "prefer" : "any");
+            hiLabel.run();
+        });
+        LinearLayout.LayoutParams hiLp = new LinearLayout.LayoutParams(-1, dp(42));
+        hiLp.topMargin = dp(8);
+        card.addView(hiBtn, hiLp);
+
+        card.addView(settingsSwitchRow("Details in the subtitle title",
+                "Source, fit percentage and sync status in each subtitle's title. Turn off if your player shows titles badly.",
+                com.jellyarr.app.services.StremioBridge.isSubTitles(this),
+                (v, checked) -> com.jellyarr.app.services.StremioBridge.setSubTitles(ctx, checked)));
+        card.addView(settingsSwitchRow("OpenSubtitles V3 (free, no key)",
+                "The Stremio OpenSubtitles addon as one more source.",
+                com.jellyarr.app.services.StremioBridge.isOsV3(this),
+                (v, checked) -> com.jellyarr.app.services.StremioBridge.setOsV3(ctx, checked)));
+        card.addView(settingsSwitchRow("Check OpenSubtitles.com results",
+                "Checking downloads each file, which counts against the key's daily limit. Off: they are listed unchecked and downloaded when picked (exact file matches are always checked).",
+                com.jellyarr.app.services.StremioBridge.isVerifyOscom(this),
+                (v, checked) -> com.jellyarr.app.services.StremioBridge.setVerifyOscom(ctx, checked)));
+
+        card.addView(createSettingsDivider());
+
+        card.addView(UiKit.text(this, I18n.tr("Recent activity"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView actHint = UiKit.caption(this, I18n.tr("How long each step took (Jellyfin, Prowlarr, TorrServer) and the speed of the video. If something is slow, this shows where."));
+        actHint.setPadding(0, dp(2), 0, dp(6));
+        card.addView(actHint);
+        final TextView actText = UiKit.mono(this, "");
+        actText.setTextSize(10.5f);
+        actText.setTextDirection(View.TEXT_DIRECTION_LTR);
+        card.addView(actText);
+        LinearLayout actBtns = new LinearLayout(this);
+        actBtns.setOrientation(LinearLayout.HORIZONTAL);
+        actBtns.setPadding(0, dp(6), 0, 0);
+        Button actRefresh = UiKit.outline(this, buttonLabel("REFRESH"), v -> { if (bridgeRefresh != null) bridgeRefresh.run(); });
+        Button actCopy = UiKit.tonal(this, buttonLabel("COPY"), v ->
+                copyUrlToClipboard("Jellyarr activity", com.jellyarr.app.services.StremioBridge.getInstance().getActivity(60)));
+        LinearLayout.LayoutParams ab = new LinearLayout.LayoutParams(0, dp(38), 1.0f);
+        ab.setMarginEnd(dp(6));
+        actBtns.addView(actRefresh, ab);
+        actBtns.addView(actCopy, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
+        card.addView(actBtns);
+
+        card.addView(createSettingsDivider());
+
+        card.addView(UiKit.text(this, I18n.tr("Use it in Stremio"), 13.5f, AppTheme.text(), UiKit.BOLD));
+        TextView how = UiKit.caption(this, I18n.tr(
+                "1. In Stremio open Addons, tap Add addon and paste the addon URL above (or tap OPEN IN STREMIO). Nothing else is needed.\n"
+                + "2. You get your Jellyfin library, Popular and Featured lists, torrents from Prowlarr and subtitles in the languages above.\n"
+                + "3. Using AIOStreams hosted online? Set the public address above first: its server fetches this addon itself and cannot reach a home-network address."));
+        how.setPadding(0, dp(2), 0, dp(4));
+        card.addView(how);
+
+        section.addView(card);
+
+        bridgeRefresh = () -> {
+            com.jellyarr.app.services.StremioBridge b = com.jellyarr.app.services.StremioBridge.getInstance();
+            boolean on = com.jellyarr.app.services.StremioBridge.isEnabled(ctx);
+            if (on && !b.isRunning()) b.start(ctx);
+            if (!on) {
+                status.setText(I18n.tr("Off"));
+                status.setTextColor(AppTheme.textSecondary());
+            } else if (b.isRunning()) {
+                status.setText(I18n.tr("Running on port " + com.jellyarr.app.services.StremioBridge.PORT));
+                status.setTextColor(AppTheme.accent());
+            } else {
+                String err = b.getLastError();
+                status.setText(I18n.tr("Could not start") + (err != null ? ": " + err : ""));
+                status.setTextColor(AppTheme.danger());
+            }
+            urlBox.removeAllViews();
+            String lan = com.jellyarr.app.services.StremioBridge.getLanManifestUrl(ctx);
+            String local = com.jellyarr.app.services.StremioBridge.getLocalManifestUrl(ctx);
+            if (!com.jellyarr.app.services.StremioBridge.getPublicUrl(ctx).isEmpty()) {
+                String pub = com.jellyarr.app.services.StremioBridge.getManifestUrl(ctx);
+                urlBox.addView(detailCopyRow(I18n.tr("Public"), pub, true, "Jellyarr addon URL", pub));
+            }
+            urlBox.addView(detailCopyRow("LAN", lan, true, "Jellyarr addon URL", lan));
+            if (!lan.equals(local)) {
+                urlBox.addView(detailCopyRow(I18n.tr("This phone"), local, true, "Jellyarr addon URL", local));
+            }
+
+            MediaServiceManager mgr = MediaServiceManager.getInstance(ctx);
+            ManagedService ts = mgr.getService("torrserver");
+            ManagedService pr = mgr.getService("prowlarr");
+            String prState = pr == null || !pr.isInstalled() ? I18n.tr("not installed")
+                    : mgr.isServiceRunning("prowlarr") ? I18n.tr("running") : I18n.tr("stopped");
+            String tsState = ts == null || !ts.isInstalled() ? I18n.tr("not installed")
+                    : mgr.isServiceRunning("torrserver") ? I18n.tr("running") : I18n.tr("stopped");
+            deps.setText("Prowlarr: " + prState + "  ·  TorrServer: " + tsState);
+            if (ts == null) {
+                tsBtn.setVisibility(View.GONE);
+            } else if (!ts.isInstalled()) {
+                tsBtn.setVisibility(View.VISIBLE);
+                tsBtn.setText(buttonLabel("INSTALL TORRSERVER"));
+                tsBtn.setOnClickListener(v -> installServiceAutomatically(ts));
+            } else if (!mgr.isServiceRunning("torrserver")) {
+                tsBtn.setVisibility(View.VISIBLE);
+                tsBtn.setText(buttonLabel("START TORRSERVER"));
+                tsBtn.setOnClickListener(v -> {
+                    mgr.recordServiceActive("torrserver", true);
+                    mgr.startService("torrserver", ctx);
+                    Toast.makeText(ctx, I18n.tr("Starting TorrServer..."), Toast.LENGTH_SHORT).show();
+                    status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 4000);
+                });
+            } else {
+                tsBtn.setVisibility(View.GONE);
+            }
+            String act = com.jellyarr.app.services.StremioBridge.getInstance().getActivity(12);
+            actText.setText(act.isEmpty() ? I18n.tr("No activity yet.") : act);
+            refreshTunnelRow(tunStatus, tunBtn);
+        };
+        bridgeRefresh.run();
+        return section;
+    }
+
+    /** Cloudflare Tunnel status line and its install / start / stop button (health is read off the UI thread). */
+    private void refreshTunnelRow(final TextView status, final Button btn) {
+        final android.content.Context ctx = this;
+        final MediaServiceManager mgr = MediaServiceManager.getInstance(ctx);
+        final ManagedService cf = mgr.getService(com.jellyarr.app.services.CloudflareTunnel.SERVICE_ID);
+        if (cf == null) {
+            status.setText("");
+            btn.setVisibility(View.GONE);
+            return;
+        }
+        final boolean hasToken = !com.jellyarr.app.services.CloudflareTunnel.getToken(ctx).isEmpty();
+        if (!cf.isInstalled()) {
+            btn.setVisibility(View.VISIBLE);
+            if (!com.jellyarr.app.services.CloudflareTunnel.isBundled(ctx)) {
+                status.setText(I18n.tr("This build does not include the tunnel."));
+                status.setTextColor(AppTheme.danger());
+                btn.setVisibility(View.GONE);
+                return;
+            }
+            status.setText(I18n.tr("Not installed"));
+            status.setTextColor(AppTheme.textSecondary());
+            btn.setText(buttonLabel("INSTALL TUNNEL"));
+            btn.setOnClickListener(v -> installServiceAutomatically(cf));
+            return;
+        }
+        if (!hasToken) {
+            status.setText(I18n.tr("Paste your tunnel token above."));
+            status.setTextColor(AppTheme.textSecondary());
+            btn.setVisibility(View.GONE);
+            return;
+        }
+        btn.setVisibility(View.VISIBLE);
+        if (!mgr.isServiceRunning(cf.getId())) {
+            status.setText(cf.getLastError() != null && cf.getLastError().length() > 0 && cf.getState() == com.jellyarr.app.model.ServiceState.ERROR
+                    ? I18n.tr("Stopped") + ": " + cf.getLastError() : I18n.tr("Stopped"));
+            status.setTextColor(AppTheme.textSecondary());
+            btn.setText(buttonLabel("START TUNNEL"));
+            btn.setOnClickListener(v -> {
+                mgr.recordServiceActive(cf.getId(), true);
+                mgr.startService(cf.getId(), ctx);
+                status.setText(I18n.tr("Connecting..."));
+                status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 6000);
+                status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 20000);
+            });
+            return;
+        }
+        btn.setText(buttonLabel("STOP TUNNEL"));
+        btn.setOnClickListener(v -> {
+            mgr.recordServiceActive(cf.getId(), false);
+            mgr.stopService(cf.getId());
+            status.postDelayed(() -> { if (bridgeRefresh != null) bridgeRefresh.run(); }, 1500);
+        });
+        status.setText(I18n.tr("Connecting..."));
+        status.setTextColor(AppTheme.textSecondary());
+        runBg(() -> {
+            final boolean ready = mgr.isServiceHealthy(cf);
+            runOnUiThread(() -> {
+                status.setText(I18n.tr(ready ? "Connected to Cloudflare" : "Connecting..."));
+                status.setTextColor(ready ? AppTheme.accent() : AppTheme.textSecondary());
+                if (!ready) status.postDelayed(() -> { if (bridgeRefresh != null && isUiAlive()) bridgeRefresh.run(); }, 6000);
+            });
+        });
     }
 
     private void refreshCompanionButtons() {

@@ -2,7 +2,7 @@ name: Build APK (Jellyarr)
 
 on:
   push:
-    branches: [ 'feature/**' ]
+    branches: [ 'feature/**', 'ccr-*', 'claude/**' ]
   workflow_dispatch:
     inputs:
       channel:
@@ -64,6 +64,9 @@ jobs:
           patchelf --remove-needed libgssapi_krb5.so.2 --remove-rpath "$SO"
           readelf -d "$SO" | grep -E 'NEEDED|RPATH|RUNPATH' || true
           sha256sum "$SO"
+
+      - name: Build cloudflared (Android DNS patch)
+        uses: ./.github/actions/build-cloudflared
 
       - name: Download Termux bootstraps
         run: |
