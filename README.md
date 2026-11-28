@@ -40,6 +40,10 @@ All services listen on the phone and on your local network only.
   interactive search, calendar, queue, history, wanted, system), plus a Jellyfin library browser.
 - **SYNC STACK.** One tap connects everything: download folders, Transmission as the download client,
   Prowlarr indexers pushed to Sonarr/Radarr, API keys and existing media.
+- **Setup presets.** Ready-made Prowlarr indexers (public, grouped by general / movies / TV / anime, each tested when
+  added) and Radarr/Sonarr quality profiles with sensible size limits (*Saver 720p*, *Balanced 1080p*, *High 4K*),
+  plus smart filters that block CAM, 3D and hardcoded-subtitle releases. Pick what you want in one screen
+  (Media tab › **SETUP PRESETS**); re-applying updates what Jellyarr created and never touches your own profiles.
 - **Media storage.** Movies and TV libraries as Jellyfin sees them, with their folders, sizes and the drive
   they live on. Move a library folder to another path or another drive; Jellyfin, Radarr and Sonarr are
   updated automatically.
@@ -50,6 +54,29 @@ All services listen on the phone and on your local network only.
 - **Backup & restore** of every service configuration and database.
 - **Arabic and English**, full right-to-left layout, Material 3 themes including AMOLED black and dynamic colours.
 - **Home screen widgets** and a quick-settings tile.
+
+## Setup presets
+
+**SETUP PRESETS** (Media tab) applies a curated configuration to Prowlarr, Radarr and Sonarr. The services must be
+installed and running.
+
+| Profile | Qualities | Size limits (Radarr / Sonarr) |
+| :--- | :--- | :--- |
+| **Saver 720p** | 720p web / HDTV / Blu-ray, prefers x265 | movie up to ~1.5 GB, episode up to ~500 MB |
+| **Balanced 1080p** | 1080p web / HDTV / Blu-ray | movie up to ~4 GB, episode up to ~1.5 GB |
+| **High 4K** | 4K and 1080p web / Blu-ray, no remux | loose limits, needs plenty of storage |
+
+- Profiles are created as `Jellyarr <name>`; applying again updates them in place. Your own profiles are never changed.
+- Size limits are quality definitions (MB per minute), which *Radarr and Sonarr share across all profiles*: the last
+  preset applied wins for the qualities it covers. Turn them off in the dialog if you manage them yourself.
+- Smart filters are custom formats that score CAM/Telesync, 3D and hardcoded-subtitle releases at -10000 (rejected).
+  They need Radarr 4+ / Sonarr 4+; on older versions they are skipped.
+- Indexers are public trackers only. Each one is tested when added and skipped if the test fails; a few sites need a
+  Cloudflare solver and are marked in the list. After adding, Prowlarr pushes them to Radarr and Sonarr.
+- The catalogue is `app/src/main/assets/stack_presets.json`. Placing a file named `stack_presets.json` in the app's
+  files directory overrides it, so indexers and profiles can be updated without a new release.
+
+You are responsible for what you download; check the laws that apply to you.
 
 ## Requirements
 
@@ -66,6 +93,7 @@ All services listen on the phone and on your local network only.
 3. Open Jellyarr and wait for the first-run setup (the runtime is unpacked once).
 4. Create the unified account when asked, then tap **START SERVER**.
 5. Install the companion services from the **Media** tab and tap **SYNC STACK**.
+6. Optional: tap **SETUP PRESETS** to add indexers and a quality profile (see *Setup presets* below).
 
 Jellyfin is then available at `http://<phone-ip>:8096` from any device on your network.
 

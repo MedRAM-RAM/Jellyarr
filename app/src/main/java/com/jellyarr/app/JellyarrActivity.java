@@ -5303,6 +5303,11 @@ public final class JellyarrActivity extends AppCompatActivity
 
         header.addView(masterRow);
 
+        Button btnPresets = UiKit.outline(this, buttonLabel("SETUP PRESETS"), v -> showStackPresetsDialog());
+        LinearLayout.LayoutParams presetsLp = new LinearLayout.LayoutParams(-1, dp(44));
+        presetsLp.topMargin = dp(8);
+        header.addView(btnPresets, presetsLp);
+
         // Section header above the cards with compact Install / Uninstall actions
         LinearLayout cardsHeader = new LinearLayout(this);
         cardsHeader.setOrientation(LinearLayout.HORIZONTAL);
@@ -8998,6 +9003,65 @@ public final class JellyarrActivity extends AppCompatActivity
             }
             updateButtonText.run();
         });
+    }
+
+    /** Ready-made Prowlarr indexers and Radarr/Sonarr quality profiles the user picks from. */
+    private void showStackPresetsDialog() {
+        final com.jellyarr.app.services.StackPresets presets;
+        try {
+            presets = com.jellyarr.app.services.StackPresets.load(this);
+        } catch (Throwable t) {
+            Toast.makeText(this, I18n.tr("Could not load the presets: ") + t.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
+        final StackPresetsView pv = new StackPresetsView(this, presets);
+        ScrollView sv = new ScrollView(this);
+        sv.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        sv.addView(pv.view());
+        int maxH = (int) (getResources().getDisplayMetrics().heightPixels * 0.62f);
+        sv.setLayoutParams(new LinearLayout.LayoutParams(-1, maxH));
+        showOledDialog("Setup Presets", "Indexers, quality and size, ready to use", sv, "APPLY", 0, () -> {
+            final com.jellyarr.app.services.StackPresets.Selection sel = pv.selection();
+            if (sel.isEmpty()) {
+                Toast.makeText(this, I18n.tr("Nothing selected."), Toast.LENGTH_SHORT).show();
+                return;
+            }
+            runStackPresets(presets, sel);
+        }, "CANCEL", null);
+    }
+
+    private void runStackPresets(final com.jellyarr.app.services.StackPresets presets,
+                                 final com.jellyarr.app.services.StackPresets.Selection sel) {
+        TextView status = new TextView(this);
+        status.setTextSize(12.5f);
+        status.setTextColor(AppTheme.text());
+        status.setTypeface(Typeface.MONOSPACE);
+        status.setText("Applying presets...");
+        ScrollView sv = new ScrollView(this);
+        sv.addView(status);
+        showOledDialog("Setup Presets", "Live progress", sv, null, 0, null, "CLOSE", null);
+
+        final StringBuilder lines = new StringBuilder();
+        new Thread(() -> {
+            // Indexers need Prowlarr and the quality profiles need Radarr or Sonarr, all running.
+            boolean ok;
+            try {
+                ok = presets.apply(this, sel, line -> runOnUiThread(() -> {
+                    lines.append(line).append("\n");
+                    status.setText(lines.toString());
+                }));
+            } catch (Throwable t) {
+                ok = false;
+                final String m = String.valueOf(t.getMessage());
+                runOnUiThread(() -> { lines.append("✖ ").append(m).append("\n"); status.setText(lines.toString()); });
+            }
+            final boolean done = ok;
+            runOnUiThread(() -> {
+                lines.append("\n").append(done ? "✔ Done" : "Finished with some issues. Start the services that are not running and apply again.");
+                status.setText(lines.toString());
+                refreshServicesTabUI();
+            });
+        }, "stack-presets").start();
     }
 
     private void syncAndAutoWireAllServices() {

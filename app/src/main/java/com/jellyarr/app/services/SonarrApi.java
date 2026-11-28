@@ -575,6 +575,37 @@ public final class SonarrApi {
 
     public JSONArray qualityProfiles() throws Exception { return arr("/qualityprofile"); }
 
+    // ---- preset support: quality profiles, quality definitions and custom formats
+
+    public JSONObject qualityProfileSchema() throws Exception { return obj("/qualityprofile/schema"); }
+
+    public JSONObject addQualityProfile(JSONObject profile) throws Exception {
+        String r = call("POST", "/qualityprofile", profile.toString(), 30000).trim();
+        return r.isEmpty() ? new JSONObject() : new JSONObject(r);
+    }
+
+    public void updateQualityProfile(JSONObject profile) throws Exception {
+        call("PUT", "/qualityprofile/" + profile.getInt("id"), profile.toString(), 30000);
+    }
+
+    public JSONArray qualityDefinitions() throws Exception { return arr("/qualitydefinition"); }
+
+    public void updateQualityDefinition(JSONObject def) throws Exception {
+        call("PUT", "/qualitydefinition/" + def.getInt("id"), def.toString(), 30000);
+    }
+
+    /** Custom formats exist in Radarr 4+ and Sonarr 4+; older versions answer 404. */
+    public JSONArray customFormats() throws Exception { return arr("/customformat"); }
+
+    public JSONObject addCustomFormat(JSONObject format) throws Exception {
+        String r = call("POST", "/customformat", format.toString(), 30000).trim();
+        return r.isEmpty() ? new JSONObject() : new JSONObject(r);
+    }
+
+    public void updateCustomFormat(JSONObject format) throws Exception {
+        call("PUT", "/customformat/" + format.getInt("id"), format.toString(), 30000);
+    }
+
     public JSONArray indexers() throws Exception { return arr("/indexer"); }
 
     public JSONArray downloadClients() throws Exception { return arr("/downloadclient"); }

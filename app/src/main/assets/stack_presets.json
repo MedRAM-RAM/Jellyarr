@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "namePrefix": "Jellyarr",
+  "indexers": [
+    { "id": "yts",              "label": "YTS",             "group": "movies",  "recommended": true,  "note": "Small 720p/1080p movie releases" },
+    { "id": "thepiratebay",     "label": "The Pirate Bay",  "group": "general", "recommended": true,  "note": "Movies and TV, very large catalogue" },
+    { "id": "eztv",             "label": "EZTV",            "group": "tv",      "recommended": true,  "note": "TV episodes, fast after airing" },
+    { "id": "knaben",           "label": "Knaben",          "group": "general", "recommended": true,  "note": "Meta-search over many public trackers" },
+    { "id": "bitsearch",        "label": "BitSearch",       "group": "general", "recommended": true,  "note": "General purpose, good for TV and movies" },
+    { "id": "nyaasi",           "label": "Nyaa",            "group": "anime",   "recommended": true,  "note": "Anime and Asian TV" },
+    { "id": "animetosho",       "label": "AnimeTosho",      "group": "anime",   "recommended": false, "note": "Anime, mirrors Nyaa releases" },
+    { "id": "tokyotosho",       "label": "TokyoTosho",      "group": "anime",   "recommended": false, "note": "Anime and manga" },
+    { "id": "limetorrents",     "label": "LimeTorrents",    "group": "general", "recommended": false, "note": "General purpose" },
+    { "id": "torrentdownloads", "label": "TorrentDownloads","group": "general", "recommended": false, "note": "General purpose" },
+    { "id": "torrentgalaxyclone","label": "TorrentGalaxy",  "group": "general", "recommended": false, "note": "Movies and TV; may be blocked by Cloudflare", "cloudflare": true },
+    { "id": "1337x",            "label": "1337x",           "group": "general", "recommended": false, "note": "Movies and TV; usually needs a Cloudflare solver", "cloudflare": true }
+  ],
+  "qualityProfiles": [
+    {
+      "id": "saver",
+      "name": "Saver 720p",
+      "summary": "Smallest downloads. 720p only, prefers x265. Movies up to about 1.5 GB, episodes up to about 500 MB.",
+      "qualities": ["WEBDL-720p", "WEBRip-720p", "HDTV-720p", "Bluray-720p"],
+      "cutoff": "WEBDL-720p",
+      "sizes": {
+        "radarr": { "min": 3, "preferred": 8,  "max": 14 },
+        "sonarr": { "min": 2, "preferred": 7,  "max": 11 }
+      },
+      "scores": { "x265": 100, "block3d": -10000, "blockHardSubs": -10000, "blockCam": -10000 }
+    },
+    {
+      "id": "balanced",
+      "name": "Balanced 1080p",
+      "summary": "Best value. 1080p web and Blu-ray. Movies up to about 4 GB, episodes up to about 1.5 GB.",
+      "qualities": ["WEBDL-1080p", "WEBRip-1080p", "HDTV-1080p", "Bluray-1080p"],
+      "cutoff": "Bluray-1080p",
+      "sizes": {
+        "radarr": { "min": 5, "preferred": 20, "max": 36 },
+        "sonarr": { "min": 4, "preferred": 14, "max": 33 }
+      },
+      "scores": { "block3d": -10000, "blockHardSubs": -10000, "blockCam": -10000 }
+    },
+    {
+      "id": "high",
+      "name": "High 4K",
+      "summary": "Best quality with loose limits. 4K and 1080p, no remux. Needs plenty of storage.",
+      "qualities": ["WEBDL-2160p", "WEBRip-2160p", "Bluray-2160p", "WEBDL-1080p", "WEBRip-1080p", "Bluray-1080p"],
+      "cutoff": "Bluray-2160p",
+      "sizes": {
+        "radarr": { "min": 10, "preferred": 60,  "max": 200 },
+        "sonarr": { "min": 8,  "preferred": 45,  "max": 150 }
+      },
+      "scores": { "block3d": -10000, "blockHardSubs": -10000, "blockCam": -10000 }
+    }
+  ],
+  "customFormats": [
+    {
+      "key": "x265",
+      "name": "x265 (HEVC)",
+      "specs": [ { "name": "x265 / HEVC", "implementation": "ReleaseTitleSpecification", "regex": "[xh][ ._-]?265|HEVC", "required": true } ]
+    },
+    {
+      "key": "block3d",
+      "name": "Block 3D",
+      "specs": [ { "name": "3D", "implementation": "ReleaseTitleSpecification", "regex": "\\b(3D|HSBS|H-SBS|HOU)\\b", "required": true } ]
+    },
+    {
+      "key": "blockHardSubs",
+      "name": "Block hardcoded subs",
+      "specs": [ { "name": "Hardcoded subs", "implementation": "ReleaseTitleSpecification", "regex": "\\b(HC|HARD-?SUBS?|HARDCODED|KORSUB)\\b", "required": true } ]
+    },
+    {
+      "key": "blockCam",
+      "name": "Block CAM and Telesync",
+      "specs": [ { "name": "CAM / TS", "implementation": "ReleaseTitleSpecification", "regex": "\\b(HD-?CAM|CAM-?Rip|HD-?TS|TELESYNC|TELECINE|HD-?TC|WORKPRINT)\\b", "required": true } ]
+    }
+  ]
+}
