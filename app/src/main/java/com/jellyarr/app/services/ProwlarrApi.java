@@ -284,6 +284,11 @@ public final class ProwlarrApi {
 
     public JSONArray tags() throws Exception { return arr("/tag"); }
 
+    public JSONObject createTag(String label) throws Exception {
+        String r = call("POST", "/tag", new JSONObject().put("label", label).toString(), 30000).trim();
+        return r.isEmpty() ? new JSONObject() : new JSONObject(r);
+    }
+
     // ------------------------------------------------------------------ history
 
     /** Paging object {page, pageSize, totalRecords, records: [{indexerId, date, successful, eventType, data{}}]}. */

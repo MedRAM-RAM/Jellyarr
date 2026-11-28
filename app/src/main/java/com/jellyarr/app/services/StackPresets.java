@@ -33,6 +33,7 @@ public final class StackPresets {
 
     public static final class Indexer {
         public String id, label, group, note;
+        public final List<String> aliases = new ArrayList<>();
         public boolean recommended, cloudflare;
     }
 
@@ -99,6 +100,8 @@ public final class StackPresets {
             d.note = o.optString("note", "");
             d.recommended = o.optBoolean("recommended", false);
             d.cloudflare = o.optBoolean("cloudflare", false);
+            JSONArray al = o.optJSONArray("aliases");
+            for (int j = 0; al != null && j < al.length(); j++) d.aliases.add(al.getString(j).toLowerCase(Locale.ROOT));
             p.indexers.add(d);
         }
         JSONArray qp = root.optJSONArray("qualityProfiles");
@@ -187,12 +190,17 @@ public final class StackPresets {
                 if (d == null) continue;
                 String key = d.optString("definitionName", "").toLowerCase(Locale.ROOT);
                 if (!key.isEmpty() && !schema.containsKey(key)) schema.put(key, d);
+                String nm = d.optString("name", "").toLowerCase(Locale.ROOT);
+                if (!nm.isEmpty() && !schema.containsKey(nm)) schema.put(nm, d);
             }
             Set<String> have = new HashSet<>();
             JSONArray cur = api.indexers();
             for (int i = 0; i < cur.length(); i++) {
                 JSONObject o = cur.optJSONObject(i);
-                if (o != null) have.add(o.optString("definitionName", "").toLowerCase(Locale.ROOT));
+                if (o != null) {
+                    have.add(o.optString("definitionName", "").toLowerCase(Locale.ROOT));
+                    have.add(o.optString("name", "").toLowerCase(Locale.ROOT));
+                }
             }
             int appProfileId = 1;
             try {
@@ -206,11 +214,20 @@ public final class StackPresets {
                 // keep the default id
             }
             int added = 0;
+            int cfTag = -1;
             for (Indexer ix : indexers) {
                 if (!sel.indexerIds.contains(ix.id)) continue;
-                String key = ix.id.toLowerCase(Locale.ROOT);
-                if (have.contains(key)) { log.line("  • " + ix.label + ": already added"); continue; }
-                JSONObject def = schema.get(key);
+                List<String> keys = new ArrayList<>();
+                keys.add(ix.id.toLowerCase(Locale.ROOT));
+                keys.add(ix.label.toLowerCase(Locale.ROOT));
+                keys.addAll(ix.aliases);
+                boolean exists = false;
+                JSONObject def = null;
+                for (String k : keys) {
+                    if (have.contains(k)) exists = true;
+                    if (def == null) def = schema.get(k);
+                }
+                if (exists) { log.line("  • " + ix.label + ": already added"); continue; }
                 if (def == null) { log.line("  • " + ix.label + ": not available in this Prowlarr version, skipped"); continue; }
                 try {
                     JSONObject body = new JSONObject(def.toString());
@@ -218,17 +235,22 @@ public final class StackPresets {
                     body.put("enable", true);
                     body.put("appProfileId", appProfileId);
                     body.put("priority", 25);
-                    body.put("tags", new JSONArray());
+                    JSONArray tags = new JSONArray();
+                    if (ix.cloudflare) {
+                        if (cfTag < 0) cfTag = cloudflareTag(api);
+                        if (cfTag > 0) tags.put(cfTag);
+                    }
+                    body.put("tags", tags);
                     body.remove("id");
                     // Without forceSave Prowlarr tests the indexer first and refuses it when the test fails.
                     api.addIndexer(body, false);
                     added++;
-                    log.line("  ✔ " + ix.label + ": added and tested");
+                    log.line("  ✔ " + ix.label + ": added and tested" + (ix.cloudflare && cfTag > 0 ? " (Cloudflare solver on)" : ""));
                 } catch (Throwable t) {
                     ok = false;
                     String msg = String.valueOf(t.getMessage());
                     if (msg.length() > 160) msg = msg.substring(0, 160) + "…";
-                    log.line("  ✖ " + ix.label + ": " + msg + (ix.cloudflare ? " (this site is often behind Cloudflare)" : "") + " — skipped");
+                    log.line("  ✖ " + ix.label + ": " + msg + " — skipped");
                 }
             }
             if (added > 0) {
@@ -244,6 +266,23 @@ public final class StackPresets {
             log.line("  ✖ " + t.getMessage());
         }
         return ok;
+    }
+
+    /**
+     * Id of Prowlarr's "flaresolverr" tag (created when missing). Indexers carrying it go through the built-in
+     * Cloudflare solver proxy that SYNC STACK registers in Prowlarr. Returns 0 when it cannot be had.
+     */
+    private static int cloudflareTag(ProwlarrApi api) {
+        try {
+            JSONArray tags = api.tags();
+            for (int i = 0; i < tags.length(); i++) {
+                JSONObject t = tags.optJSONObject(i);
+                if (t != null && "flaresolverr".equalsIgnoreCase(t.optString("label"))) return t.optInt("id");
+            }
+            return api.createTag("flaresolverr").optInt("id", 0);
+        } catch (Throwable t) {
+            return 0;
+        }
     }
 
     // ---- Radarr / Sonarr

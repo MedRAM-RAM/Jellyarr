@@ -103,7 +103,7 @@ final class StackPresetsView {
         text.addView(name);
         if (note != null && !note.isEmpty()) text.addView(UiKit.caption(ctx, note));
         if (warn) {
-            TextView w = UiKit.caption(ctx, "May need a Cloudflare solver");
+            TextView w = UiKit.caption(ctx, "Uses the built-in Cloudflare solver");
             w.setTextColor(AppTheme.warning());
             text.addView(w);
         }

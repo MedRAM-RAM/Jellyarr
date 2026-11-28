@@ -6,12 +6,7 @@ We prioritize the security, integrity, and privacy of **Jellyarr**. This documen
 
 ## Supported Versions
 
-Security fixes and compatibility updates are actively maintained on the following release line:
-
-| Version | Status | Notes |
-| :--- | :--- | :--- |
-| **v1.4.x** (v1.4.8+) | Supported | Current active production release line |
-| **< v1.4.0** | Unsupported | Deprecated legacy releases; upgrade to latest |
+Security fixes are provided for the latest release only. Please update to the latest version before reporting an issue.
 
 ---
 

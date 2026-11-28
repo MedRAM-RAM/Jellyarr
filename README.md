@@ -71,8 +71,8 @@ installed and running.
   preset applied wins for the qualities it covers. Turn them off in the dialog if you manage them yourself.
 - Smart filters are custom formats that score CAM/Telesync, 3D and hardcoded-subtitle releases at -10000 (rejected).
   They need Radarr 4+ / Sonarr 4+; on older versions they are skipped.
-- Indexers are public trackers only. Each one is tested when added and skipped if the test fails; a few sites need a
-  Cloudflare solver and are marked in the list. After adding, Prowlarr pushes them to Radarr and Sonarr.
+- Indexers are 10 popular public trackers. Each one is tested when added and skipped if the test fails; the ones behind
+  Cloudflare (1337x, TorrentGalaxy, LimeTorrents, uIndex) are tagged to use the built-in Cloudflare solver. After adding, Prowlarr pushes them to Radarr and Sonarr.
 - The catalogue is `app/src/main/assets/stack_presets.json`. Placing a file named `stack_presets.json` in the app's
   files directory overrides it, so indexers and profiles can be updated without a new release.
 
@@ -97,18 +97,6 @@ You are responsible for what you download; check the laws that apply to you.
 
 Jellyfin is then available at `http://<phone-ip>:8096` from any device on your network.
 
-### Moving from the old package (2.x)
-
-Since 3.0.0 the app id is `com.jellyarr.app` (it was `com.fishbowl.app`), so Android installs 3.0.0 as a new app and
-the old one cannot update itself to it:
-
-1. In the old app, make a backup (**Settings › Backup**) and stop all services.
-2. Install Jellyarr 3.0.0 and restore the backup when the first start offers it.
-3. Uninstall the old app.
-
-Media in `JellyarrMedia` is not touched. Paths that point inside the old app's data folder are switched to the new
-package during the restore.
-
 ## Storage layout
 
 ```text
@@ -120,8 +108,7 @@ package during the restore.
 ```
 
 Folders on an SD card or USB drive can be added as library paths and media can be moved between drives from
-**Media › Media storage**. Installs that still use the old `FishbowlMedia` folder are renamed automatically on
-first launch.
+**Media › Media storage**.
 
 ## Building from source
 
@@ -146,7 +133,7 @@ Termux, Microsoft or Google.
 
 ## Credits
 
-- Based on [Fishbowl](https://github.com/Suz41/Fishbowl) by Sujal Achari (GPLv3).
+- Based on [Fishbowl](https://github.com/Suz41/Fishbowl) by Sujal Achari (GPLv3) · Developed by MedRAM.
 - [Jellyfin](https://jellyfin.org), [Sonarr, Radarr and Prowlarr](https://wiki.servarr.com),
   [Transmission](https://transmissionbt.com), [Termux](https://termux.dev) and [.NET](https://dotnet.microsoft.com).
 
